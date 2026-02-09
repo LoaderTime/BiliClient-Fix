@@ -14,6 +14,7 @@ import androidx.multidex.MultiDex;
 
 import com.RobinNotBad.BiliClient.activity.base.InstanceActivity;
 import com.RobinNotBad.BiliClient.activity.user.info.UserInfoActivity;
+import com.RobinNotBad.BiliClient.api.AppInfoApi;
 import com.RobinNotBad.BiliClient.api.DynamicApi;
 import com.RobinNotBad.BiliClient.api.MessageApi;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
@@ -76,6 +77,17 @@ public class BiliTerminal extends Application {
                         SharedPreferencesUtil.putInt(SharedPreferencesUtil.MESSAGE_UPDATE_NUM, totalUnread);
                     } catch (IOException | JSONException e) {
                         SharedPreferencesUtil.putInt(SharedPreferencesUtil.MESSAGE_UPDATE_NUM, 0);
+                    }
+                });
+            }
+
+            // 启动时检查应用更新（根据auto_check_update_enable设置）
+            if (SharedPreferencesUtil.getBoolean(SharedPreferencesUtil.AUTO_CHECK_UPDATE_ENABLE, true)) {
+                CenterThreadPool.run(() -> {
+                    try {
+                        AppInfoApi.check(context);
+                    } catch (Exception e) {
+                        Logu.e("AppInfoApi.check: 检查更新失败 - " + e.getMessage());
                     }
                 });
             }

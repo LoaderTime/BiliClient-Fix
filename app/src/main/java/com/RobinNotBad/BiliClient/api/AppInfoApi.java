@@ -84,11 +84,14 @@ public class AppInfoApi {
                 SharedPreferencesUtil.putInt("app_version_last", version);
             }
 
-            if (SharedPreferencesUtil.getInt("app_version_check", 0) < curr) {    //限制一天一次
-                Log.e("debug", "检查更新");
-                SharedPreferencesUtil.putInt("app_version_check", curr);
+            // 只有启用自动检查更新时才检查应用更新
+            if (SharedPreferencesUtil.getBoolean(SharedPreferencesUtil.AUTO_CHECK_UPDATE_ENABLE, true)) {
+                if (SharedPreferencesUtil.getInt("app_version_check", 0) < curr) {    //限制一天一次
+                    Log.e("debug", "检查更新");
+                    SharedPreferencesUtil.putInt("app_version_check", curr);
 
-                checkUpdate(context, false);
+                    checkUpdate(context, false);
+                }
             }
         } catch (IOException e) {
             MsgUtil.showMsg("无法连接到终端公告接口\n也许是服务器宕机了？\n（对软件内容无影响）");

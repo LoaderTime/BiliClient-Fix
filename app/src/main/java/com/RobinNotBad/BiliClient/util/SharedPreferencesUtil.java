@@ -28,6 +28,7 @@ public class SharedPreferencesUtil {
     public static final String NIGHT_REMINDER_ENABLE = "night_reminder_enable";
     public static final String SEARCH_DEFAULT_CONTENT_ENABLE = "search_default_content_enable";
     public static final String PLAYER_MEDIA_SESSION_ENABLE = "player_media_session_enable";
+    public static final String AUTO_CHECK_UPDATE_ENABLE = "auto_check_update_enable";
 
     public static String cookies = "cookies";
     public static String mid = "mid";

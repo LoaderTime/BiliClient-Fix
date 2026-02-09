@@ -16,6 +16,7 @@ import com.RobinNotBad.BiliClient.util.CenterThreadPool;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.google.android.material.card.MaterialCardView;
+import com.google.android.material.switchmaterial.SwitchMaterial;
 
 public class SettingMainActivity extends InstanceActivity {
 
@@ -146,6 +147,30 @@ public class SettingMainActivity extends InstanceActivity {
                         runOnUiThread(() -> MsgUtil.showMsg("连接到哔哩终端接口时发生错误"));
                     }
                 });
+            });
+
+            //启动时检查更新开关
+            MaterialCardView autoCheckUpdateCard = findViewById(R.id.auto_check_update);
+            SwitchMaterial autoCheckUpdateSwitch = findViewById(R.id.auto_check_update_switch);
+            
+            // 初始化开关状态
+            boolean autoCheckUpdateEnabled = SharedPreferencesUtil.getBoolean(
+                SharedPreferencesUtil.AUTO_CHECK_UPDATE_ENABLE, true);
+            autoCheckUpdateSwitch.setChecked(autoCheckUpdateEnabled);
+            
+            // 设置开关监听器
+            autoCheckUpdateSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                SharedPreferencesUtil.putBoolean(
+                    SharedPreferencesUtil.AUTO_CHECK_UPDATE_ENABLE, isChecked);
+                MsgUtil.showMsg(isChecked ? "已开启启动时检查更新" : "已关闭启动时检查更新");
+            });
+
+            //数据迁移
+            MaterialCardView dataMigration = findViewById(R.id.data_migration);
+            dataMigration.setOnClickListener(view -> {
+                Intent intent = new Intent();
+                intent.setClass(this, DataMigrationActivity.class);
+                startActivity(intent);
             });
 
             //公告列表

@@ -391,6 +391,11 @@
             android:label="设置"
             android:screenOrientation="locked" />
         <activity
+            android:name=".activity.settings.DataMigrationActivity"
+            android:exported="false"
+            android:label="数据迁移"
+            android:screenOrientation="locked" />
+        <activity
             android:name=".activity.user.CreativeCenterActivity"
             android:exported="false"
             android:label="创作中心"
