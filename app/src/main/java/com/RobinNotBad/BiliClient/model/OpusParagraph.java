@@ -10,6 +10,7 @@ import android.text.style.BackgroundColorSpan;
 import android.text.style.ForegroundColorSpan;
 import android.text.style.RelativeSizeSpan;
 import android.text.style.StyleSpan;
+import android.text.style.StrikethroughSpan;
 
 import com.RobinNotBad.BiliClient.util.EmoteUtil;
 import com.RobinNotBad.BiliClient.util.Logu;
@@ -170,9 +171,13 @@ public class OpusParagraph {
                     if (style != null) {
                         boolean bold = style.optBoolean("bold");
                         boolean italic = style.optBoolean("italic");
+                        boolean strikethrough = style.optBoolean("strikethrough");
                         int styleInt = (bold ? Typeface.BOLD : 0) + (italic ? Typeface.ITALIC : 0);
                         if (styleInt != 0)
                             stringBuilder.setSpan(new StyleSpan(styleInt), startPosition, endPosition, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        if (strikethrough) {
+                            stringBuilder.setSpan(new StrikethroughSpan(), startPosition, endPosition, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                        }
                     }
 
                     //字体大小，使用的是相对大小，17号的字体在手表上还是太逆天了
@@ -275,9 +280,13 @@ public class OpusParagraph {
                         if (style != null) {
                             boolean bold = style.optBoolean("bold");
                             boolean italic = style.optBoolean("italic");
+                            boolean strikethrough = style.optBoolean("strikethrough");
                             int styleInt = (bold ? Typeface.BOLD : 0) + (italic ? Typeface.ITALIC : 0);
                             if (styleInt != 0) {
                                 stringBuilder.setSpan(new StyleSpan(styleInt), startLength, endLength, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            }
+                            if (strikethrough) {
+                                stringBuilder.setSpan(new StrikethroughSpan(), startLength, endLength, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                             }
                         }
                         
@@ -288,23 +297,17 @@ public class OpusParagraph {
                             stringBuilder.setSpan(new RelativeSizeSpan(fontScale), startLength, endLength, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                         }
                         
-                        // 字体颜色（黑色背景下做亮度保护，避免低对比度不可读）
+                        // 字体颜色
                         String color = word.optString("color", "#18191c");
                         if (color.startsWith("#") && !color.equals("#18191c")) {
                             try {
                                 int parsedColor = Color.parseColor(color);
-                                // 基于黑色背景的亮度阈值判断
-                                // luminance ∈ [0,1]，经验阈值 0.35 以下在黑底下可读性较差
-                                double luminance = Color.luminance(parsedColor);
-                                if (luminance >= 0.35) {
-                                    stringBuilder.setSpan(
-                                            new ForegroundColorSpan(parsedColor),
-                                            startLength,
-                                            endLength,
-                                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                                    );
-                                }
-                                // 否则不设置颜色，回退到 TextView 默认文字色（保证可读）
+                                stringBuilder.setSpan(
+                                        new ForegroundColorSpan(parsedColor),
+                                        startLength,
+                                        endLength,
+                                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                                );
                             } catch (Exception e) {
                                 Logu.e("color error in analyzeOpus", color);
                             }

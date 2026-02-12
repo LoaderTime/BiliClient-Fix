@@ -846,32 +846,60 @@ public class OpusApi {
             return;
         }
 
-        htmlText = htmlText
-                .replaceAll("class=\"color-green-02\"", "style=\"color:#60d837\"")
-                .replaceAll("class=\"color-blue-01\"", "style=\"color:#23ade5\"")
-                .replaceAll("class=\"color-pink-01\"", "style=\"color:#fb7299\"")
-                .replaceAll("class=\"color-gray-01\"", "style=\"color:#999999\"");
+        htmlText = applyArticleColorClassMapping(htmlText);
+        htmlText = convertLineThroughStyleToStrikeTag(htmlText);
 
         CharSequence spanned;
+        CharSequence strikeSpanned;
+        String colorPriorityHtml = htmlText.replaceAll("(?i)text-decoration\\s*:\\s*line-through\\s*;?", "");
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-            spanned = android.text.Html.fromHtml(htmlText, android.text.Html.FROM_HTML_MODE_LEGACY);
+            spanned = android.text.Html.fromHtml(colorPriorityHtml, android.text.Html.FROM_HTML_MODE_LEGACY);
+            strikeSpanned = android.text.Html.fromHtml(htmlText, android.text.Html.FROM_HTML_MODE_LEGACY);
         } else {
-            spanned = android.text.Html.fromHtml(htmlText);
+            spanned = android.text.Html.fromHtml(colorPriorityHtml);
+            strikeSpanned = android.text.Html.fromHtml(htmlText);
         }
 
         if (!(spanned instanceof android.text.Spanned) || spanned.length() == 0) {
             return;
         }
 
-        android.text.SpannableStringBuilder ssb = new android.text.SpannableStringBuilder(spanned);
+        android.text.SpannableStringBuilder ssb;
+        if (strikeSpanned instanceof android.text.Spanned) {
+            ssb = new android.text.SpannableStringBuilder(strikeSpanned);
+        } else {
+            ssb = new android.text.SpannableStringBuilder(spanned);
+        }
 
+        android.text.Spanned colorSpanned = (android.text.Spanned) spanned;
         android.text.style.ForegroundColorSpan[] colorSpans =
-                ssb.getSpans(0, ssb.length(), android.text.style.ForegroundColorSpan.class);
+                colorSpanned.getSpans(0, colorSpanned.length(), android.text.style.ForegroundColorSpan.class);
 
-        for (android.text.style.ForegroundColorSpan span : colorSpans) {
-            int color = span.getForegroundColor();
-            if (android.graphics.Color.luminance(color) < 0.35) {
-                ssb.removeSpan(span);
+        // 先应用大范围颜色，再应用小范围颜色，避免父级颜色覆盖子级颜色
+        java.util.ArrayList<android.text.style.ForegroundColorSpan> orderedColorSpans = new java.util.ArrayList<>();
+        java.util.Collections.addAll(orderedColorSpans, colorSpans);
+        java.util.Collections.sort(orderedColorSpans, (a, b) -> {
+            int aStart = colorSpanned.getSpanStart(a);
+            int aEnd = colorSpanned.getSpanEnd(a);
+            int bStart = colorSpanned.getSpanStart(b);
+            int bEnd = colorSpanned.getSpanEnd(b);
+            int aLen = aEnd - aStart;
+            int bLen = bEnd - bStart;
+            if (aLen != bLen) {
+                return Integer.compare(bLen, aLen);
+            }
+            return Integer.compare(aStart, bStart);
+        });
+
+        for (android.text.style.ForegroundColorSpan colorSpan : orderedColorSpans) {
+            int start = colorSpanned.getSpanStart(colorSpan);
+            int end = colorSpanned.getSpanEnd(colorSpan);
+            int flags = colorSpanned.getSpanFlags(colorSpan);
+            if (start >= 0 && end > start && end <= ssb.length()) {
+                ssb.setSpan(new android.text.style.ForegroundColorSpan(colorSpan.getForegroundColor()),
+                        start,
+                        end,
+                        flags);
             }
         }
 
@@ -888,6 +916,180 @@ public class OpusApi {
         paragraph.type = OpusParagraph.TYPE_TEXT;
         paragraph.content = ssb;
         paragraphs.add(paragraph);
+    }
+
+    /**
+     * Android Html.fromHtml 对 style="text-decoration: line-through" 兼容性不稳定，
+     * 转成 <strike> 以稳定生成 StrikethroughSpan。
+     */
+    private static String convertLineThroughStyleToStrikeTag(String htmlText) {
+        if (htmlText == null || htmlText.isEmpty()) {
+            return htmlText;
+        }
+
+        java.util.regex.Pattern tagPattern = java.util.regex.Pattern.compile("<(/?)([A-Za-z0-9]+)([^>]*)>");
+        java.util.regex.Matcher matcher = tagPattern.matcher(htmlText);
+        StringBuilder out = new StringBuilder();
+        java.util.ArrayDeque<Boolean> strikeSpanStack = new java.util.ArrayDeque<>();
+
+        int last = 0;
+        while (matcher.find()) {
+            out.append(htmlText, last, matcher.start());
+
+            String slash = matcher.group(1);
+            String tagName = matcher.group(2);
+            String attrs = matcher.group(3);
+            boolean isClosing = slash != null && !slash.isEmpty();
+
+            if (!"span".equalsIgnoreCase(tagName)) {
+                out.append(matcher.group(0));
+                last = matcher.end();
+                continue;
+            }
+
+            if (isClosing) {
+                out.append(matcher.group(0));
+                if (!strikeSpanStack.isEmpty() && strikeSpanStack.pop()) {
+                    out.append("</strike>");
+                }
+                last = matcher.end();
+                continue;
+            }
+
+            boolean hasStrike = false;
+            String newAttrs = attrs;
+
+            java.util.regex.Pattern stylePattern = java.util.regex.Pattern.compile(
+                    "\\bstyle\\s*=\\s*(['\"])(.*?)\\1",
+                    java.util.regex.Pattern.CASE_INSENSITIVE
+            );
+            java.util.regex.Matcher styleMatcher = stylePattern.matcher(attrs);
+            if (styleMatcher.find()) {
+                String quote = styleMatcher.group(1);
+                String styleContent = styleMatcher.group(2);
+                if (styleContent != null && styleContent.toLowerCase(Locale.ROOT).contains("line-through")) {
+                    hasStrike = true;
+                    String cleanedStyle = styleContent.replaceAll(
+                            "(?i)text-decoration\\s*:[^;]*line-through[^;]*;?",
+                            ""
+                    ).trim();
+                    if (cleanedStyle.isEmpty()) {
+                        newAttrs = styleMatcher.replaceFirst("");
+                    } else {
+                        if (!cleanedStyle.endsWith(";")) {
+                            cleanedStyle += ";";
+                        }
+                        newAttrs = styleMatcher.replaceFirst("style=" + quote + cleanedStyle + quote);
+                    }
+                }
+            }
+
+            if (hasStrike) {
+                out.append("<strike>");
+            }
+            out.append("<span").append(newAttrs).append(">");
+            strikeSpanStack.push(hasStrike);
+            last = matcher.end();
+        }
+
+        out.append(htmlText.substring(last));
+        return out.toString();
+    }
+
+    private static String applyArticleColorClassMapping(String htmlText) {
+        if (htmlText == null || htmlText.isEmpty()) {
+            return htmlText;
+        }
+
+        java.util.HashMap<String, String> colorMap = new java.util.HashMap<>();
+        colorMap.put("color-blue-01", "#56c1fe");
+        colorMap.put("color-blue-02", "#02a2ff");
+        colorMap.put("color-blue-03", "#0176ba");
+        colorMap.put("color-blue-04", "#004e80");
+        colorMap.put("color-default", "#222");
+        colorMap.put("color-gray-01", "#d6d5d5");
+        colorMap.put("color-gray-02", "#929292");
+        colorMap.put("color-gray-03", "#5f5f5f");
+        colorMap.put("color-green-01", "#89fa4e");
+        colorMap.put("color-green-02", "#60d837");
+        colorMap.put("color-green-03", "#1db100");
+        colorMap.put("color-green-04", "#017001");
+        colorMap.put("color-lblue-01", "#73fdea");
+        colorMap.put("color-lblue-02", "#18e7cf");
+        colorMap.put("color-lblue-03", "#068f86");
+        colorMap.put("color-lblue-04", "#017c76");
+        colorMap.put("color-pink-01", "#ff968d");
+        colorMap.put("color-pink-02", "#ff654e");
+        colorMap.put("color-pink-03", "#ee230d");
+        colorMap.put("color-pink-04", "#b41700");
+        colorMap.put("color-purple-01", "#ff8cc6");
+        colorMap.put("color-purple-02", "#ef5fa8");
+        colorMap.put("color-purple-03", "#cb297a");
+        colorMap.put("color-purple-04", "#99195e");
+        colorMap.put("color-yellow-01", "#fff359");
+        colorMap.put("color-yellow-02", "#fbe231");
+        colorMap.put("color-yellow-03", "#f8ba00");
+        colorMap.put("color-yellow-04", "#ff9201");
+
+        java.util.regex.Pattern classTagPattern = java.util.regex.Pattern.compile(
+                "<[^>]*\\bclass\\s*=\\s*(['\"])([^'\"]*)\\1[^>]*>",
+                java.util.regex.Pattern.CASE_INSENSITIVE
+        );
+        java.util.regex.Matcher matcher = classTagPattern.matcher(htmlText);
+        StringBuffer sb = new StringBuffer();
+
+        while (matcher.find()) {
+            String tag = matcher.group(0);
+            String classValue = matcher.group(2);
+
+            String mappedColor = null;
+            String[] classes = classValue.trim().split("\\s+");
+            for (String cls : classes) {
+                if (colorMap.containsKey(cls)) {
+                    mappedColor = colorMap.get(cls);
+                    break;
+                }
+            }
+
+            if (mappedColor == null) {
+                matcher.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(tag));
+                continue;
+            }
+
+            String updatedTag = tag;
+            java.util.regex.Pattern stylePattern = java.util.regex.Pattern.compile(
+                    "\\bstyle\\s*=\\s*(['\"])(.*?)\\1",
+                    java.util.regex.Pattern.CASE_INSENSITIVE
+            );
+            java.util.regex.Matcher styleMatcher = stylePattern.matcher(updatedTag);
+
+            if (styleMatcher.find()) {
+                String quote = styleMatcher.group(1);
+                String styleContent = styleMatcher.group(2);
+                String newStyle = styleContent;
+                if (styleContent.toLowerCase(Locale.ROOT).contains("color:")) {
+                    newStyle = styleContent.replaceAll("(?i)color\\s*:[^;]+;?", "color:" + mappedColor + ";");
+                } else {
+                    if (!newStyle.trim().isEmpty() && !newStyle.trim().endsWith(";")) {
+                        newStyle += ";";
+                    }
+                    newStyle += "color:" + mappedColor + ";";
+                }
+                updatedTag = styleMatcher.replaceFirst("style=" + quote + newStyle + quote);
+            } else {
+                int insertPos = updatedTag.lastIndexOf('>');
+                if (insertPos > 0) {
+                    updatedTag = updatedTag.substring(0, insertPos)
+                            + " style=\"color:" + mappedColor + ";\""
+                            + updatedTag.substring(insertPos);
+                }
+            }
+
+            matcher.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(updatedTag));
+        }
+
+        matcher.appendTail(sb);
+        return sb.toString();
     }
 
     public static OpusParagraph[] analyzeParagraphs(JSONArray jsonArray) throws JSONException {
