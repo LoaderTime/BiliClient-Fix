@@ -16,7 +16,11 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Locale;
+
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 public class OpusApi {
 
@@ -415,21 +419,305 @@ public class OpusApi {
         if (articleInfo.content != null && !articleInfo.content.isEmpty()) {
             opus.paragraphs = convertHtmlToParagraphs(articleInfo.content);
         }
+
+        // 先尝试使用 article/view 返回的 opusId 走 detail API 拉结构化段落。
+        // 这个路径不依赖网页反爬，稳定性高于 read/cv 网页补偿。
+        if ((opus.paragraphs == null || opus.paragraphs.length <= 1) && articleInfo.opusId > 0) {
+            OpusParagraph[] apiParagraphs = fetchOpusParagraphsByOpusId(articleInfo.opusId);
+            if (apiParagraphs.length > 0) {
+                opus.paragraphs = apiParagraphs;
+                Logu.i("专栏内容解析: 使用 opus/detail API 补偿解析, opusId="
+                        + articleInfo.opusId + ", 段落数=" + apiParagraphs.length);
+            }
+        }
+
+        // 某些专栏在 /x/article/view 的 content 里只有极简HTML，
+        // 会导致整段挤在一行且图片缺失；此时回源网页再取 opus paragraphs。
+        if ((opus.paragraphs == null || opus.paragraphs.length <= 1) && opus.id > 0) {
+            OpusParagraph[] webParagraphs = fetchOpusParagraphsFromWebPage(opus.id, articleInfo.opusId, articleInfo.content);
+            if (webParagraphs.length > 0) {
+                opus.paragraphs = webParagraphs;
+                Logu.i("专栏内容解析: 使用网页补偿解析, cv=" + opus.id + ", 段落数=" + webParagraphs.length);
+            }
+        }
+
+        if (opus.paragraphs == null) {
+            opus.paragraphs = new OpusParagraph[0];
+        }
         
         // 设置评论信息
         opus.commentId = articleInfo.id;
         opus.commentType = 12; // 专栏的评论类型通常是12
     }
+
+    private static OpusParagraph[] fetchOpusParagraphsByOpusId(long opusId) {
+        if (opusId <= 0) {
+            return new OpusParagraph[0];
+        }
+
+        try {
+            String url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/opus/detail?id="
+                    + opusId + "&timezone_offset=-480&features=htmlNewStyle";
+            JSONObject result = NetWorkUtil.getJson(url);
+            if (result == null || result.optBoolean("retry_failed", false) || result.optInt("code", -1) != 0) {
+                return new OpusParagraph[0];
+            }
+
+            JSONObject data = result.optJSONObject("data");
+            if (data == null) {
+                return new OpusParagraph[0];
+            }
+
+            JSONObject item = data.optJSONObject("item");
+            if (item == null) {
+                return new OpusParagraph[0];
+            }
+
+            JSONArray modules = item.optJSONArray("modules");
+            if (modules == null) {
+                return new OpusParagraph[0];
+            }
+
+            for (int i = 0; i < modules.length(); i++) {
+                JSONObject module = modules.optJSONObject(i);
+                if (module == null) {
+                    continue;
+                }
+                if (!"MODULE_TYPE_CONTENT".equals(module.optString("module_type"))) {
+                    continue;
+                }
+                JSONObject moduleContent = module.optJSONObject("module_content");
+                if (moduleContent == null) {
+                    continue;
+                }
+                JSONArray paragraphs = moduleContent.optJSONArray("paragraphs");
+                if (paragraphs != null && paragraphs.length() > 0) {
+                    return analyzeParagraphs(paragraphs);
+                }
+            }
+        } catch (Exception e) {
+            Logu.e("专栏内容解析: opus/detail API 补偿失败, opusId=" + opusId + ", err=" + e.getMessage());
+        }
+
+        return new OpusParagraph[0];
+    }
+
+    private static OpusParagraph[] fetchOpusParagraphsFromWebPage(long cvid, long opusIdHint, String articleHtml) {
+        ArrayList<String> urlList = new ArrayList<>();
+        HashSet<String> visited = new HashSet<>();
+
+        if (opusIdHint > 0) {
+            urlList.add("https://www.bilibili.com/opus/" + opusIdHint);
+            Logu.i("专栏内容解析: 网页补偿使用 opusIdHint=" + opusIdHint + ", cv=" + cvid);
+        }
+
+        // 专栏稳定入口优先使用 read/cv，避免把 cvid 当成 opusId 造成无效跳转。
+        urlList.add("https://www.bilibili.com/read/cv" + cvid);
+
+        long opusId = extractOpusIdFromHtml(articleHtml);
+        if (opusId > 0) {
+            urlList.add("https://www.bilibili.com/opus/" + opusId);
+            Logu.i("专栏内容解析: 网页补偿识别到 opusId=" + opusId + ", cv=" + cvid);
+        } else {
+            Logu.i("专栏内容解析: 网页补偿未识别 opusId, cv=" + cvid + ", 仅使用 read/cv 入口");
+        }
+
+        for (int i = 0; i < urlList.size(); i++) {
+            String url = urlList.get(i);
+            if (!visited.add(url)) {
+                continue;
+            }
+            try (Response response = NetWorkUtil.get(url, NetWorkUtil.webHeaders);
+                 ResponseBody body = response.body()) {
+                if (body == null) {
+                    continue;
+                }
+
+                String html = body.string();
+                if (html == null || html.isEmpty()) {
+                    continue;
+                }
+
+                // 某些 read/cv 页面不会直接带段落数据，但会包含真实 opus 链接。
+                long discoverOpusId = extractOpusIdFromHtml(html);
+                if (discoverOpusId > 0) {
+                    String discoveredUrl = "https://www.bilibili.com/opus/" + discoverOpusId;
+                    if (!visited.contains(discoveredUrl) && !urlList.contains(discoveredUrl)) {
+                        urlList.add(discoveredUrl);
+                        Logu.i("专栏内容解析: 网页补偿追加真实 opus 链接=" + discoveredUrl + ", from=" + url);
+                    }
+                }
+
+                OpusParagraph[] paragraphs = parseInitialStateContent(html);
+                if (paragraphs.length > 0) {
+                    Logu.i("专栏内容解析: 网页INITIAL_STATE命中, url=" + url + ", 段落数=" + paragraphs.length);
+                    return paragraphs;
+                }
+
+                paragraphs = parseHtmlContent(html);
+                if (paragraphs.length > 1) {
+                    Logu.i("专栏内容解析: 网页HTML命中, url=" + url + ", 段落数=" + paragraphs.length);
+                    return paragraphs;
+                }
+            } catch (Exception e) {
+                Logu.e("专栏内容解析: 网页补偿失败, url=" + url + ", err=" + e.getMessage());
+            }
+        }
+
+        return new OpusParagraph[0];
+    }
+
+    private static long extractOpusIdFromHtml(String html) {
+        if (html == null || html.isEmpty()) {
+            return 0;
+        }
+
+        try {
+            String marker = "window.__INITIAL_STATE__ =";
+            int start = html.indexOf(marker);
+            if (start < 0) {
+                return 0;
+            }
+
+            start += marker.length();
+            int end = html.indexOf(";(function()", start);
+            if (end < 0) {
+                end = html.indexOf("</script>", start);
+            }
+            if (end < 0) {
+                return 0;
+            }
+
+            String rawJson = html.substring(start, end).trim();
+            if (rawJson.endsWith(";")) {
+                rawJson = rawJson.substring(0, rawJson.length() - 1).trim();
+            }
+            if (rawJson.isEmpty() || !rawJson.startsWith("{")) {
+                return 0;
+            }
+
+            JSONObject initialState = new JSONObject(rawJson);
+            JSONObject detail = initialState.optJSONObject("detail");
+            if (detail == null) {
+                return 0;
+            }
+
+            String idStr = detail.optString("id_str", "");
+            if (!idStr.isEmpty()) {
+                try {
+                    return Long.parseLong(idStr);
+                } catch (NumberFormatException ignored) {
+                }
+            }
+
+            return detail.optLong("id", 0);
+        } catch (Exception e) {
+            Logu.e("专栏内容解析: 提取 opusId 失败: " + e.getMessage());
+        }
+
+        // read/cv 页面可能没有 __INITIAL_STATE__，兜底直接从文本里提取 /opus/{id}
+        try {
+            java.util.regex.Matcher matcher = java.util.regex.Pattern
+                    .compile("(?:https?:)?\\/\\/www\\.bilibili\\.com\\/opus\\/(\\d+)")
+                    .matcher(html);
+            if (matcher.find()) {
+                return Long.parseLong(matcher.group(1));
+            }
+        } catch (Exception ignored) {
+        }
+
+        return 0;
+    }
     
     private static OpusParagraph[] convertHtmlToParagraphs(String content) {
         // 首先尝试解析为JSON格式（新版动态/专栏）
         try {
-            return parseJsonContent(content);
+            OpusParagraph[] paragraphs = parseJsonContent(content);
+            if (paragraphs.length > 0) {
+                Logu.i("专栏内容解析: 使用 JSON(ops) 解析, 段落数=" + paragraphs.length);
+                return paragraphs;
+            }
         } catch (Exception e) {
             // JSON解析失败，回退到HTML解析
-            Logu.e("JSON解析失败，尝试HTML解析: " + e.getMessage());
-            return parseHtmlContent(content);
+            Logu.e("JSON(ops)解析失败，继续尝试 INITIAL_STATE: " + e.getMessage());
         }
+
+        // 新版专栏页面（opus-detail）会把完整结构化段落放在 window.__INITIAL_STATE__ 中
+        try {
+            OpusParagraph[] paragraphs = parseInitialStateContent(content);
+            if (paragraphs.length > 0) {
+                Logu.i("专栏内容解析: 使用 __INITIAL_STATE__ 解析, 段落数=" + paragraphs.length);
+                return paragraphs;
+            }
+        } catch (Exception e) {
+            Logu.e("INITIAL_STATE解析失败，继续尝试HTML: " + e.getMessage());
+        }
+
+        OpusParagraph[] paragraphs = parseHtmlContent(content);
+        Logu.i("专栏内容解析: 使用 HTML 回退解析, 段落数=" + paragraphs.length);
+        return paragraphs;
+    }
+
+    private static OpusParagraph[] parseInitialStateContent(String html) throws JSONException {
+        if (html == null || html.isEmpty()) {
+            return new OpusParagraph[0];
+        }
+
+        String marker = "window.__INITIAL_STATE__ =";
+        int start = html.indexOf(marker);
+        if (start < 0) {
+            return new OpusParagraph[0];
+        }
+
+        start += marker.length();
+        int end = html.indexOf(";(function()", start);
+        if (end < 0) {
+            end = html.indexOf("</script>", start);
+        }
+        if (end < 0) {
+            return new OpusParagraph[0];
+        }
+
+        String rawJson = html.substring(start, end).trim();
+        if (rawJson.endsWith(";")) {
+            rawJson = rawJson.substring(0, rawJson.length() - 1).trim();
+        }
+        if (rawJson.isEmpty() || !rawJson.startsWith("{")) {
+            return new OpusParagraph[0];
+        }
+
+        JSONObject initialState = new JSONObject(rawJson);
+        JSONObject detail = initialState.optJSONObject("detail");
+        if (detail == null) {
+            return new OpusParagraph[0];
+        }
+
+        JSONArray modules = detail.optJSONArray("modules");
+        if (modules == null || modules.length() == 0) {
+            return new OpusParagraph[0];
+        }
+
+        for (int i = 0; i < modules.length(); i++) {
+            JSONObject module = modules.optJSONObject(i);
+            if (module == null) {
+                continue;
+            }
+            if (!"MODULE_TYPE_CONTENT".equals(module.optString("module_type"))) {
+                continue;
+            }
+
+            JSONObject moduleContent = module.optJSONObject("module_content");
+            if (moduleContent == null) {
+                continue;
+            }
+
+            JSONArray paragraphs = moduleContent.optJSONArray("paragraphs");
+            if (paragraphs != null && paragraphs.length() > 0) {
+                return analyzeParagraphs(paragraphs);
+            }
+        }
+
+        return new OpusParagraph[0];
     }
     
     private static OpusParagraph[] parseJsonContent(String jsonContent) {

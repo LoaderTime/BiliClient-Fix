@@ -18,6 +18,7 @@ public class ArticleInfo implements Parcelable, Serializable {
     public String keywords;
     public String content; //文章内容
     public long listId; //合集ID（article-list）
+    public long opusId; // 对应的 opusId（部分新专栏需要）
 
     public ArticleInfo() {
     }
@@ -37,6 +38,9 @@ public class ArticleInfo implements Parcelable, Serializable {
         if (in.dataAvail() >= 8) {
             listId = in.readLong();
         }
+        if (in.dataAvail() >= 8) {
+            opusId = in.readLong();
+        }
     }
 
     @Override
@@ -52,6 +56,7 @@ public class ArticleInfo implements Parcelable, Serializable {
         dest.writeString(keywords);
         dest.writeString(content);
         dest.writeLong(listId);
+        dest.writeLong(opusId);
     }
 
     @Override

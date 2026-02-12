@@ -100,7 +100,60 @@ public class ArticleApi {
         } else {
             articleInfo.listId = data.optLong("list_id", 0);
         }
+        // 新版专栏可能绑定了 opusId，用于跳转到 opus 页面
+        articleInfo.opusId = findOpusId(data);
         return articleInfo;
+    }
+
+    private static long findOpusId(JSONObject data) {
+        if (data == null) {
+            return 0;
+        }
+        String[] keys = new String[]{
+                "opus_id",
+                "opusId",
+                "opus_id_str",
+                "opusIdStr",
+                "dynamic_id",
+                "dynamic_id_str",
+                "dyn_id",
+                "dyn_id_str"
+        };
+        for (String key : keys) {
+            if (data.has(key)) {
+                long parsed = parseIdValue(data.opt(key));
+                if (parsed > 0) {
+                    return parsed;
+                }
+            }
+        }
+        return 0;
+    }
+
+    private static long parseIdValue(Object value) {
+        if (value == null) {
+            return 0;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        String raw = value.toString().trim();
+        if (raw.isEmpty()) {
+            return 0;
+        }
+        try {
+            return Long.parseLong(raw);
+        } catch (NumberFormatException ignored) {
+        }
+        String digits = raw.replaceAll("\\D+", "");
+        if (digits.isEmpty()) {
+            return 0;
+        }
+        try {
+            return Long.parseLong(digits);
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     /**
