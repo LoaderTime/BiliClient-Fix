@@ -18,6 +18,7 @@ public class PrivateMessage {
 
     public static final int TYPE_TEXT = 1;
     public static final int TYPE_VIDEO = 7;
+    public static final int TYPE_VIDEO_CARD = 11;
     public static final int TYPE_PIC = 2;
     public static final int TYPE_RETRACT = 5;
     public static final int TYPE_FACE = 6;

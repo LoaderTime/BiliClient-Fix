@@ -3,6 +3,7 @@ package com.RobinNotBad.BiliClient.adapter.message;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.Intent;
+import android.text.TextUtils;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
@@ -34,6 +35,7 @@ import java.text.SimpleDateFormat;
 
 public class NoticeHolder extends RecyclerView.ViewHolder {
     public final LinearLayout avaterList;
+    public final TextView username;
     public final TextView action;
     public final TextView pubdate;
     public final ConstraintLayout extraCard;
@@ -43,6 +45,7 @@ public class NoticeHolder extends RecyclerView.ViewHolder {
         super(itemView);
         this.itemView = itemView;
         avaterList = itemView.findViewById(R.id.avatar_list);
+        username = itemView.findViewById(R.id.username);
         action = itemView.findViewById(R.id.action);
         pubdate = itemView.findViewById(R.id.pubdate);
         extraCard = itemView.findViewById(R.id.extraCard);
@@ -51,8 +54,14 @@ public class NoticeHolder extends RecyclerView.ViewHolder {
     @SuppressLint("SetTextI18n")
     public void showMessage(MessageCard message, Context context) {
         avaterList.removeAllViews();
-        if (message.user.isEmpty()) avaterList.setVisibility(View.GONE);
-        else avaterList.setVisibility(View.VISIBLE);
+        if (message.user.isEmpty()) {
+            avaterList.setVisibility(View.GONE);
+            username.setVisibility(View.GONE);
+        } else {
+            avaterList.setVisibility(View.VISIBLE);
+            username.setVisibility(View.VISIBLE);
+            username.setText(message.user.get(0).name);
+        }
         for (int i = 0; i < message.user.size(); i++) {
             ImageView imageView = new ImageView(context);
             Glide.with(BiliTerminal.context)
@@ -85,7 +94,11 @@ public class NoticeHolder extends RecyclerView.ViewHolder {
             pubdate.setText(sdf.format(message.timeStamp * 1000));
         } else pubdate.setText(message.timeDesc);
 
-        action.setText(message.content);
+        if (message.videoCard != null && !TextUtils.isEmpty(message.videoCard.title)) {
+            action.setText(formatVideoMessage(message.videoCard.title));
+        } else {
+            action.setText(message.content);
+        }
         StringUtil.setCopy(action);
 
         if (message.videoCard != null) {
@@ -147,5 +160,13 @@ public class NoticeHolder extends RecyclerView.ViewHolder {
                 }
             });
         }
+    }
+
+    private String formatVideoMessage(String title) {
+        String content = "[视频] " + title;
+        if (content.length() > 22) {
+            return content.substring(0, 21) + "...";
+        }
+        return content;
     }
 }

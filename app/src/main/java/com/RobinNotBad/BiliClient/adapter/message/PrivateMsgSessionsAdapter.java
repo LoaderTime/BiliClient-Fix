@@ -80,9 +80,13 @@ public class PrivateMsgSessionsAdapter
                         break;
 
                     case PrivateMessage.TYPE_VIDEO:
+                    case PrivateMessage.TYPE_VIDEO_CARD:
                     case PrivateMessage.TYPE_PIC_CARD:
+                        holder.contentText.setText(formatVideoTitle(msgContent.content.optString("title", "")));
+                        break;
+
                     case PrivateMessage.TYPE_NOMAL_CARD:
-                        holder.contentText.setText(msgContent.content.getString("title"));
+                        holder.contentText.setText(formatSystemCardText(msgContent.content));
                         break;
 
                     case PrivateMessage.TYPE_TEXT_WITH_VIDEO:
@@ -118,6 +122,8 @@ public class PrivateMsgSessionsAdapter
                         .placeholder(R.mipmap.akari)
                         .apply(RequestOptions.circleCropTransform())
                         .into(holder.avatarView);
+            } else {
+                holder.nameText.setText(String.valueOf(msgContent.talkerUid));
             }
 
             holder.itemView.setOnClickListener(view -> {
@@ -134,6 +140,22 @@ public class PrivateMsgSessionsAdapter
         } catch (JSONException err) {
             Log.e("PrivateMsgUserAdapter", err.toString());
         }
+    }
+
+    private String formatVideoTitle(String title) {
+        String content = "[视频] " + title;
+        if (content.length() > 22) {
+            return content.substring(0, 21) + "...";
+        }
+        return content;
+    }
+
+    private String formatSystemCardText(org.json.JSONObject content) {
+        String text = content.optString("text", "");
+        if (!TextUtils.isEmpty(text)) {
+            return text;
+        }
+        return content.optString("title", "");
     }
 
     @Override
