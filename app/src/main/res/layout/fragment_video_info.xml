@@ -195,6 +195,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
+            app:backgroundTint="#2F3034"
             android:text="播放" />
 
         <com.google.android.material.card.MaterialCardView
@@ -295,6 +296,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginEnd="2dp"
                 android:layout_weight="0.5"
+                app:backgroundTint="#2F3034"
                 android:text="稍后再看" />
 
             <com.google.android.material.button.MaterialButton
@@ -303,6 +305,7 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="2dp"
                 android:layout_weight="0.5"
+                app:backgroundTint="#2F3034"
                 android:text="缓存" />
         </LinearLayout>
 
@@ -311,6 +314,7 @@
             android:id="@+id/relay"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            app:backgroundTint="#2F3034"
             android:text="转发"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toEndOf="parent"
