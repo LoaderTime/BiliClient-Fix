@@ -136,43 +136,9 @@ public class AppInfoApi {
     }};
 
     private static void checkUpdate(Context context, boolean need_toast, boolean debug_ver) {
-        try {
-            boolean realIsDebug = ToolsUtil.isDebugBuild();
-            String url = "http://api.biliterminal.cn/terminal/version/get_last";
-            if (debug_ver) url += "?debug";
-            JSONObject result = NetWorkUtil.getJson(url, customHeaders);
-
-            if (result.getInt("code") != 0) throw new Exception(result.getString("msg"));
-            JSONObject data = result.getJSONObject("data");
-
-            String version_name = data.getString("version_name");
-            String update_log = data.getString("update_log");
-            int latest = data.getInt("version_code");
-            long ctime = data.optLong("ctime", -1);
-            int can_download = data.optInt("can_download", 0);
-            int is_release = data.optInt("is_release", 0);
-
-            int version = context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionCode;
-            if (latest > version) {
-                MsgUtil.showMsg(debug_ver ? "发现新的测试版！" : "发现新版本！");
-                context.startActivity(new Intent(context, UpdateInfoActivity.class)
-                        .putExtra("versionName", version_name)
-                        .putExtra("versionCode", latest)
-                        .putExtra("updateLog", update_log)
-                        .putExtra("ctime", ctime)
-                        .putExtra("isRelease", is_release)
-                        .putExtra("canDownload", can_download));
-                return;
-            } else if (need_toast && !(realIsDebug && !debug_ver)) {
-                MsgUtil.showMsg(debug_ver ? "没有新的测试版了！" : "当前是最新版本！");
-            }
-            if (realIsDebug && !debug_ver) {
-                checkUpdate(context, need_toast, true);
-            }
-        } catch (IOException | JSONException e) {
-            MsgUtil.err("检查更新：", e);
-        } catch (Exception e) {
-            MsgUtil.showMsg(e.getMessage());
+        // 更新接口已停用，直接显示当前是最新版本
+        if (need_toast) {
+            MsgUtil.showMsg(debug_ver ? "没有新的测试版了！" : "当前是最新版本！");
         }
     }
 
@@ -181,13 +147,8 @@ public class AppInfoApi {
     }
 
     public static String getDownloadUrl(int versionCode) throws Exception {
-        String url = "https://api.biliterminal.cn/terminal/version/get_download_url" + new NetWorkUtil.FormData().setUrlParam(true)
-                .put("version_code", versionCode);
-        JSONObject result = NetWorkUtil.getJson(url, customHeaders);
-
-        if (result.getInt("code") != 0) throw new Exception("错误：" + result.getString("msg"));
-
-        return result.optString("data");
+        // 更新接口已停用，返回空字符串
+        return "";
     }
 
     public static void checkAnnouncement() throws Exception {
