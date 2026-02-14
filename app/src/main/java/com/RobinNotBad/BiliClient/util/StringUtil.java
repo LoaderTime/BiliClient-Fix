@@ -87,6 +87,27 @@ public class StringUtil {
             return String.valueOf(num);
     }
 
+    /**
+     * 单位转换 - 处理任意对象
+     *
+     * @param obj 原始数字对象
+     * @return 转换后的字符串
+     */
+    public static String toWan(Object obj) {
+        if (obj == null) return "0";
+        try {
+            long num;
+            if (obj instanceof Number) {
+                num = ((Number) obj).longValue();
+            } else {
+                num = Long.parseLong(obj.toString());
+            }
+            return toWan(num);
+        } catch (Exception e) {
+            return String.valueOf(obj);
+        }
+    }
+
     public static String toTime(int progress) {
         int cghour = progress / 3600;
         int cgminute = (progress % 3600) / 60;

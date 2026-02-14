@@ -93,6 +93,10 @@ public class VideoInfoActivity extends BaseActivity {
 
         setPageName("视频详情");
         TerminalContext.getInstance().getVideoInfoByAidOrBvId(aid, bvid).observe(this, (result) -> result.onSuccess((videoInfo) -> {
+            // 修复 Android 4.x 上的生命周期问题
+            // 确保 Activity 处于有效状态时才执行 Fragment 事务
+            if (isFinishing()) return;
+            
             aid = videoInfo.aid;
             bvid = videoInfo.bvid;
             fragmentList = new ArrayList<>(3);
@@ -110,6 +114,9 @@ public class VideoInfoActivity extends BaseActivity {
             viewPager.setAdapter(vpfAdapter);
             if (seek_reply != -1) viewPager.setCurrentItem(1);
         }).onFailure((error) -> {
+            // 同样检查 Activity 状态
+            if (isFinishing()) return;
+            
             loading.setImageResource(R.mipmap.loading_2233_error);
             MsgUtil.showMsg("获取信息失败！\n可能是视频不存在？");
             CenterThreadPool.runOnUIThreadAfter(5L, TimeUnit.SECONDS, () ->

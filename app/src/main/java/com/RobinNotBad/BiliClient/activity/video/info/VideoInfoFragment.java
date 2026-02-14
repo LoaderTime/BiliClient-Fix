@@ -63,6 +63,7 @@ import com.RobinNotBad.BiliClient.util.GlideUtil;
 import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
+import com.RobinNotBad.BiliClient.util.LinkUrlUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
 import com.RobinNotBad.BiliClient.util.TerminalContext;
 import com.RobinNotBad.BiliClient.util.ToolsUtil;
@@ -337,14 +338,33 @@ public class VideoInfoFragment extends BaseFragment {
         timeText.setText(videoInfo.timeDesc);
         durationText.setText(videoInfo.duration);
 
-        description.setText(videoInfo.description);
+        // 修复 Android 4.x 上的 SpannableString 兼容性问题
+        // 合并多次 setText 操作，避免内部数组状态异常导致 ArrayIndexOutOfBoundsException
+        SpannableStringBuilder descBuilder = new SpannableStringBuilder(videoInfo.description);
+        
+        // 先设置 link（仅修改 SpannableStringBuilder，不调用 setText）
+        if (SharedPreferencesUtil.getBoolean(SharedPreferencesUtil.LINK_ENABLE, true)) {
+            // 手动处理 URL 链接，避免调用 setLink(TextView...) 导致的多次 setText
+            StringUtil.setLink(descBuilder);
+        }
+        
+        // 处理 @ 链接 - 直接在 SpannableStringBuilder 上添加 span
+        if (videoInfo.descAts != null && !videoInfo.descAts.isEmpty()) {
+            for (com.RobinNotBad.BiliClient.model.At at : videoInfo.descAts) {
+                descBuilder.setSpan(new StringUtil.LinkClickableSpan(
+                        descBuilder.subSequence(at.start, at.end).toString(),
+                        LinkUrlUtil.TYPE_USER, String.valueOf(at.id)),
+                    at.start, at.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+        }
+        
+        description.setText(descBuilder);
+        
         description.setOnClickListener(view1 -> {
             if (desc_expand) description.setMaxLines(3);
             else description.setMaxLines(512);
             desc_expand = !desc_expand;
         });
-        StringUtil.setLink(description);
-        StringUtil.setAtLink(videoInfo.descAts, description);
         StringUtil.setCopy(description);
 
         bvidText.setOnLongClickListener(v -> {
