@@ -296,7 +296,13 @@ public class VideoInfoFragment extends BaseFragment {
                 if (playerData == null) return;
                 HistoryApi.reportHistory(videoInfo.aid, playerData.cidHistory, playerData.progress / 1000);
             } catch (Exception e) {
-                MsgUtil.err(e);
+                // 未登录用户可能无法获取视频播放地址，显示提示而不是错误弹窗
+                if (e instanceof org.json.JSONException || 
+                    (e.getMessage() != null && e.getMessage().contains("durl"))) {
+                    runOnUiThread(() -> MsgUtil.showMsg("数据解析错误\n建议登陆后再尝试"));
+                } else {
+                    MsgUtil.err(e);
+                }
             }
             onFinishLoad();
         });
