@@ -95,6 +95,8 @@ public class AppInfoApi {
             }
         } catch (IOException e) {
             MsgUtil.showMsg("无法连接到终端公告接口\n也许是服务器宕机了？\n（对软件内容无影响）");
+        } catch (JSONException e) {
+            MsgUtil.showMsg("解析错误");
         } catch (Exception e) {
             Log.e("debug-terminal", e.toString());
             MsgUtil.err("终端接口出现问题（不影响软件内容）", e);
@@ -192,7 +194,7 @@ public class AppInfoApi {
         String url = "http://api.biliterminal.cn/terminal/announcement/get_list?from=" + SharedPreferencesUtil.getInt("app_announcement_last", -1);
         JSONObject result = NetWorkUtil.getJson(url, customHeaders);
 
-        if (result.getInt("code") != 0) throw new Exception("错误：" + result.getString("msg"));
+        if (result.getInt("code") != 0) throw new Exception("错误：" + result.optString("msg", "解析错误"));
         JSONArray data = result.getJSONArray("data");
         for (int i = 0; i < data.length(); i++) {
             JSONObject item = data.getJSONObject(i);

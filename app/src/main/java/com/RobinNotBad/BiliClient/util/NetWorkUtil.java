@@ -27,8 +27,11 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.zip.Inflater;
 
 import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 
+import okhttp3.ConnectionSpec;
 import okhttp3.Dns;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
@@ -63,29 +66,7 @@ public class NetWorkUtil {
         while (INSTANCE.get() == null) {
             INSTANCE.compareAndSet(null, setOkHttpSsl(new OkHttpClient.Builder())
                     .followRedirects(false)
-                    .addInterceptor(chain -> {
-                        Request request = chain.request();
-                        Response response = chain.proceed(request);
-                        RedirectHandler handler;
-                        String location = response.header("Location");
-                        boolean isSslRedirect = false;
-                        try {
-                            isSslRedirect = location != null && !request.isHttps() && new URI(location).getScheme().equalsIgnoreCase("https") && request.url().host().equalsIgnoreCase(new URI(location).getHost());
-                        } catch (URISyntaxException ignored) {
-                        }
-
-                        if (response.isRedirect() && location != null) {
-                            if (request.url().host().equals("b23.tv") && !isSslRedirect && (handler = request.tag(RedirectHandler.class)) != null) {
-                                handler.handleRedirect(location);
-                            } else {
-                                Request newRequest = request.newBuilder()
-                                        .url(location)
-                                        .build();
-                                return chain.proceed(newRequest);
-                            }
-                        }
-                        return response;
-                    })
+                    .addInterceptor(new RedirectInterceptor())
                     .addInterceptor(new CookieSaveInterceptor())
                     .dns(new Inet4Selector())
                     .pingInterval(8, TimeUnit.SECONDS)
@@ -98,29 +79,28 @@ public class NetWorkUtil {
     public synchronized static OkHttpClient.Builder setOkHttpSsl(OkHttpClient.Builder okhttpBuilder) {
         if (Build.VERSION.SDK_INT > 22) return okhttpBuilder;
         try {
-            @SuppressLint("CustomX509TrustManager") final X509TrustManager trustAllCert =
-                    new X509TrustManager() {
-                        @SuppressLint("TrustAllX509TrustManager")
-                        @Override
-                        public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                        }
-
-                        @SuppressLint("TrustAllX509TrustManager")
-                        @Override
-                        public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
-                        }
-
-                        @Override
-                        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
-                            return new java.security.cert.X509Certificate[]{};
-                        }
-                    };
-            final SSLSocketFactory sslSocketFactory = new SSLSocketFactoryCompat(trustAllCert);
-            okhttpBuilder.sslSocketFactory(sslSocketFactory, trustAllCert);
+            final X509TrustManager trustManager = getSystemTrustManager();
+            final SSLSocketFactory sslSocketFactory = new SSLSocketFactoryCompat(trustManager);
+            okhttpBuilder.sslSocketFactory(sslSocketFactory, trustManager);
+            okhttpBuilder.connectionSpecs(Arrays.asList(
+                    ConnectionSpec.MODERN_TLS,
+                    ConnectionSpec.COMPATIBLE_TLS,
+                    ConnectionSpec.CLEARTEXT
+            ));
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
         return okhttpBuilder;
+    }
+
+    private static X509TrustManager getSystemTrustManager() throws Exception {
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init((java.security.KeyStore) null);
+        TrustManager[] trustManagers = trustManagerFactory.getTrustManagers();
+        if (trustManagers.length != 1 || !(trustManagers[0] instanceof X509TrustManager)) {
+            throw new IllegalStateException("Unexpected default trust managers:" + Arrays.toString(trustManagers));
+        }
+        return (X509TrustManager) trustManagers[0];
     }
 
     public static JSONObject getJson(String url) throws IOException {
@@ -289,8 +269,7 @@ public class NetWorkUtil {
         Logu.d("get-url", url);
         OkHttpClient client = getOkHttpInstance();
         Request.Builder requestBuilder = new Request.Builder().url(url).get();
-        for (int i = 0; i < headers.size(); i += 2)
-            requestBuilder.addHeader(headers.get(i), headers.get(i + 1));
+        addHeaders(requestBuilder, headers);
         if (redirectHandler != null) requestBuilder.tag(RedirectHandler.class, redirectHandler);
         Request request = requestBuilder.build();
         return client.newCall(request).execute();
@@ -302,9 +281,10 @@ public class NetWorkUtil {
         OkHttpClient client = getOkHttpInstance();
         RequestBody body = RequestBody.create(MediaType.parse(contentType + "; charset=utf-8"), data);
         Request.Builder requestBuilder = new Request.Builder().url(url).post(body);
-        for (int i = 0; i < headers.size(); i += 2) {
-            String key = headers.get(i);
-            String val = headers.get(i + 1);
+        ArrayList<String> stableHeaders = new ArrayList<>(headers);
+        for (int i = 0; i < stableHeaders.size(); i += 2) {
+            String key = stableHeaders.get(i);
+            String val = stableHeaders.get(i + 1);
             if (key.equalsIgnoreCase("Content-Type")) val = contentType;
             requestBuilder.addHeader(key, val);
         }
@@ -483,6 +463,17 @@ public class NetWorkUtil {
         webHeaders.set(1, SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
     }
 
+    public static ArrayList<String> getWebHeadersSnapshot() {
+        return new ArrayList<>(webHeaders);
+    }
+
+    public static void addHeaders(Request.Builder requestBuilder, List<String> headers) {
+        ArrayList<String> stableHeaders = new ArrayList<>(headers);
+        for (int i = 0; i + 1 < stableHeaders.size(); i += 2) {
+            requestBuilder.addHeader(stableHeaders.get(i), stableHeaders.get(i + 1));
+        }
+    }
+
     public static class FormData {
         private final Map<String, String> data;
         private boolean isUrlParam;
@@ -540,6 +531,36 @@ public class NetWorkUtil {
         public Response intercept(Chain chain) throws IOException {
             Response response = chain.proceed(chain.request());
             saveCookiesFromResponse(response);
+            return response;
+        }
+    }
+
+    private static class RedirectInterceptor implements Interceptor {
+        @NonNull
+        @Override
+        public Response intercept(@NonNull Chain chain) throws IOException {
+            Request request = chain.request();
+            Response response = chain.proceed(request);
+            RedirectHandler handler;
+            String location = response.header("Location");
+            boolean isSslRedirect = false;
+            try {
+                isSslRedirect = location != null
+                        && !request.isHttps()
+                        && new URI(location).getScheme().equalsIgnoreCase("https")
+                        && request.url().host().equalsIgnoreCase(new URI(location).getHost());
+            } catch (URISyntaxException ignored) {
+            }
+
+            if (response.isRedirect() && location != null) {
+                if (request.url().host().equals("b23.tv") && !isSslRedirect && (handler = request.tag(RedirectHandler.class)) != null) {
+                    handler.handleRedirect(location);
+                } else {
+                    Request newRequest = request.newBuilder().url(location).build();
+                    response.close();
+                    return chain.proceed(newRequest);
+                }
+            }
             return response;
         }
     }

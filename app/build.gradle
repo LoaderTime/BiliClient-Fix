@@ -2,6 +2,13 @@ plugins {
     id 'com.android.application'
 }
 
+configurations.all {
+    resolutionStrategy {
+        force 'com.squareup.okhttp3:okhttp:3.12.13'
+        force 'com.squareup.okio:okio:1.17.5'
+    }
+}
+
 int betaVer = 0 //如果为0则是正式版
 
 android {
@@ -96,7 +103,8 @@ dependencies {
     //noinspection GradleDependency
     implementation 'com.google.android.material:material:1.9.0'
     //noinspection GradleDependency
-    implementation 'com.squareup.okhttp3:okhttp:3.12.1'
+    implementation 'com.squareup.okhttp3:okhttp:3.12.13'
+    implementation 'com.squareup.okio:okio:1.17.5'
     implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
     implementation 'com.github.bumptech.glide:glide:4.13.2'
     implementation 'com.github.bumptech.glide:okhttp3-integration:4.13.2'

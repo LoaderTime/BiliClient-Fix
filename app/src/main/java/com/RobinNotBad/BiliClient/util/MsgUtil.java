@@ -145,7 +145,7 @@ public class MsgUtil {
     public static void err(String desc, Throwable e) {
         Context context = BiliTerminal.context;
         if (desc != null) Log.e("debug-error", desc);
-        e.printStackTrace();
+        safePrintStackTrace(e);
 
         StringBuilder output = new StringBuilder(TextUtils.isEmpty(desc) ? "" : desc + "\n");
 
@@ -187,6 +187,18 @@ public class MsgUtil {
         }
 
         showMsgLong(output.toString());
+    }
+
+    private static void safePrintStackTrace(Throwable e) {
+        try {
+            e.printStackTrace();
+        } catch (Throwable printErr) {
+            Log.e("debug-error", "printStackTrace failed: " + printErr);
+            try {
+                Log.e("debug-error", "origin throwable class: " + e.getClass().getName() + ", message: " + e.getMessage());
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     public static void showText(String title, String text) {

@@ -25,11 +25,9 @@ public class CustomGlideModule extends AppGlideModule {
     public void registerComponents(@NonNull Context context, @NonNull Glide glide, @NonNull Registry registry) {
         OkHttpClient.Builder builder = NetWorkUtil.setOkHttpSsl(new OkHttpClient.Builder());
         builder.addInterceptor(chain -> {
-            ArrayList<String> headers = NetWorkUtil.webHeaders;
+            ArrayList<String> headers = NetWorkUtil.getWebHeadersSnapshot();
             Request.Builder requestBuilder = chain.request().newBuilder();
-            for (int i = 0; i < headers.size(); i += 2)
-                requestBuilder.addHeader(headers.get(i), headers.get(i + 1));
-
+            NetWorkUtil.addHeaders(requestBuilder, headers);
             return chain.proceed(requestBuilder.build());
         });
 
