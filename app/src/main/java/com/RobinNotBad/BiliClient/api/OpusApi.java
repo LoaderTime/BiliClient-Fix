@@ -841,35 +841,32 @@ public class OpusApi {
         return imgUrl;
     }
     
+    private static final String STRIKE_MARK_START = "BC_STRIKE_START_5f2d9c";
+    private static final String STRIKE_MARK_END = "BC_STRIKE_END_5f2d9c";
+
     private static void addTextParagraphs(ArrayList<OpusParagraph> paragraphs, String htmlText, boolean isCaption) {
         if (htmlText == null || htmlText.isEmpty()) {
             return;
         }
 
         htmlText = applyArticleColorClassMapping(htmlText);
-        htmlText = convertLineThroughStyleToStrikeTag(htmlText);
+        htmlText = markLineThroughRanges(htmlText);
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) {
+            htmlText = convertSpanColorStyleToFontTag(htmlText);
+        }
 
         CharSequence spanned;
-        CharSequence strikeSpanned;
-        String colorPriorityHtml = htmlText.replaceAll("(?i)text-decoration\\s*:\\s*line-through\\s*;?", "");
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
-            spanned = android.text.Html.fromHtml(colorPriorityHtml, android.text.Html.FROM_HTML_MODE_LEGACY);
-            strikeSpanned = android.text.Html.fromHtml(htmlText, android.text.Html.FROM_HTML_MODE_LEGACY);
+            spanned = android.text.Html.fromHtml(htmlText, android.text.Html.FROM_HTML_MODE_LEGACY);
         } else {
-            spanned = android.text.Html.fromHtml(colorPriorityHtml);
-            strikeSpanned = android.text.Html.fromHtml(htmlText);
+            spanned = android.text.Html.fromHtml(htmlText);
         }
 
         if (!(spanned instanceof android.text.Spanned) || spanned.length() == 0) {
             return;
         }
 
-        android.text.SpannableStringBuilder ssb;
-        if (strikeSpanned instanceof android.text.Spanned) {
-            ssb = new android.text.SpannableStringBuilder(strikeSpanned);
-        } else {
-            ssb = new android.text.SpannableStringBuilder(spanned);
-        }
+        android.text.SpannableStringBuilder ssb = new android.text.SpannableStringBuilder(spanned);
 
         android.text.Spanned colorSpanned = (android.text.Spanned) spanned;
         android.text.style.ForegroundColorSpan[] colorSpans =
@@ -903,6 +900,8 @@ public class OpusApi {
             }
         }
 
+        applyStrikeMarkers(ssb);
+
         if (isCaption) {
             ssb.setSpan(
                     new android.text.style.AlignmentSpan.Standard(android.text.Layout.Alignment.ALIGN_CENTER),
@@ -919,10 +918,10 @@ public class OpusApi {
     }
 
     /**
-     * Android Html.fromHtml 对 style="text-decoration: line-through" 兼容性不稳定，
-     * 转成 <strike> 以稳定生成 StrikethroughSpan。
+     * 低版本 Android 的 Html.fromHtml 对 span style="color:..." 兼容较差，
+     * 转换为 <font color="..."> 以提升 API < 24 的颜色解析稳定性。
      */
-    private static String convertLineThroughStyleToStrikeTag(String htmlText) {
+    private static String convertSpanColorStyleToFontTag(String htmlText) {
         if (htmlText == null || htmlText.isEmpty()) {
             return htmlText;
         }
@@ -930,7 +929,7 @@ public class OpusApi {
         java.util.regex.Pattern tagPattern = java.util.regex.Pattern.compile("<(/?)([A-Za-z0-9]+)([^>]*)>");
         java.util.regex.Matcher matcher = tagPattern.matcher(htmlText);
         StringBuilder out = new StringBuilder();
-        java.util.ArrayDeque<Boolean> strikeSpanStack = new java.util.ArrayDeque<>();
+        java.util.ArrayDeque<Boolean> colorFontStack = new java.util.ArrayDeque<>();
 
         int last = 0;
         while (matcher.find()) {
@@ -949,8 +948,131 @@ public class OpusApi {
 
             if (isClosing) {
                 out.append(matcher.group(0));
-                if (!strikeSpanStack.isEmpty() && strikeSpanStack.pop()) {
-                    out.append("</strike>");
+                if (!colorFontStack.isEmpty() && colorFontStack.pop()) {
+                    out.append("</font>");
+                }
+                last = matcher.end();
+                continue;
+            }
+
+            boolean hasColor = false;
+            String colorValue = null;
+
+            java.util.regex.Pattern stylePattern = java.util.regex.Pattern.compile(
+                    "\\bstyle\\s*=\\s*(['\"])(.*?)\\1",
+                    java.util.regex.Pattern.CASE_INSENSITIVE
+            );
+            java.util.regex.Matcher styleMatcher = stylePattern.matcher(attrs);
+            if (styleMatcher.find()) {
+                String styleContent = styleMatcher.group(2);
+                java.util.regex.Matcher colorMatcher = java.util.regex.Pattern.compile(
+                        "(?i)color\\s*:\\s*([^;]+)"
+                ).matcher(styleContent == null ? "" : styleContent);
+                if (colorMatcher.find()) {
+                    hasColor = true;
+                    colorValue = colorMatcher.group(1);
+                    if (colorValue != null) {
+                        colorValue = colorValue.trim();
+                    }
+                }
+            }
+
+            if (hasColor && colorValue != null && !colorValue.isEmpty()) {
+                out.append("<font color=\"").append(colorValue).append("\">");
+            }
+            out.append(matcher.group(0));
+            colorFontStack.push(hasColor && colorValue != null && !colorValue.isEmpty());
+
+            last = matcher.end();
+        }
+
+        out.append(htmlText.substring(last));
+        return out.toString();
+    }
+
+    private static void applyStrikeMarkers(android.text.SpannableStringBuilder ssb) {
+        String text = ssb.toString();
+        java.util.ArrayDeque<Integer> startStack = new java.util.ArrayDeque<>();
+        java.util.ArrayList<int[]> ranges = new java.util.ArrayList<>();
+
+        int cursor = 0;
+        while (cursor < text.length()) {
+            int startIdx = text.indexOf(STRIKE_MARK_START, cursor);
+            int endIdx = text.indexOf(STRIKE_MARK_END, cursor);
+
+            if (startIdx == -1 && endIdx == -1) {
+                break;
+            }
+
+            if (endIdx == -1 || (startIdx != -1 && startIdx < endIdx)) {
+                startStack.push(startIdx);
+                cursor = startIdx + STRIKE_MARK_START.length();
+            } else {
+                if (!startStack.isEmpty()) {
+                    int startMark = startStack.pop();
+                    ranges.add(new int[]{startMark, endIdx});
+                }
+                cursor = endIdx + STRIKE_MARK_END.length();
+            }
+        }
+
+        for (int i = ranges.size() - 1; i >= 0; i--) {
+            int[] range = ranges.get(i);
+            int start = range[0];
+            int end = range[1];
+            if (start >= 0 && end > start && end <= ssb.length()) {
+                ssb.setSpan(
+                        new android.text.style.StrikethroughSpan(),
+                        start + STRIKE_MARK_START.length(),
+                        end,
+                        android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                );
+            }
+        }
+
+        removeAllMarkerText(ssb, STRIKE_MARK_END);
+        removeAllMarkerText(ssb, STRIKE_MARK_START);
+    }
+
+    private static void removeAllMarkerText(android.text.SpannableStringBuilder ssb, String marker) {
+        int idx = ssb.toString().indexOf(marker);
+        while (idx >= 0) {
+            ssb.delete(idx, idx + marker.length());
+            idx = ssb.toString().indexOf(marker, idx);
+        }
+    }
+
+    /**
+     * 用 marker 标记 line-through 文本范围，避免低版本 Html.fromHtml 丢失删除线 span。
+     */
+    private static String markLineThroughRanges(String htmlText) {
+        if (htmlText == null || htmlText.isEmpty()) {
+            return htmlText;
+        }
+
+        java.util.regex.Pattern tagPattern = java.util.regex.Pattern.compile("<(/?)([A-Za-z0-9]+)([^>]*)>");
+        java.util.regex.Matcher matcher = tagPattern.matcher(htmlText);
+        StringBuilder out = new StringBuilder();
+        java.util.ArrayDeque<Boolean> strikeTagStack = new java.util.ArrayDeque<>();
+        java.util.HashSet<String> voidTags = new java.util.HashSet<>();
+        java.util.Collections.addAll(voidTags,
+                "br", "img", "hr", "input", "meta", "link", "base", "col",
+                "area", "param", "source", "track", "wbr");
+
+        int last = 0;
+        while (matcher.find()) {
+            out.append(htmlText, last, matcher.start());
+
+            String slash = matcher.group(1);
+            String tagName = matcher.group(2);
+            String attrs = matcher.group(3);
+            boolean isClosing = slash != null && !slash.isEmpty();
+            String lowerTagName = tagName == null ? "" : tagName.toLowerCase(Locale.ROOT);
+
+            if (isClosing) {
+                out.append(matcher.group(0));
+                if (!strikeTagStack.isEmpty() && strikeTagStack.pop()) {
+                    out.append(STRIKE_MARK_END);
                 }
                 last = matcher.end();
                 continue;
@@ -958,6 +1080,7 @@ public class OpusApi {
 
             boolean hasStrike = false;
             String newAttrs = attrs;
+            boolean selfClosing = attrs != null && attrs.trim().endsWith("/");
 
             java.util.regex.Pattern stylePattern = java.util.regex.Pattern.compile(
                     "\\bstyle\\s*=\\s*(['\"])(.*?)\\1",
@@ -970,7 +1093,7 @@ public class OpusApi {
                 if (styleContent != null && styleContent.toLowerCase(Locale.ROOT).contains("line-through")) {
                     hasStrike = true;
                     String cleanedStyle = styleContent.replaceAll(
-                            "(?i)text-decoration\\s*:[^;]*line-through[^;]*;?",
+                            "(?i)text-decoration(?:-line)?\\s*:[^;]*line-through[^;]*;?",
                             ""
                     ).trim();
                     if (cleanedStyle.isEmpty()) {
@@ -985,10 +1108,17 @@ public class OpusApi {
             }
 
             if (hasStrike) {
-                out.append("<strike>");
+                out.append(STRIKE_MARK_START);
             }
-            out.append("<span").append(newAttrs).append(">");
-            strikeSpanStack.push(hasStrike);
+            out.append("<").append(tagName).append(newAttrs).append(">");
+
+            if (selfClosing || voidTags.contains(lowerTagName)) {
+                if (hasStrike) {
+                    out.append(STRIKE_MARK_END);
+                }
+            } else {
+                strikeTagStack.push(hasStrike);
+            }
             last = matcher.end();
         }
 
