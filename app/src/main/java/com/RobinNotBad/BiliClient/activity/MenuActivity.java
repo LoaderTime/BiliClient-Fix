@@ -1,6 +1,7 @@
 package com.RobinNotBad.BiliClient.activity;
 
 import android.annotation.SuppressLint;
+import android.content.res.ColorStateList;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Process;
@@ -160,6 +161,7 @@ public class MenuActivity extends BaseActivity {
                     materialButton.setText(Objects.requireNonNull(btnNames.get(btn)).first);
                     break;
             }
+            materialButton.setBackgroundTintList(ColorStateList.valueOf(0xFF2F3034));
             materialButton.setOnClickListener(view -> killAndJump(btn));
             layout.addView(materialButton, params);
         }
@@ -244,4 +246,5 @@ public class MenuActivity extends BaseActivity {
         return super.onKeyDown(keyCode, event);
     }
 }
+
 
