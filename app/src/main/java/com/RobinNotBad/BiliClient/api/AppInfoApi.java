@@ -191,44 +191,12 @@ public class AppInfoApi {
     }
 
     public static void checkAnnouncement() throws Exception {
-        String url = "http://api.biliterminal.cn/terminal/announcement/get_list?from=" + SharedPreferencesUtil.getInt("app_announcement_last", -1);
-        JSONObject result = NetWorkUtil.getJson(url, customHeaders);
-
-        if (result.getInt("code") != 0) throw new Exception("错误：" + result.optString("msg", "解析错误"));
-        JSONArray data = result.getJSONArray("data");
-        for (int i = 0; i < data.length(); i++) {
-            JSONObject item = data.getJSONObject(i);
-
-            int id = item.getInt("id");
-
-            if (SharedPreferencesUtil.getInt("app_announcement_last", 0) < id)
-                SharedPreferencesUtil.putInt("app_announcement_last", id);
-            String title = item.getString("title");
-            String content = item.getString("content");
-            MsgUtil.showText(title, content);
-        }
+        // 原公告接口已停运：保留方法以兼容旧调用，不再访问网络
     }
 
     public static ArrayList<Announcement> getAnnouncementList() throws Exception {
-        String url = "http://api.biliterminal.cn/terminal/announcement/get_list";
-        JSONObject result = NetWorkUtil.getJson(url, customHeaders);
-
-        if (result.getInt("code") != 0) throw new Exception("错误：" + result.getString("msg"));
-        JSONArray data = result.getJSONArray("data");
-
-        @SuppressLint("SimpleDateFormat") SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
-
-        ArrayList<Announcement> list = new ArrayList<>();
-        for (int i = 0; i < data.length(); i++) {
-            JSONObject section = data.getJSONObject(i);
-            Announcement announcement = new Announcement();
-            announcement.id = section.getInt("id");
-            announcement.ctime = sdf.format(section.getLong("ctime") * 1000);
-            announcement.title = section.getString("title");
-            announcement.content = section.getString("content");
-            list.add(announcement);
-        }
-        return list;
+        // 原公告接口已停运：公告列表固定返回空
+        return new ArrayList<>();
     }
 
     public static ApiResult uploadStack(String stack, Context context) {
