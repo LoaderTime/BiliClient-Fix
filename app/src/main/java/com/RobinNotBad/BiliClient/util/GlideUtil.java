@@ -59,7 +59,7 @@ public class GlideUtil {
 
     public static void request(ImageView view, String url, int placeholder) {
         Glide.with(view).asDrawable().load(url(url))
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .format(DecodeFormat.PREFER_RGB_565)
                 .transition(GlideUtil.getTransitionOptions())
                 .placeholder(placeholder)
@@ -68,7 +68,7 @@ public class GlideUtil {
 
     public static void requestRound(ImageView view, String url, int placeholder) {
         Glide.with(view).asDrawable().load(url(url))
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .format(DecodeFormat.PREFER_RGB_565)
                 .transition(GlideUtil.getTransitionOptions())
                 .placeholder(placeholder)
@@ -78,7 +78,7 @@ public class GlideUtil {
 
     public static void request(ImageView view, String url, int roundCorners, int placeholder) {
         Glide.with(view).asDrawable().load(url(url))
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .format(DecodeFormat.PREFER_RGB_565)
                 .transition(GlideUtil.getTransitionOptions())
                 .placeholder(placeholder)

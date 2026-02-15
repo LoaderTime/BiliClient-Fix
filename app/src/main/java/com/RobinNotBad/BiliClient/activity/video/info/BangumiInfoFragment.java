@@ -106,7 +106,7 @@ public class BangumiInfoFragment extends Fragment {
         Glide.with(requireContext())
                 .load(GlideUtil.url(bangumi.info.cover_horizontal))
                 .transition(GlideUtil.getTransitionOptions())
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .placeholder(R.mipmap.placeholder)
                 .into(imageMediaCover);
         imageMediaCover.setOnClickListener((view) -> startActivity(new Intent(view.getContext(), ImageViewerActivity.class).putExtra("imageList", new ArrayList<>(List.of(bangumi.info.cover_horizontal)))));

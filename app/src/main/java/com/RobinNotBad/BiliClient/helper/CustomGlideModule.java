@@ -7,9 +7,11 @@ import androidx.annotation.NonNull;
 
 import com.RobinNotBad.BiliClient.util.NetWorkUtil;
 import com.bumptech.glide.Glide;
+import com.bumptech.glide.GlideBuilder;
 import com.bumptech.glide.Registry;
 import com.bumptech.glide.annotation.GlideModule;
 import com.bumptech.glide.integration.okhttp3.OkHttpUrlLoader;
+import com.bumptech.glide.load.engine.cache.InternalCacheDiskCacheFactory;
 import com.bumptech.glide.load.model.GlideUrl;
 import com.bumptech.glide.module.AppGlideModule;
 
@@ -24,6 +26,18 @@ import okhttp3.Response;
 
 @GlideModule
 public class CustomGlideModule extends AppGlideModule {
+
+    /**
+     * Glide 磁盘缓存大小（避免默认缓存过大）。
+     * 取值偏保守，以兼容低存储设备。
+     */
+    private static final int DISK_CACHE_SIZE_BYTES = 8 * 1024 * 1024;
+
+    @Override
+    public void applyOptions(@NonNull Context context, @NonNull GlideBuilder builder) {
+        builder.setDiskCache(new InternalCacheDiskCacheFactory(context, DISK_CACHE_SIZE_BYTES));
+    }
+
     @Override
     public void registerComponents(@NonNull Context context, @NonNull Glide glide, @NonNull Registry registry) {
         OkHttpClient.Builder builder = NetWorkUtil.setOkHttpSsl(new OkHttpClient.Builder());

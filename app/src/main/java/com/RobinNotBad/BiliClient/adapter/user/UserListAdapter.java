@@ -69,7 +69,7 @@ public class UserListAdapter extends RecyclerView.Adapter<UserListAdapter.Holder
                     .transition(GlideUtil.getTransitionOptions())
                     .placeholder(R.mipmap.akari)
                     .apply(RequestOptions.circleCropTransform())
-                    .diskCacheStrategy(DiskCacheStrategy.NONE)
+                    .diskCacheStrategy(DiskCacheStrategy.DATA)
                     .into(holder.avatar);
             holder.avatar.setVisibility(View.VISIBLE);
             holder.desc.setSingleLine(true);

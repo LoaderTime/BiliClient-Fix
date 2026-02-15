@@ -138,18 +138,28 @@ public class DownloadAdapter extends RecyclerView.Adapter<DownloadAdapter.Downlo
                 Glide.with(BiliTerminal.context).asDrawable().load(section.url_cover)
                         .transition(GlideUtil.getTransitionOptions())
                         .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(5))))
-                        .diskCacheStrategy(DiskCacheStrategy.NONE)
+                        .diskCacheStrategy(DiskCacheStrategy.DATA)
                         .into(cover);
         }
 
         @SuppressLint({"SetTextI18n"})
         public void showProgress(String state, float percent) {
-            if (state == null || percent == -1) {
+            if (state == null || percent == DownloadService.PERCENT_NONE) {
                 progress.setVisibility(View.GONE);
                 return;
             }
             progress.setVisibility(View.VISIBLE);
             extra.setVisibility(View.VISIBLE);
+
+            // percent < 0 表示进度不可知（例如 content-length 获取不到）
+            if (percent < 0) {
+                extra.setText(state + "：处理中...");
+                ViewGroup.LayoutParams layoutParams = progress.getLayoutParams();
+                layoutParams.width = ViewGroup.LayoutParams.MATCH_PARENT;
+                progress.setLayoutParams(layoutParams);
+                return;
+            }
+
             extra.setText(state + "：" + String.format(Locale.CHINA, "%.2f", percent * 100) + "%");
             int width = itemView.getMeasuredWidth();
             if (width > 0) {

@@ -122,7 +122,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                             Glide.with(BiliTerminal.context).asDrawable().load(imageUrl)
                                     .placeholder(R.mipmap.placeholder)
                                     .transition(GlideUtil.getTransitionOptions())
-                                    .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                    .diskCacheStrategy(DiskCacheStrategy.DATA)
                                     .into(imageView);
                         }
 
@@ -163,7 +163,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                                 .transition(GlideUtil.getTransitionOptions())
                                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))))
                                 .format(DecodeFormat.PREFER_RGB_565)
-                                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                .diskCacheStrategy(DiskCacheStrategy.DATA)
                                 .into(topImage);
                     }
                     topCount.setVisibility(View.GONE);
@@ -176,7 +176,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                                 .transition(GlideUtil.getTransitionOptions())
                                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))))
                                 .format(DecodeFormat.PREFER_RGB_565)
-                                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                .diskCacheStrategy(DiskCacheStrategy.DATA)
                                 .into(topImage);
                     }
                     topImage.setOnClickListener(view -> {
@@ -201,7 +201,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                             .placeholder(R.mipmap.akari)
                             .transition(GlideUtil.getTransitionOptions())
                             .apply(RequestOptions.circleCropTransform())
-                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .diskCacheStrategy(DiskCacheStrategy.DATA)
                             .into(upIcon);
                 }
                 upCard.setOnClickListener(view1 -> {

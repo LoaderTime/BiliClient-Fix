@@ -99,7 +99,7 @@ public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAd
                     holder.lastImageUrl = url;
                     Glide.with(BiliTerminal.context).asDrawable().load(url).placeholder(R.mipmap.placeholder)
                             .transition(GlideUtil.getTransitionOptions())
-                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .diskCacheStrategy(DiskCacheStrategy.DATA)
                             .into(imageView);
                 }
 
@@ -134,7 +134,7 @@ public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAd
                                 .transition(GlideUtil.getTransitionOptions())
                                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))))
                                 .format(DecodeFormat.PREFER_RGB_565)
-                                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                .diskCacheStrategy(DiskCacheStrategy.DATA)
                                 .into(cover);
                     }
                 }
@@ -146,7 +146,7 @@ public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAd
                             .placeholder(R.mipmap.akari)
                             .transition(GlideUtil.getTransitionOptions())
                             .apply(RequestOptions.circleCropTransform())
-                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .diskCacheStrategy(DiskCacheStrategy.DATA)
                             .into(upIcon);
                 }
                 upCard.setOnClickListener(view1 -> {

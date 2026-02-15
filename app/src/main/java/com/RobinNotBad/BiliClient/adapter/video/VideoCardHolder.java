@@ -61,7 +61,7 @@ public class VideoCardHolder extends RecyclerView.ViewHolder {
                         .transition(GlideUtil.getTransitionOptions())
                         .placeholder(R.mipmap.placeholder)
                         .format(DecodeFormat.PREFER_RGB_565)
-                        .diskCacheStrategy(DiskCacheStrategy.NONE)
+                        .diskCacheStrategy(DiskCacheStrategy.DATA)
                         .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(5)))
                                 .sizeMultiplier(0.85f))
                         .into(cover);

@@ -159,7 +159,7 @@ public class LocalVideoAdapter extends RecyclerView.Adapter<RecyclerView.ViewHol
                 Glide.with(BiliTerminal.context).asDrawable().load(videoCard.cover)
                         .transition(GlideUtil.getTransitionOptions())
                         .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(5))))
-                        .diskCacheStrategy(DiskCacheStrategy.NONE)
+                        .diskCacheStrategy(DiskCacheStrategy.DATA)
                         .into(cover);
             } catch (Exception ignored) {
             }

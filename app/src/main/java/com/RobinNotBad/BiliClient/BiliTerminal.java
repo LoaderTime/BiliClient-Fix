@@ -60,6 +60,8 @@ public class BiliTerminal extends Application {
             Logu.LOGV_ENABLED = SharedPreferencesUtil.getBoolean("dev_logv", debugBuild);
             Logu.LOGD_ENABLED = SharedPreferencesUtil.getBoolean("dev_logd", debugBuild);
             Logu.LOGI_ENABLED = SharedPreferencesUtil.getBoolean("dev_logi", debugBuild);
+            // 仅 Debug 默认开启调用者 TAG（getStackTrace 开销较大）；Release 默认关闭
+            Logu.LOG_CALLER_ENABLED = SharedPreferencesUtil.getBoolean("dev_logcaller", debugBuild);
 
             if (SharedPreferencesUtil.getBoolean(SharedPreferencesUtil.DYNAMIC_UPDATE_CHECK_ENABLE, true) && SharedPreferencesUtil.getLong(SharedPreferencesUtil.mid, 0) != 0) {
                 CenterThreadPool.run(() -> {

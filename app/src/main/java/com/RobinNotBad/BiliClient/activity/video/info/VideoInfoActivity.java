@@ -22,7 +22,6 @@ import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.RobinNotBad.BiliClient.util.TerminalContext;
-import com.bumptech.glide.Glide;
 
 import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
@@ -53,7 +52,6 @@ public class VideoInfoActivity extends BaseActivity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_simple_viewpager);    //这里async是否反而会减慢速度，仅有一个viewpager的页面加载已经足够快了吧
 
-        Glide.get(BiliTerminal.context).clearMemory();
         Intent intent = getIntent();
         String type = intent.getStringExtra("type");
         if (type == null) type = "video";
@@ -153,7 +151,6 @@ public class VideoInfoActivity extends BaseActivity {
     @Override
     protected void onDestroy() {
         Logu.d("onDestroy");
-        Glide.get(BiliTerminal.context).clearMemory();
         TerminalContext.getInstance().leaveDetailPage();
         super.onDestroy();
     }

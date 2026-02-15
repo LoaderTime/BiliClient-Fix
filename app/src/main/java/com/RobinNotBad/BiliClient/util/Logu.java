@@ -12,68 +12,97 @@ public class Logu {
     public static boolean LOGD_ENABLED = false;
     public static boolean LOGI_ENABLED = false;
 
+    /**
+     * 是否在 Log 的 TAG 中输出调用者信息（会触发 getStackTrace，开销较大）。
+     * 建议仅在 Debug 环境开启；Release 环境关闭以减少性能损耗。
+     */
+    public static boolean LOG_CALLER_ENABLED = true;
+
+    private static final String DEFAULT_TAG = "BiliClient";
+
+    private static String getTag() {
+        if (!LOG_CALLER_ENABLED) return DEFAULT_TAG;
+        String caller = getCaller();
+        return caller != null ? caller : DEFAULT_TAG;
+    }
+
     public static void v(String s) {
         if (!LOGV_ENABLED) return;
-        Log.v(getCaller(), s);
+        Log.v(getTag(), s);
     }
 
     public static void i(String s) {
         if (!LOGI_ENABLED) return;
-        Log.i(getCaller(), s);
+        Log.i(getTag(), s);
     }
 
     public static void d(String s) {
         if (!LOGD_ENABLED) return;
-        Log.d(getCaller(), s);
+        Log.d(getTag(), s);
     }
 
     public static void w(String s) {
-        Log.w(getCaller(), s);
+        Log.w(getTag(), s);
     }
 
     public static void e(String s) {
-        Log.e(getCaller(), s);
+        Log.e(getTag(), s);
     }
 
     public static void wtf(String s) {
-        Log.wtf(getCaller(), s);
+        Log.wtf(getTag(), s);
     }
 
 
     public static void v(String tag, String info) {
         if (!LOGV_ENABLED) return;
-        Log.v(getCaller(), tag + ">" + info);
+        Log.v(getTag(), tag + ">" + info);
     }
 
     public static void i(String tag, String info) {
         if (!LOGI_ENABLED) return;
-        Log.i(getCaller(), tag + ">" + info);
+        Log.i(getTag(), tag + ">" + info);
     }
 
     public static void d(String tag, String info) {
         if (!LOGD_ENABLED) return;
-        Log.d(getCaller(), tag + ">" + info);
+        Log.d(getTag(), tag + ">" + info);
     }
 
     public static void w(String tag, String info) {
-        Log.w(getCaller(), tag + ">" + info);
+        Log.w(getTag(), tag + ">" + info);
     }
 
     public static void e(String tag, String info) {
-        Log.e(getCaller(), tag + ">" + info);
+        Log.e(getTag(), tag + ">" + info);
     }
 
     public static void wtf(String tag, String info) {
-        Log.wtf(getCaller(), tag + ">" + info);
+        Log.wtf(getTag(), tag + ">" + info);
     }
 
     private static String getCaller() {
-        StackTraceElement caller = Thread.currentThread().getStackTrace()[4];
-        String name = caller.getClassName();
-        int index = name.length();
-        for (; index > 1; index--) {
-            if (name.charAt(index - 1) == '.') break;
+        try {
+            StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+            boolean reachedThisClass = false;
+            for (StackTraceElement element : stackTrace) {
+                String className = element.getClassName();
+                if (Logu.class.getName().equals(className)) {
+                    reachedThisClass = true;
+                    continue;
+                }
+                if (!reachedThisClass) continue;
+
+                // 找到第一个离开 Logu 的调用栈帧，即为真实调用者
+                String name = className;
+                int index = name.lastIndexOf('.');
+                if (index >= 0 && index + 1 < name.length()) {
+                    name = name.substring(index + 1);
+                }
+                return name + ">" + element.getMethodName();
+            }
+        } catch (Throwable ignored) {
         }
-        return name.substring(index) + ">" + caller.getMethodName();
+        return null;
     }
 }

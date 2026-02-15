@@ -62,7 +62,7 @@ public class ArticleCardHolder extends RecyclerView.ViewHolder {
                 .transition(GlideUtil.getTransitionOptions())
                 .format(DecodeFormat.PREFER_RGB_565)
                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(5))))
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .into(cover);
     }
 
@@ -98,7 +98,7 @@ public class ArticleCardHolder extends RecyclerView.ViewHolder {
                 .transition(GlideUtil.getTransitionOptions())
                 .format(DecodeFormat.PREFER_RGB_565)
                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(5))))
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .into(cover);
     }
 }

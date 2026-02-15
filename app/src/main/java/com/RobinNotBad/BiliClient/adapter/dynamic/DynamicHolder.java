@@ -240,7 +240,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                     .transition(GlideUtil.getTransitionOptions())
                     .placeholder(R.mipmap.akari)
                     .apply(RequestOptions.circleCropTransform())
-                    .diskCacheStrategy(DiskCacheStrategy.NONE)
+                    .diskCacheStrategy(DiskCacheStrategy.DATA)
                     .into(avatar);
         }
 
@@ -325,7 +325,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                                     .centerCrop()
                                     .format(DecodeFormat.PREFER_RGB_565)
                                     .sizeMultiplier(0.85f)
-                                    .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                    .diskCacheStrategy(DiskCacheStrategy.DATA)
                                     .into(imageView);
                         }
                         TextView textView = cell_dynamic_image.findViewById(R.id.imageCount);

@@ -251,7 +251,7 @@ public class VideoInfoFragment extends BaseFragment {
         Glide.with(getAppContext()).asDrawable().load(GlideUtil.url(videoInfo.cover)).placeholder(R.mipmap.placeholder)
                 .transition(GlideUtil.getTransitionOptions())
                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))).sizeMultiplier(0.85f).skipMemoryCache(true).dontAnimate())
-                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                .diskCacheStrategy(DiskCacheStrategy.DATA)
                 .into(cover);
 
         if (SharedPreferencesUtil.getBoolean("tags_enable", true)) {

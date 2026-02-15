@@ -100,7 +100,7 @@ public class AboutActivity extends BaseActivity {
                             .transition(GlideUtil.getTransitionOptions())
                             .placeholder(R.mipmap.akari)
                             .apply(RequestOptions.circleCropTransform())
-                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .diskCacheStrategy(DiskCacheStrategy.DATA)
                             .into(developerAvaterViews.get(i));
                 } catch (Exception ignored) {
                 }

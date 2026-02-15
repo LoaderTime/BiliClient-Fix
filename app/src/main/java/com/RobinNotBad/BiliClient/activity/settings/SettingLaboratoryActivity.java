@@ -63,6 +63,8 @@ public class SettingLaboratoryActivity extends RefreshListActivity {
                         String.valueOf(debugBuild)));
                 add(new SettingSection("switch", "允许Logu.d", "dev_logd", "", String.valueOf(debugBuild)));
                 add(new SettingSection("switch", "允许Logu.i", "dev_logi", "", String.valueOf(debugBuild)));
+                add(new SettingSection("switch", "显示Logu调用者(较耗性能)", "dev_logcaller",
+                        "开启后日志TAG会显示调用者类名与方法名（需要解析调用栈，性能开销较大）", String.valueOf(debugBuild)));
                 add(new SettingSection("switch", "详细显示数据解析报错", "dev_jsonerr_detailed",
                         getString(R.string.setting_lab_jsonerr_detailed), String.valueOf(debugBuild)));
                 add(new SettingSection("switch", "详细显示列表报错", "dev_recyclererr_detailed",

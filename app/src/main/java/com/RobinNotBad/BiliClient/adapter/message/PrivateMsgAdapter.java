@@ -159,7 +159,7 @@ public class PrivateMsgAdapter extends RecyclerView.Adapter<PrivateMsgAdapter.Vi
                                 .load(GlideUtil.url(picUrl))
                                 .transition(GlideUtil.getTransitionOptions())
                                 .override(Target.SIZE_ORIGINAL)
-                                .diskCacheStrategy(DiskCacheStrategy.NONE)
+                                .diskCacheStrategy(DiskCacheStrategy.DATA)
                                 .into(holder.picMsg);
                         holder.picMsg.setOnClickListener(view -> {
                             ArrayList<String> imageList = new ArrayList<>();
@@ -195,7 +195,7 @@ public class PrivateMsgAdapter extends RecyclerView.Adapter<PrivateMsgAdapter.Vi
                             .load(GlideUtil.url(msg.content.getString("thumb")))
                             .transition(GlideUtil.getTransitionOptions())
                             .format(DecodeFormat.PREFER_RGB_565)
-                            .diskCacheStrategy(DiskCacheStrategy.NONE)
+                            .diskCacheStrategy(DiskCacheStrategy.DATA)
                             .into(holder.videoCover);
                     holder.upNameTv.setText(msg.content.getString("author"));
                     holder.videoTitleTv.setText(msg.content.getString("title"));

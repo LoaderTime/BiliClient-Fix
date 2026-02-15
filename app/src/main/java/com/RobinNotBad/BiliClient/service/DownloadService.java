@@ -52,7 +52,16 @@ import okio.Sink;
 public class DownloadService extends Service {
     public static boolean started;
     public static int exitCode;
-    public static float percent = -1;
+
+    /**
+     * 下载进度：
+     * -1 表示不显示/无进度（例如未开始或无需展示）
+     * -2 表示进度不可知（content-length 不可用，通知栏会显示 indeterminate）
+     * [0,1] 表示正常百分比进度
+     */
+    public static final float PERCENT_NONE = -1f;
+    public static final float PERCENT_INDETERMINATE = -2f;
+    public static float percent = PERCENT_NONE;
     public static String state;
     public static DownloadSection section;
     private static long firstDown;
@@ -371,8 +380,18 @@ public class DownloadService extends Service {
                 if (section == null || notifyTimer == null)
                     return;
 
-                statusBuilder.setContentText(state + "：" + section.name_short);
-                statusBuilder.setProgress(100, (int) (percent * 100), false);
+                String textState = state != null ? state : "准备中";
+                statusBuilder.setContentText(textState + "：" + section.name_short);
+
+                if (percent < 0) {
+                    // contentLength 不可用等情况：使用不确定进度条，避免负数/除零导致异常
+                    statusBuilder.setProgress(0, 0, true);
+                } else {
+                    int p = (int) (percent * 100);
+                    if (p < 0) p = 0;
+                    if (p > 100) p = 100;
+                    statusBuilder.setProgress(100, p, false);
+                }
                 notifyManager.notify(FOREGROUND_ID, statusBuilder.build());
             }
         }, 500, 500);
@@ -433,43 +452,60 @@ public class DownloadService extends Service {
     }
 
     private int downFile(String url, File file) throws IOException {
-        Response response;
-        try {
-            response = NetWorkUtil.get(url);
+        File parent = file.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs())
+            return ERR_FILE;
+
+        if (file.exists() && !file.delete())
+            return ERR_FILE;
+
+        try (Response response = NetWorkUtil.get(url)) {
+            if (response.body() == null)
+                return ERR_NETWORK;
+
+            final long totalBytes = response.body().contentLength();
+            long downloadedBytes = 0;
+
+            // 如果无法获取总大小，使用 indeterminate 进度
+            percent = totalBytes > 0 ? 0 : PERCENT_INDETERMINATE;
+
+            try (InputStream inputStream = response.body().byteStream();
+                 FileOutputStream fileOutputStream = new FileOutputStream(file, false)) {
+
+                byte[] buffer = new byte[16 * 1024];
+                while (started) {
+                    final int len;
+                    try {
+                        len = inputStream.read(buffer);
+                    } catch (IOException e) {
+                        return ERR_NETWORK;
+                    }
+                    if (len == -1) break;
+
+                    try {
+                        fileOutputStream.write(buffer, 0, len);
+                    } catch (IOException e) {
+                        return ERR_FILE;
+                    }
+
+                    downloadedBytes += len;
+                    if (totalBytes > 0) {
+                        percent = Math.min(1.0f, downloadedBytes * 1.0f / totalBytes);
+                    } else {
+                        percent = PERCENT_INDETERMINATE;
+                    }
+                }
+            }
+
+            if (!started)
+                return ERR_UNKNOWN;
+
+            // 已完成（即便 totalBytes<=0，也至少避免显示负数）
+            if (totalBytes > 0) percent = 1.0f;
         } catch (IOException e) {
             return ERR_NETWORK;
         }
-        InputStream inputStream = null;
-        FileOutputStream fileOutputStream = null;
-        try {
-            if (!file.exists() && !file.createNewFile())
-                return ERR_FILE;
-            else if (!file.delete() || !file.createNewFile())
-                return ERR_FILE;
 
-            inputStream = Objects.requireNonNull(response.body()).byteStream();
-            fileOutputStream = new FileOutputStream(file);
-            int len;
-            byte[] bytes = new byte[1024 * 10];
-            long TotalFileSize = Objects.requireNonNull(response.body()).contentLength();
-            while ((len = inputStream.read(bytes)) != -1 && started) {
-                fileOutputStream.write(bytes, 0, len);
-                long CompleteFileSize = file.length();
-                percent = 1.0f * CompleteFileSize / TotalFileSize;
-            }
-            if (!started)
-                return ERR_UNKNOWN;
-        } catch (IOException e) {
-            return ERR_FILE;
-        } finally {
-            if (inputStream != null)
-                inputStream.close();
-            if (fileOutputStream != null)
-                fileOutputStream.close();
-            if (response.body() != null)
-                response.body().close();
-            response.close();
-        }
         return NORMAL;
     }
 
@@ -509,7 +545,7 @@ public class DownloadService extends Service {
         Logu.d("结束");
 
         started = false;
-        percent = -1;
+        percent = PERCENT_NONE;
         state = null;
 
         if (toastTimer != null)

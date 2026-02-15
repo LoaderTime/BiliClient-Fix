@@ -118,7 +118,7 @@ public class PrivateMsgSessionsAdapter
                     holder.nameText.setText(user.name);
                 }
                 Glide.with(BiliTerminal.context).asDrawable().load(GlideUtil.url(user.avatar))
-                        .diskCacheStrategy(DiskCacheStrategy.NONE)
+                        .diskCacheStrategy(DiskCacheStrategy.DATA)
                         .placeholder(R.mipmap.akari)
                         .apply(RequestOptions.circleCropTransform())
                         .into(holder.avatarView);
