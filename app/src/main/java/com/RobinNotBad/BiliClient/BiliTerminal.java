@@ -7,7 +7,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.os.Build;
+import android.os.StrictMode;
 import android.util.DisplayMetrics;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.multidex.MultiDex;
@@ -52,6 +54,9 @@ public class BiliTerminal extends Application {
             errorCatch.init(context);
 
             boolean debugBuild = isDebugBuild();
+            if (debugBuild) {
+                enableStrictModeForDebug();
+            }
             Logu.LOGV_ENABLED = SharedPreferencesUtil.getBoolean("dev_logv", debugBuild);
             Logu.LOGD_ENABLED = SharedPreferencesUtil.getBoolean("dev_logd", debugBuild);
             Logu.LOGI_ENABLED = SharedPreferencesUtil.getBoolean("dev_logi", debugBuild);
@@ -91,6 +96,30 @@ public class BiliTerminal extends Application {
                     }
                 });
             }
+        }
+    }
+
+    /**
+     * 仅在 Debug 构建启用 StrictMode：用于尽早发现主线程磁盘/网络操作、资源泄露等问题。
+     * Release 不启用，避免影响性能与用户体验。
+     */
+    private static void enableStrictModeForDebug() {
+        try {
+            StrictMode.setThreadPolicy(new StrictMode.ThreadPolicy.Builder()
+                    .detectDiskReads()
+                    .detectDiskWrites()
+                    .detectNetwork()
+                    .penaltyLog()
+                    .build());
+
+            StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder()
+                    .detectLeakedSqlLiteObjects()
+                    .detectLeakedClosableObjects()
+                    .penaltyLog()
+                    .build());
+        } catch (Throwable t) {
+            // 极端情况下（某些 ROM/系统裁剪），StrictMode 可能异常；此处仅记录，不影响启动。
+            Log.w("BiliTerminal", "enableStrictModeForDebug failed", t);
         }
     }
 

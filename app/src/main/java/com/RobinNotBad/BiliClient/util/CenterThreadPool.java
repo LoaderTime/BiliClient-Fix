@@ -3,6 +3,7 @@ package com.RobinNotBad.BiliClient.util;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Log;
 
 import androidx.core.util.Consumer;
 import androidx.lifecycle.LiveData;
@@ -14,7 +15,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import kotlin.Unit;
@@ -34,34 +37,65 @@ import kotlinx.coroutines.Dispatchers;
  */
 public class CenterThreadPool {
 
+    private static final String TAG = "CenterThreadPool";
+
     private static final boolean FORCE_DISABLED = false;
     private static final Handler MAIN_THREAD_HANDLER = new Handler(Looper.getMainLooper());
     private static final CoroutineScope COROUTINE_SCOPE;
-    private static final AtomicReference<ExecutorService> THREAD_POOL;
+    private static final AtomicReference<ExecutorService> THREAD_POOL = new AtomicReference<>();
+    private static final AtomicInteger FALLBACK_THREAD_ID = new AtomicInteger(0);
+    private static final AtomicInteger EXECUTOR_THREAD_ID = new AtomicInteger(0);
 
     private static ExecutorService getThreadPoolInstance() {
-        if (THREAD_POOL == null) return null;
-        int bestThreadPoolSize = Runtime.getRuntime().availableProcessors();
-        while (THREAD_POOL.get() == null) {
-            THREAD_POOL.compareAndSet(null, new ThreadPoolExecutor(
-                    bestThreadPoolSize / 2,
-                    bestThreadPoolSize * 2,
-                    60,
-                    TimeUnit.SECONDS,
-                    new ArrayBlockingQueue<>(20)
-            ));
+        ExecutorService existed = THREAD_POOL.get();
+        if (existed != null) return existed;
+
+        // 兼容：部分设备 availableProcessors 可能返回 0 或 1，需做下限保护
+        int cpu = Math.max(1, Runtime.getRuntime().availableProcessors());
+        int corePoolSize = Math.max(1, cpu / 2);
+        int maxPoolSize = Math.max(corePoolSize, cpu * 2);
+
+        ThreadFactory threadFactory = r -> {
+            Thread t = new Thread(r);
+            t.setName("CenterThreadPool-" + EXECUTOR_THREAD_ID.incrementAndGet());
+            return t;
+        };
+
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                corePoolSize,
+                maxPoolSize,
+                60,
+                TimeUnit.SECONDS,
+                // 注意：这里队列不要太小，否则旧设备上容易触发拒绝策略导致任务丢失。
+                new ArrayBlockingQueue<>(64),
+                threadFactory
+        );
+        executor.allowCoreThreadTimeOut(true);
+
+        if (THREAD_POOL.compareAndSet(null, executor)) {
+            return executor;
+        }
+
+        // 竞争失败，释放刚创建的 executor，返回已存在实例
+        try {
+            executor.shutdown();
+        } catch (Throwable ignored) {
         }
         return THREAD_POOL.get();
     }
 
     static {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            COROUTINE_SCOPE = null;
-            THREAD_POOL = new AtomicReference<>();
-        } else {
-            COROUTINE_SCOPE = CoroutineScopeKt.CoroutineScope((CoroutineContext) Dispatchers.getIO());
-            THREAD_POOL = null;
+        CoroutineScope scope = null;
+        if (!FORCE_DISABLED && Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            try {
+                scope = CoroutineScopeKt.CoroutineScope((CoroutineContext) Dispatchers.getIO());
+            } catch (Throwable t) {
+                // 协程初始化失败时（例如依赖缺失/被裁剪/ROM兼容问题），回退到 Java 线程池
+                Log.w(TAG, "Coroutine init failed, fallback to ThreadPoolExecutor", t);
+                scope = null;
+            }
         }
+        COROUTINE_SCOPE = scope;
     }
 
 
@@ -71,27 +105,55 @@ public class CenterThreadPool {
      * @param runnable 要运行的任务
      */
     public static void run(Runnable runnable) {
-        try {
-            //能用协程用协程
-            if (COROUTINE_SCOPE != null) {
+        if (runnable == null) return;
+
+        // 兜底：避免后台任务异常直接触发全局 UncaughtExceptionHandler 导致整个进程崩溃
+        Runnable safeRunnable = () -> {
+            try {
+                runnable.run();
+            } catch (Throwable t) {
+                Log.e(TAG, "Uncaught exception in background task", t);
+            }
+        };
+
+        // 强制禁用（调试/兼容用途）
+        if (FORCE_DISABLED) {
+            startFallbackThread(safeRunnable);
+            return;
+        }
+
+        // 优先协程
+        if (COROUTINE_SCOPE != null) {
+            try {
                 BuildersKt.launch(COROUTINE_SCOPE, EmptyCoroutineContext.INSTANCE, CoroutineStart.DEFAULT, (CoroutineScope scope, Continuation<? super Unit> continuation) -> {
-                    runnable.run();
+                    safeRunnable.run();
                     return Unit.INSTANCE;
                 });
-                //协程不可用时尝试以原生线程池运行
-            } else if (THREAD_POOL != null) {
-                ExecutorService service = getThreadPoolInstance();
-                if (service != null) service.submit(runnable);
-                else new Thread(runnable).start();
-            } else {
-                //都不可用再开线程
-                new Thread(runnable).start();
+                return;
+            } catch (Throwable t) {
+                Log.w(TAG, "Coroutine launch failed, fallback to ThreadPoolExecutor", t);
             }
-        } catch (Throwable e) {
-            //最后再放手一博
-            //new Thread(runnable).start();
-            e.printStackTrace();
         }
+
+        // 协程不可用则回退线程池
+        try {
+            ExecutorService service = getThreadPoolInstance();
+            if (service != null) {
+                service.submit(safeRunnable);
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Executor submit failed, fallback to new Thread", t);
+        }
+
+        // 最终兜底，保证任务不丢
+        startFallbackThread(safeRunnable);
+    }
+
+    private static void startFallbackThread(Runnable runnable) {
+        Thread t = new Thread(runnable);
+        t.setName("CenterThreadPool-fallback-" + FALLBACK_THREAD_ID.incrementAndGet());
+        t.start();
     }
 
     /**
@@ -142,7 +204,8 @@ public class CenterThreadPool {
             try {
                 T value = deferred.get();
                 CenterThreadPool.runOnUiThread(() -> consumer.accept(value));
-            } catch (Throwable ignored) {
+            } catch (Throwable t) {
+                Log.w(TAG, "observe() failed", t);
             }
         });
     }

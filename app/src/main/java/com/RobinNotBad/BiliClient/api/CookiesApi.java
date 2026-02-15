@@ -32,6 +32,8 @@ import java.util.Random;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
+import okhttp3.Response;
+
 /**
  * Cookies相关API
  */
@@ -155,7 +157,10 @@ public class CookiesApi {
     }};
 
     public static void checkCookies() throws JSONException, IOException {
-        NetWorkUtil.get("https://www.bilibili.com/");
+        // StrictMode/资源泄漏修复：确保 Response 被关闭，避免连接池泄漏
+        try (Response response = NetWorkUtil.get("https://www.bilibili.com/")) {
+            // no-op
+        }
 
         Cookies cookies = NetWorkUtil.getCookies();
 

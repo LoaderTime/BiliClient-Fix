@@ -105,7 +105,11 @@ public class TerminalContext {
             videoInfo = VideoInfoApi.getVideoInfo(aid);
             if (videoInfo != null) {
                 if (saveToCache) {
+                    // 兼容：同时按 aid 与 bvid 缓存，避免不同入口(如分享/跳转)导致缓存无法命中
                     contentLruCache.put(ContentType.Video.getTypeCode() + "_" + aid, videoInfo);
+                    if (!TextUtils.isEmpty(videoInfo.bvid)) {
+                        contentLruCache.put(ContentType.Video.getTypeCode() + "_" + videoInfo.bvid, videoInfo);
+                    }
                 }
                 return Result.success(videoInfo);
             }
@@ -122,7 +126,17 @@ public class TerminalContext {
             videoInfo = VideoInfoApi.getVideoInfo(bvid);
             if (videoInfo != null) {
                 if (saveToCache) {
-                    contentLruCache.put(ContentType.Video.getTypeCode() + "_" + videoInfo.aid, videoInfo);
+                    // 关键修复：getVideoInfoByAidOrBvId(bvid) 的缓存 key 使用 bvid，这里必须保持一致
+                    if (!TextUtils.isEmpty(bvid)) {
+                        contentLruCache.put(ContentType.Video.getTypeCode() + "_" + bvid, videoInfo);
+                    }
+                    // 同时按 aid / 返回的 bvid 备份一份，提升命中率
+                    if (videoInfo.aid > 0) {
+                        contentLruCache.put(ContentType.Video.getTypeCode() + "_" + videoInfo.aid, videoInfo);
+                    }
+                    if (!TextUtils.isEmpty(videoInfo.bvid)) {
+                        contentLruCache.put(ContentType.Video.getTypeCode() + "_" + videoInfo.bvid, videoInfo);
+                    }
                 }
                 return Result.success(videoInfo);
             }

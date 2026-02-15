@@ -14,6 +14,9 @@ import org.json.JSONObject;
 import java.io.IOException;
 import java.util.List;
 
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
 public class HistoryApi {
 
     public static final int ARTICLE_HISTORY_TYPE = 3;
@@ -33,7 +36,10 @@ public class HistoryApi {
                 + "&progress=" + (progress >= 0 ? progress : "")
                 + "&platform=pc"
                 + "&csrf=" + SharedPreferencesUtil.getString(SharedPreferencesUtil.csrf, "");
-        NetWorkUtil.post(url, per, NetWorkUtil.webHeaders);
+        // StrictMode/资源泄漏修复：必须关闭 Response，避免连接池泄漏
+        try (Response ignored = NetWorkUtil.post(url, per, NetWorkUtil.webHeaders)) {
+            // no-op
+        }
     }
 
     /**
@@ -73,22 +79,24 @@ public class HistoryApi {
     }
 
     private static void postHistoryReport(String url, String form) throws IOException {
-        okhttp3.Response response = NetWorkUtil.post(url, form, NetWorkUtil.webHeaders);
-        if (response == null || response.body() == null) {
-            return;
-        }
-        String body = response.body().string();
-        try {
-            JSONObject json = new JSONObject(body);
-            int code = json.optInt("code", -1);
-            String message = json.optString("message", "");
-            if (code != 0) {
-                Logu.e("HistoryReport", "history/report failed: code=" + code + ", message=" + message + ", form=" + form);
-            } else {
-                Logu.i("HistoryReport", "history/report ok: form=" + form);
+        try (Response response = NetWorkUtil.post(url, form, NetWorkUtil.webHeaders)) {
+            if (response == null) return;
+            ResponseBody responseBody = response.body();
+            if (responseBody == null) return;
+
+            String body = responseBody.string();
+            try {
+                JSONObject json = new JSONObject(body);
+                int code = json.optInt("code", -1);
+                String message = json.optString("message", "");
+                if (code != 0) {
+                    Logu.e("HistoryReport", "history/report failed: code=" + code + ", message=" + message + ", form=" + form);
+                } else {
+                    Logu.i("HistoryReport", "history/report ok: form=" + form);
+                }
+            } catch (Exception ignored) {
+                Logu.e("HistoryReport", "history/report invalid response: " + body);
             }
-        } catch (Exception ignored) {
-            Logu.e("HistoryReport", "history/report invalid response: " + body);
         }
     }
 
@@ -199,7 +207,10 @@ public class HistoryApi {
             String url = "https://api.bilibili.com/x/v2/history/delete";
             String per = "kid=" + kid
                     + "&csrf=" + SharedPreferencesUtil.getString(SharedPreferencesUtil.csrf, "");
-            NetWorkUtil.post(url, per, NetWorkUtil.webHeaders);
+            // StrictMode/资源泄漏修复：必须关闭 Response，避免连接池泄漏
+            try (Response ignored = NetWorkUtil.post(url, per, NetWorkUtil.webHeaders)) {
+                // no-op
+            }
         } catch (Exception ignored) {
         }
     }
