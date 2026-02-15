@@ -27,6 +27,7 @@ public class OpusParagraph {
     public static final int TYPE_DIVIDER = 3;
     public static final int TYPE_TEXT_BLOCKQUOTE = 4;
     public static final int TYPE_LIST = 5;
+    public static final int TYPE_CODE = 7;
     public static final int TYPE_HEADING = 8;
 
     //这几个是自定义的
@@ -43,6 +44,20 @@ public class OpusParagraph {
     public int align;
     public int type;
     public Object content;
+
+    /**
+     * 用于 para_type=7 的代码块。
+     * 仅保留 B 站 opus/detail 返回的字段：content / lang。
+     */
+    public static class CodeBlock {
+        public final String content;
+        public final String lang;
+
+        public CodeBlock(String content, String lang) {
+            this.content = content == null ? "" : content;
+            this.lang = lang == null ? "" : lang;
+        }
+    }
 
     public OpusParagraph() {
     }
@@ -69,12 +84,24 @@ public class OpusParagraph {
             case TYPE_LIST:
                 this.content = analyzeList(para.optJSONObject("list"));
                 break;
+            case TYPE_CODE:
+                this.content = analyzeCode(para.optJSONObject("code"));
+                break;
             case TYPE_TEXT_OPUS:
                 this.content = analyzeOpus(para.optJSONArray("data"));
                 break;
             default:
                 this.content = "[无法识别段落：" + type + "]";
         }
+    }
+
+    private CodeBlock analyzeCode(JSONObject code) {
+        if (code == null) return new CodeBlock("", "");
+        // 结构示例（来自专栏2.txt INITIAL_STATE）：
+        // {"content":"...","lang":"python"}
+        String content = code.optString("content", "");
+        String lang = code.optString("lang", "");
+        return new CodeBlock(content, lang);
     }
 
     public CharSequence analyzeBlockQuote(JSONObject blockquote) throws JSONException {

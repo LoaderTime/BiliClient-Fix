@@ -79,6 +79,9 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
             case OpusParagraph.TYPE_DYNAMIC:
                 view = LayoutInflater.from(this.context).inflate(R.layout.cell_dynamic_child, parent, false);
                 break;
+            case OpusParagraph.TYPE_CODE:
+                view = LayoutInflater.from(this.context).inflate(R.layout.cell_article_code, parent, false);
+                break;
             case OpusParagraph.TYPE_TEXT:
             case OpusParagraph.TYPE_TEXT_BLOCKQUOTE:
             case OpusParagraph.TYPE_TEXT_OPUS:
@@ -326,6 +329,23 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
 
             case OpusParagraph.TYPE_ARTICLE:
 
+                break;
+
+            case OpusParagraph.TYPE_CODE:
+                if (realPosition >= 0 && realPosition < paragraphs.length && paragraphs[realPosition].content != null) {
+                    TextView codeText = holder.itemView.findViewById(R.id.codeText);
+                    Object content = paragraphs[realPosition].content;
+                    if (content instanceof OpusParagraph.CodeBlock) {
+                        OpusParagraph.CodeBlock codeBlock = (OpusParagraph.CodeBlock) content;
+                        // 不做高亮，避免引入新依赖并确保 Android 4.4 兼容；
+                        // 仅保证内容可复制 + 容器背景色固定 #2F3034。
+                        codeText.setText(codeBlock.content);
+                        StringUtil.setCopy(codeText);
+                    } else {
+                        codeText.setText(String.valueOf(content));
+                        StringUtil.setCopy(codeText);
+                    }
+                }
                 break;
 
             case OpusParagraph.TYPE_TEXT:
