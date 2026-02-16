@@ -54,6 +54,23 @@ public class DownloadService extends Service {
     public static int exitCode;
 
     /**
+     * 由用户在下载列表中手动停止下载（双击停止）。
+     * 用于：
+     * - onDestroy 显示更明确的退出提示
+     * - 触发失败清理逻辑（方案 A：回退为 none + 清理残留目录）
+     */
+    private static volatile boolean userStopRequested;
+    private static volatile String userStopMessage;
+
+    /**
+     * 记录最近一次正在处理的下载任务信息：
+     * - 由于 stopSelf() 前可能已经将 section 置空（用于 UI 刷新），因此 onDestroy() 不能只依赖 section。
+     * - 用于失败时自动清理残留文件并将任务状态回退为 none。
+     */
+    private volatile long lastSectionId = -1;
+    private volatile File lastSectionFolder = null;
+
+    /**
      * 下载进度：
      * -1 表示不显示/无进度（例如未开始或无需展示）
      * -2 表示进度不可知（content-length 不可用，通知栏会显示 indeterminate）
@@ -148,6 +165,8 @@ public class DownloadService extends Service {
                     break;
 
                 section = section_tmp;
+                lastSectionId = section.id;
+                lastSectionFolder = section.getPath();
 
                 // 获取视频链接
                 String url_video, url_danmaku, url_audio;
@@ -192,6 +211,13 @@ public class DownloadService extends Service {
                     switch (section.type) {
                         case "video_single": // 单集视频
                             File path_single = section.getPath();
+
+                            // 失败自动清理会删除目录，这里确保目录存在，便于重试
+                            if (!path_single.exists() && !path_single.mkdirs()) {
+                                failed = true;
+                                exitCode = ERR_FILE;
+                                continue;
+                            }
 
                             file_sign = new File(path_single, ".DOWNLOADING");
                             if (!file_sign.exists() && !file_sign.createNewFile()) {
@@ -318,7 +344,8 @@ public class DownloadService extends Service {
                 } catch (IOException e) {
                     failed = true;
                     exitCode = ERR_FILE;
-                    setState(section.id, "error");
+                    // 失败由 onDestroy 统一回退为 none，并清理残留文件夹
+                    setState(section.id, "none");
                 }
             }
 
@@ -413,9 +440,13 @@ public class DownloadService extends Service {
     }
 
     private void refreshDownloadList() {
-        if (DownloadListActivity.weakRef != null && DownloadListActivity.weakRef.get() != null) {
-            DownloadListActivity.weakRef.get().refreshList(true);
-        }
+        if (DownloadListActivity.weakRef == null)
+            return;
+        DownloadListActivity activity = DownloadListActivity.weakRef.get();
+        if (activity == null || activity.isDestroyed())
+            return;
+        // refreshList 内部会自行切换线程更新 UI，这里不要强行切到 UI 线程（避免 DB 查询在主线程执行）
+        activity.refreshList(true);
     }
 
     private void refreshLocalList() {
@@ -556,26 +587,59 @@ public class DownloadService extends Service {
             notifyTimer.cancel();
         notifyTimer = null;
 
-        if (exitMessage == null)
-            exitMessage = "下载服务已退出";
-
-        Logu.d("退出下载服务");
-        if (section != null) {
-            final long id = section.id;
-            final File folder = section.getPath();
-            section = null;
-
-            CenterThreadPool.run(() -> {
-                notifyExit(exitMessage);
-                if (exitCode != NORMAL) {
-                    setState(id, "none");
-                    FileUtil.deleteFolder(folder);
-                }
-                refreshDownloadList();
-            });
+        // 注意：停止服务时，下载线程可能还在运行并会继续修改 exitMessage。
+        // 因此这里要先把最终要展示的提示文案“固化”到局部变量，避免竞态导致偶发显示“未知错误”。
+        final boolean stopByUser = userStopRequested;
+        final String finalExitMessage;
+        if (stopByUser) {
+            finalExitMessage = userStopMessage != null ? userStopMessage : "已停止下载";
+            userStopRequested = false;
+            userStopMessage = null;
+            // 确保触发“非正常结束”的清理逻辑
+            if (exitCode == NORMAL) exitCode = ERR_UNKNOWN;
+        } else {
+            finalExitMessage = exitMessage != null ? exitMessage : "下载服务已退出";
         }
 
+        Logu.d("退出下载服务");
+
+        // stopSelf() 前 section 可能已经被置空，因此这里兼容 section==null 的情况
+        final DownloadSection currentSection = section;
+        final long id = currentSection != null ? currentSection.id : lastSectionId;
+        final File folder = currentSection != null ? currentSection.getPath() : lastSectionFolder;
+        section = null;
+
+        CenterThreadPool.run(() -> {
+            notifyExit(finalExitMessage);
+
+            // 方案 A：失败自动清理残留文件，但保留任务条目以便用户重试/删除
+            if (exitCode != NORMAL && id != -1 && folder != null) {
+                try {
+                    setState(id, "none");
+                } catch (Exception ignored) {
+                }
+                try {
+                    FileUtil.deleteFolder(folder);
+                } catch (Exception ignored) {
+                }
+            }
+
+            refreshDownloadList();
+        });
+
         super.onDestroy();
+    }
+
+    /**
+     * 由 UI 请求停止当前下载服务，并让 onDestroy 给出更明确提示。
+     */
+    public static void requestStopByUser(String message) {
+        userStopRequested = true;
+        userStopMessage = message;
+        // exitCode 用于 onDestroy 是否清理：确保不是 NORMAL
+        if (exitCode == NORMAL) exitCode = ERR_UNKNOWN;
+        // 尽快让下载线程退出（避免 IO 阻塞时停不下来）
+        started = false;
     }
 
     public static byte[] decompress(byte[] data) {

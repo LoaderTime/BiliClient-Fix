@@ -36,6 +36,18 @@ public class DownloadListActivity extends RefreshListActivity {
     private String lastState = null;
     private long lastDownloadingId = -1;
 
+    private static final long CONFIRM_WINDOW_MS = 3000;
+    private long stopConfirmId = -1;
+    private long stopConfirmTimestamp = 0;
+    private long deleteConfirmId = -1;
+    private long deleteConfirmTimestamp = 0;
+
+    /**
+     * 在某些操作（如删除）后，空列表提示会覆盖“删除成功”等提示。
+     * 这里使用一次性抑制标记，并在触发刷新时立即“消费”该标记，避免因 UI 线程调度延迟而失效。
+     */
+    private volatile boolean suppressEmptyTipOnce = false;
+
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -107,10 +119,14 @@ public class DownloadListActivity extends RefreshListActivity {
 
         if (sections == null || sections.isEmpty()) {
             if (!emptyTipShown) {
+                final boolean suppress = suppressEmptyTipOnce;
+                suppressEmptyTipOnce = false;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        MsgUtil.showMsg("下载列表为空");
+                        if (!suppress) {
+                            MsgUtil.showMsg("下载列表为空");
+                        }
                         showEmptyView();
                     }
                 });
@@ -136,64 +152,95 @@ public class DownloadListActivity extends RefreshListActivity {
                 adapter.setOnClickListener(new OnItemClickListener() {
                     @Override
                     public void onItemClick(int position) {
-                        CenterThreadPool.run(new Runnable() {
-                            @Override
-                            public void run() {
-                                Log.d("debug-download", "click:" + position);
-                                if (sections == null || position < 0 || position >= sections.size())
-                                    return;
+                        Log.d("debug-download", "click:" + position);
+                        if (sections == null || position < 0 || position >= sections.size())
+                            return;
 
-                                DownloadSection section = sections.get(position);
-                                if (section.state.equals("downloading")) {
-                                    MsgUtil.showMsg("下载中，无法操作");
-                                    return;
-                                }
-                                if (section.state.equals("error")) {
-                                    DownloadService.setState(section.id, "none");
-                                }
+                        DownloadSection section = sections.get(position);
+                        if (section == null)
+                            return;
 
+                        // 1) 下载中的任务：双击停止（在 3 秒内第二次点击才停止）
+                        if ("downloading".equals(section.state)) {
+                            // 如果服务并不在跑，说明状态可能已不同步：直接允许重新下载
+                            if (!DownloadService.started || DownloadService.section == null || DownloadService.section.id != section.id) {
+                                DownloadService.setState(section.id, "none");
+                                refreshList(false);
                                 DownloadService.start(section.id);
+                                return;
                             }
-                        });
+
+                            long now = System.currentTimeMillis();
+                            if (stopConfirmId == section.id && (now - stopConfirmTimestamp) <= CONFIRM_WINDOW_MS) {
+                                stopConfirmId = -1;
+                                stopConfirmTimestamp = 0;
+                                // 触发“方案A”清理逻辑，并显示更明确提示
+                                DownloadService.requestStopByUser("已停止下载");
+                                stopService(new Intent(DownloadListActivity.this, DownloadService.class));
+                                MsgUtil.showMsg("正在停止下载...");
+                            } else {
+                                stopConfirmId = section.id;
+                                stopConfirmTimestamp = now;
+                                MsgUtil.showMsg("再次点击将停止下载");
+                            }
+                            return;
+                        }
+
+                        // 2) 错误任务：点击重试前先回退为 none
+                        if ("error".equals(section.state)) {
+                            DownloadService.setState(section.id, "none");
+                        }
+
+                        // 3) 其他状态：点击开始下载
+                        DownloadService.start(section.id);
                     }
                 });
 
                 adapter.setOnLongClickListener(new OnItemLongClickListener() {
                     @Override
                     public void onItemLongClick(int position) {
-                        CenterThreadPool.run(new Runnable() {
-                            @Override
-                            public void run() {
-                                try {
-                                    if (sections == null || position < 0 || position >= sections.size())
-                                        return;
+                        try {
+                            if (sections == null || position < 0 || position >= sections.size())
+                                return;
 
-                                    final DownloadSection delete = sections.get(position);
-                                    if (delete == null)
-                                        return;
+                            final DownloadSection delete = sections.get(position);
+                            if (delete == null)
+                                return;
 
-                                    if (delete.state.equals("downloading") && DownloadService.started) {
-                                        stopService(new Intent(DownloadListActivity.this, DownloadService.class));
-                                        try {
-                                            Thread.sleep(500);
-                                        } catch (InterruptedException ignored) {
-                                        }
-                                    }
-
-                                    File folder = delete.getPath();
-                                    if (folder != null && folder.exists()) {
-                                        FileUtil.deleteFolder(folder);
-                                    }
-
-                                    DownloadService.deleteSection(delete.id);
-
-                                    refreshList(false);
-                                    MsgUtil.showMsg("删除成功");
-                                } catch (Exception e) {
-                                    MsgUtil.err(e);
-                                }
+                            // 下载中的任务不允许长按删除（避免误操作）
+                            if ("downloading".equals(delete.state) && DownloadService.started) {
+                                MsgUtil.showMsg("下载中，请双击停止");
+                                return;
                             }
-                        });
+
+                            long now = System.currentTimeMillis();
+                            if (deleteConfirmId == delete.id && (now - deleteConfirmTimestamp) <= CONFIRM_WINDOW_MS) {
+                                deleteConfirmId = -1;
+                                deleteConfirmTimestamp = 0;
+
+                                CenterThreadPool.run(() -> {
+                                    try {
+                                        File folder = delete.getPath();
+                                        if (folder != null && folder.exists()) {
+                                            FileUtil.deleteFolder(folder);
+                                        }
+                                        DownloadService.deleteSection(delete.id);
+                                        // 删除后下一次刷新会进入空列表，先抑制空列表提示避免覆盖“删除成功”
+                                        suppressEmptyTipOnce = true;
+                                        MsgUtil.showMsg("删除成功");
+                                        refreshList(false);
+                                    } catch (Throwable t) {
+                                        MsgUtil.err(t);
+                                    }
+                                });
+                            } else {
+                                deleteConfirmId = delete.id;
+                                deleteConfirmTimestamp = now;
+                                MsgUtil.showMsg("再次长按将删除该任务");
+                            }
+                        } catch (Throwable t) {
+                            MsgUtil.err(t);
+                        }
                     }
                 });
 

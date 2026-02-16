@@ -40,7 +40,10 @@ public class FileUtil {
         }
 
         File[] templist = folder.listFiles();
-        assert templist != null;
+        // 目录被并发删除/IO 异常等情况下，listFiles 可能返回 null
+        if (templist == null) {
+            return;
+        }
         for (File file : templist) {
             if (file.isFile()) {   //如果该项是文件，直接删除
                 file.delete();
