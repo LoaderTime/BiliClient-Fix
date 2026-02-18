@@ -292,7 +292,7 @@ public class PlayerApi {
                 intent.putExtra("aid", playerData.aid);
                 intent.putExtra("cid", playerData.cid);
                 intent.putExtra("mid", playerData.mid);
-                intent.putExtra("progress", playerData.progress);
+                intent.putExtra("progress", Math.max(0L, (long) playerData.progress));
                 intent.putExtra("live_mode", playerData.isLive());
                 if (playerData.qnStrList != null && playerData.qnValueList != null) {
                     intent.putExtra("qnStrList", playerData.qnStrList);

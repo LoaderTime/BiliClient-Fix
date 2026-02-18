@@ -81,6 +81,7 @@ import org.greenrobot.eventbus.Subscribe;
 import org.greenrobot.eventbus.ThreadMode;
 import org.json.JSONObject;
 
+import java.lang.ref.WeakReference;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -92,6 +93,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.Inflater;
 
 import master.flame.danmaku.controller.DrawHandler;
@@ -118,11 +120,23 @@ import tv.danmaku.ijk.media.player.IMediaPlayer;
 import tv.danmaku.ijk.media.player.IjkMediaPlayer;
 
 public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPreparedListener {
-    private boolean destroyed = false;
+    // TimerTask/OkHttp/WebSocket 回调运行在后台线程；用 volatile 确保销毁与会话切换状态能被及时看见，避免 release 后仍访问 ijkPlayer。
+    private volatile boolean destroyed = false;
 
     private IjkMediaPlayer ijkPlayer;
     private IDanmakuView mDanmakuView;
     private DanmakuContext mContext;
+
+    /**
+     * Danmaku prepare 的幂等控制：每次 streamDanmaku() 递增。
+     * <p>
+     * 目的：同一 playerSession 内多次刷新弹幕时，保证只有“最后一次” prepare 生效，
+     * 避免旧 runnable/回调在新会话后落地执行。
+     */
+    private final AtomicInteger danmakuPrepareSeq = new AtomicInteger(0);
+
+    /** 上一次用于 prepare 的 parser（用于提前 release，避免 dataSource 泄漏窗口期） */
+    private volatile BaseDanmakuParser lastDanmakuParser;
 
     private SurfaceView surfaceView;
     private TextureView textureView;
@@ -148,17 +162,74 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private TextView text_progress, text_online, text_volume, loading_text0, loading_text1, text_speed, text_newspeed;
     public TextView text_title, text_subtitle, text_audio_title, text_audio_subtitle;
 
-    private Timer progressTimer, speedTimer, loadingTimer, onlineTimer, surfaceTimer;
+    private Timer progressTimer, speedTimer, loadingTimer, onlineTimer;
     private Handler mainHandler;
     private Runnable danmakuSyncRunnable;
     private String video_url, danmaku_url;
     private MediaSession mediaSession;
+
+    /** 递增的播放会话编号，用于让旧的 TimerTask / Runnable 发现自己已过期并尽快退出 */
+    private volatile int playerSessionId = 0;
+    /** setDisplay() 已对当前 ijkPlayer 设置完 option（避免 surface 回调过早触发 prepare） */
+    private boolean displayConfigured = false;
+    /** 当前播放会话是否已经请求过一次 prepare（确保 MPPrepare 每会话只触发一次） */
+    private boolean prepareRequested = false;
+    /** onDestroy 可能多路径进入，做一次性释放保护 */
+    private volatile boolean resourcesReleased = false;
+
+    /** TextureView 模式下由 SurfaceTexture 包装出来的 Surface（需手动 release 避免 native 泄漏） */
+    private Surface textureSurface;
+    private SurfaceTexture attachedSurfaceTexture; // textureSurface 对应的 SurfaceTexture
+
+    /** SurfaceView 模式下持有唯一的 holder/callback，避免重复 addCallback 导致回调叠加/泄漏 */
+    private SurfaceHolder surfaceHolder;
+    private final SurfaceHolder.Callback surfaceCallback = new SurfaceHolder.Callback() {
+        @Override
+        public void surfaceCreated(@NonNull SurfaceHolder holder) {
+            if (destroyed)
+                return;
+            Logu.v("surface", "surfaceCreated");
+            attachSurfaceIfPossible();
+            // Surface 重建后，如果已准备过则跳回当前进度，避免画面停留在首帧
+            if (isPrepared && ijkPlayer != null && !isLiveMode) {
+                try {
+                    ijkPlayer.seekTo(seekbar_progress.getProgress());
+                } catch (Exception ignore) {
+                }
+            }
+            maybePrepare("surfaceCreated");
+        }
+
+        @Override
+        public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+        }
+
+        @Override
+        public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+            Logu.v("surface", "surfaceDestroyed");
+            if (ijkPlayer != null) {
+                try {
+                    ijkPlayer.setDisplay(null);
+                } catch (Exception ignore) {
+                }
+            }
+        }
+    };
+
+    /** 直播弹幕 listener 持有 Activity 引用，需要在销毁时主动 release 避免泄漏 */
+    private PlayerDanmuClientListener liveDanmuListener;
+
+    /** 直播弹幕 WebSocket（onDestroy 必须 close，避免线程/引用残留） */
+    private WebSocket liveWebSocket = null;
 
     private boolean isPlaying, isPrepared, hasDanmaku,
             isOnlineVideo, isLiveMode, isSeeking, isDanmakuVisible;
     private boolean menu_opened = false;
     private boolean isAudioOnlyMode = false;
     private boolean isLocalAudioFile = false; // 标记是否为本地音频文件
+
+    // 切换听视频模式时：强制在新会话 onPrepared 后跳回切换前进度，并尽量用准确 seek 避免回退到关键帧。
+    private long pendingAudioOnlyToggleSeekMs = -1L;
 
     private int video_all, video_now, video_now_last;
     private long progress_history;
@@ -245,7 +316,30 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cid = intent.getLongExtra("cid", 0);
         mid = intent.getLongExtra("mid", 0);
 
-        progress_history = intent.getIntExtra("progress", 0);
+        // 统一进度单位。
+        // - PlayerApi.last_play_time 为“秒”，但 IjkMediaPlayer.seekTo 为“毫秒”。
+        // - 统一约定：Intent 内部传“毫秒”。
+        progress_history = 0L;
+        try {
+            Bundle extras = intent.getExtras();
+            if (extras != null && extras.containsKey("progress")) {
+                Object v = extras.get("progress");
+                if (v instanceof Long) {
+                    progress_history = (Long) v;
+                } else if (v instanceof Integer) {
+                    // 旧版本：秒
+                    progress_history = ((Integer) v).longValue();
+                } else if (v instanceof String) {
+                    try {
+                        progress_history = Long.parseLong((String) v);
+                    } catch (Exception ignore) {
+                    }
+                }
+            }
+        } catch (Exception ignore) {
+        }
+        if (progress_history < 0L)
+            progress_history = 0L;
         Logu.d("history", String.valueOf(progress_history));
 
         isLiveMode = intent.getBooleanExtra("live_mode", false);
@@ -351,9 +445,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             // 先把弹幕连接注释掉
         }
 
-        layout_control.postDelayed(() -> CenterThreadPool.run(() -> { // 等界面加载完成
+	    // 此处存在 postDelayed + 线程池链路，快速切会话/退出时可能触发旧任务；用 session 做兜底防护。
+	    final int sessionAtInit = playerSessionId;
+	    layout_control.postDelayed(() -> CenterThreadPool.run(() -> { // 等界面加载完成
+	        if (destroyed || resourcesReleased || sessionAtInit != playerSessionId)
+	            return;
             if (isLiveMode) {
                 runOnUiThread(() -> {
+	                if (destroyed || resourcesReleased || sessionAtInit != playerSessionId)
+	                    return;
                     btn_menu.setVisibility(View.GONE);
                     // 直播模式隐藏清晰度按钮
                     btn_quality.setVisibility(View.GONE);
@@ -366,19 +466,28 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     // 直播模式隐藏分P选择器按钮
                     btn_page_selector.setVisibility(View.GONE);
                 });
-                setDisplay();
+	            if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId)
+	                setDisplay();
                 return;
             }
 
-            runOnUiThread(() -> {
+	        runOnUiThread(() -> {
+	            if (destroyed || resourcesReleased || sessionAtInit != playerSessionId)
+	                return;
                 loading_text0.setText("装填弹幕中");
                 loading_text1.setText("(≧∇≦)");
             });
+	        if (destroyed || resourcesReleased || sessionAtInit != playerSessionId)
+	            return;
             if (isOnlineVideo) {
                 danmakuFile = new File(cachepath, "danmaku.xml");
                 downdanmu();
             } else {
-                runOnUiThread(() -> btn_danmaku_send.setVisibility(View.GONE));
+	            runOnUiThread(() -> {
+	                if (destroyed || resourcesReleased || sessionAtInit != playerSessionId)
+	                    return;
+	                btn_danmaku_send.setVisibility(View.GONE);
+	            });
                 danmakuFile = new File(danmaku_url);
                 if (danmakuFile.exists())
                     streamDanmaku(danmakuFile.toString());
@@ -386,23 +495,25 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     hasDanmaku = false;
             }
 
-            if (!destroyed && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true))
+	        if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId
+	                && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true))
                 downSubtitle(false);
 
             // 加载高能进度条数据
-            if (!destroyed && isOnlineVideo && aid > 0 && cid > 0) {
+	        if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId && isOnlineVideo && aid > 0 && cid > 0) {
                 loadHighEnergyData();
             }
 
-            if (!destroyed && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
+	        if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId
+	                && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
                 loadViewPoints();
             }
 
-            if (!destroyed && isOnlineVideo && aid > 0 && cid > 0) {
+	        if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId && isOnlineVideo && aid > 0 && cid > 0) {
                 loadInteractionVideo();
             }
 
-            if (!destroyed)
+	        if (!destroyed && !resourcesReleased && sessionAtInit == playerSessionId)
                 setDisplay();
         }), 60);
     }
@@ -680,11 +791,236 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             btn_menu.performClick();
     };
 
+    /** 是否使用 TextureView 显示（由 initUI() 决定，运行时以实际 View 是否存在为准，避免偏好切换导致判断错误） */
+    private boolean usingTextureView() {
+        return textureView != null;
+    }
+
+    /** 当前会话视频渲染 surface 是否已就绪（听视频模式不强制要求） */
+    private boolean isRenderSurfaceReady() {
+        if (usingTextureView()) {
+            return mSurfaceTexture != null;
+        }
+        if (surfaceHolder != null) {
+            try {
+                Surface s = surfaceHolder.getSurface();
+                return s != null && s.isValid();
+            } catch (Exception ignore) {
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 绑定渲染 Surface（回调驱动；避免定时轮询）。
+     * <p>
+     * 修复：
+     * - 不再在 setDisplay() 里用 Timer 轮询等待 Surface/Texture
+     * - TextureView 只创建一个 Surface 并复用，避免频繁 new Surface 导致 native 资源泄漏
+     */
+    private void attachSurfaceIfPossible() {
+        if (ijkPlayer == null)
+            return;
+
+        if (usingTextureView()) {
+            if (mSurfaceTexture == null)
+                return;
+            ensureTextureSurface(mSurfaceTexture);
+            if (textureSurface != null) {
+                try {
+                    ijkPlayer.setSurface(textureSurface);
+                } catch (Exception ignore) {
+                }
+            }
+        } else {
+            if (surfaceHolder == null)
+                return;
+            // SurfaceView 必须等 surfaceCreated 后 surface 才有效；避免过早 setDisplay 导致异常
+            try {
+                Surface s = surfaceHolder.getSurface();
+                if (s == null || !s.isValid())
+                    return;
+            } catch (Exception ignore) {
+                return;
+            }
+            try {
+                ijkPlayer.setDisplay(surfaceHolder);
+            } catch (Exception ignore) {
+            }
+        }
+    }
+
+    private void ensureTextureSurface(@NonNull SurfaceTexture surfaceTexture) {
+        if (textureSurface != null && attachedSurfaceTexture == surfaceTexture)
+            return;
+        releaseTextureSurface();
+        try {
+            attachedSurfaceTexture = surfaceTexture;
+            textureSurface = new Surface(surfaceTexture);
+        } catch (Exception ignore) {
+            attachedSurfaceTexture = null;
+            textureSurface = null;
+        }
+    }
+
+    private void releaseTextureSurface() {
+        if (textureSurface != null) {
+            try {
+                textureSurface.release();
+            } catch (Exception ignore) {
+            }
+            textureSurface = null;
+        }
+        attachedSurfaceTexture = null;
+    }
+
+    /**
+     * 仅当满足条件时发起 prepare：
+     * - 每个播放会话只能触发一次（prepareRequested 防重入）
+     * - 非听视频模式必须等待渲染 Surface 就绪（由回调驱动）
+     */
+    private void maybePrepare(String from) {
+        if (destroyed || ijkPlayer == null)
+            return;
+        if (prepareRequested)
+            return;
+        if (!displayConfigured)
+            return;
+
+        // 听视频模式不依赖视频渲染 surface，否则可能永远等不到 surface 导致无法播放
+        if (!isAudioOnlyMode && !isRenderSurfaceReady()) {
+            Logu.v("prepare", "等待渲染Surface就绪: from=" + from);
+            return;
+        }
+
+        prepareRequested = true;
+        Logu.v("prepare", "触发MPPrepare: from=" + from + ", session=" + playerSessionId);
+        MPPrepare(video_url);
+    }
+
+    /**
+     * 仅使当前会话失效（不意味着立即创建新播放器）。
+     * <p>
+     * 用途：
+     * - onDestroy 等场景，让旧的 TimerTask / 播放器回调尽快识别自己已过期并退出
+     * - 避免误导：不会把状态重置为“可再次 prepare”的新会话
+     */
+    private void invalidatePlayerSession(@NonNull String reason) {
+        playerSessionId++;
+        // 失效阶段：禁止旧会话再次触发 prepare
+        prepareRequested = true;
+        displayConfigured = false;
+        Logu.v("session", "invalidatePlayerSession: " + reason + ", id=" + playerSessionId);
+    }
+
+    /**
+     * 开启一个新的播放会话。
+     * <p>
+     * 用途：
+     * - 让旧的 TimerTask / 播放器回调能通过 sessionId 判断自己已过期并尽快退出
+     * - 重置 prepareRequested，确保新会话仍可触发一次 MPPrepare
+     */
+    private void startNewPlayerSession(@NonNull String reason) {
+        playerSessionId++;
+        // 新会话必须允许再次 prepare
+        prepareRequested = false;
+        displayConfigured = false;
+        Logu.v("session", "startNewPlayerSession: " + reason + ", id=" + playerSessionId);
+    }
+
+    /** 重置与播放会话强相关的状态（避免旧状态影响新会话） */
+    private void resetPlaybackFlagsForNewSession() {
+        isPrepared = false;
+        isPlaying = false;
+        isSeeking = false;
+        finishWatching = false;
+        video_all = 0;
+        video_now = 0;
+        video_now_last = 0;
+    }
+
+    /** 安全停止并释放旧 ijkPlayer（避免 IllegalState / NPE） */
+    private void releaseIjkPlayerSafely(@NonNull String reason) {
+        IjkMediaPlayer old = ijkPlayer;
+        if (old == null)
+            return;
+
+        Logu.v("player", "releaseIjkPlayerSafely: " + reason);
+        try {
+            old.setDisplay(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            old.setSurface(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            old.stop();
+        } catch (Exception ignore) {
+        }
+        try {
+            old.release();
+        } catch (Exception ignore) {
+        }
+        if (ijkPlayer == old)
+            ijkPlayer = null;
+    }
+
+    /**
+     * 统一且安全的重建播放会话流程（切清晰度/切分P/听视频模式/互动跳转共用）。
+     * <p>
+     * 流程：
+     * a. startNewPlayerSession()（让旧任务/回调尽快失效）
+     * b. stopAllPeriodicTasks()
+     * c. release old ijkPlayer
+     * d. reset 状态 + new IjkMediaPlayer
+     * e. setDisplay() -> Surface 回调就绪后 maybePrepare() -> onPrepared 后启动周期任务
+     */
+    private void rebuildPlayerSession(@NonNull String reason, long startPositionMs) {
+        if (destroyed)
+            return;
+
+        // 防止“切听视频模式”残留的 pendingSeek 影响其它重建原因（切分P/清晰度/互动跳转等）。
+        if (!"toggleAudioOnlyMode".equals(reason)) {
+            pendingAudioOnlyToggleSeekMs = -1L;
+        }
+
+        startNewPlayerSession(reason);
+        stopAllPeriodicTasks();
+        releaseIjkPlayerSafely(reason);
+        resetPlaybackFlagsForNewSession();
+
+        ijkPlayer = new IjkMediaPlayer();
+        progress_history = startPositionMs;
+        setDisplay();
+    }
+
     private void setDisplay() {
+        // Surface 回调与会话重建可能来自不同线程；统一切到主线程避免 prepareRequested/displayConfigured 竞态导致重复 prepare。
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(this::setDisplay);
+            return;
+        }
+        if (destroyed || resourcesReleased)
+            return;
+
         Logu.v("创建播放器");
         Logu.v("url", video_url);
 
+        displayConfigured = false;
+
         runOnUiThread(() -> loading_text0.setText("初始化播放"));
+
+        if (ijkPlayer == null)
+            return;
+
+        // 仅在切换听视频模式的重建会话中开启 accurate seek，减少关键帧回退造成的“丢进度”。
+        if (pendingAudioOnlyToggleSeekMs >= 0L) {
+            try {
+                ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "enable-accurate-seek", 1);
+            } catch (Exception ignore) {
+            }
+        }
 
         if (isAudioOnlyMode) {
             ijkPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "vn", 1); // 禁用视频
@@ -718,70 +1054,17 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             Logu.v("设置ua");
         }
 
-        Logu.v("准备设置显示");
-        if (SharedPreferencesUtil.getBoolean("player_display", Build.VERSION.SDK_INT < 26)) { // Texture
-            Logu.v("使用texture模式");
-            surfaceTimer = new Timer();
-            surfaceTimer.schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    Logu.v("循环检测");
-                    if (mSurfaceTexture != null) {
-                        this.cancel();
-                        Surface surface = new Surface(mSurfaceTexture);
-                        ijkPlayer.setSurface(surface);
-                        MPPrepare(video_url);
-                        Logu.v("设置surfaceTexture成功！");
-                    }
-                }
-            }, 0, 200);
-        } else {
-            Logu.v("使用surface模式");
-            SurfaceHolder surfaceHolder = surfaceView.getHolder(); // Surface
-            Logu.v("获取surfaceHolder成功！");
-            surfaceTimer = new Timer();
-            surfaceTimer.schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    Logu.v("循环检测");
-                    if (!surfaceHolder.isCreating()) {
-                        this.cancel();
-                        Logu.v("定时器结束！");
-                        ijkPlayer.setDisplay(surfaceHolder);
-                        Logu.v("设置surfaceHolder成功！");
-                        surfaceHolder.addCallback(new SurfaceHolder.Callback() {
-                            @Override
-                            public void surfaceCreated(@NonNull SurfaceHolder surfaceHolder) {
-                                if (!destroyed) {
-                                    Logu.v("surface", "重新设置Holder");
-                                    ijkPlayer.setDisplay(surfaceHolder);
-                                    if (isPrepared) {
-                                        ijkPlayer.seekTo(seekbar_progress.getProgress());
-                                    }
-                                }
-                            }
+        displayConfigured = true;
 
-                            @Override
-                            public void surfaceChanged(@NonNull SurfaceHolder surfaceHolder, int i, int i1, int i2) {
-                            }
-
-                            @Override
-                            public void surfaceDestroyed(@NonNull SurfaceHolder surfaceHolder) {
-                                Logu.v("surface", "Holder没了");
-                                if (isPrepared && !destroyed)
-                                    ijkPlayer.setDisplay(null);
-                            }
-                        });
-                        Logu.v("添加callback成功！");
-                        MPPrepare(video_url);
-                    }
-                }
-            }, 0, 200);
-        }
+        // 移除 surfaceTimer 轮询，改为回调驱动；如果 surface 已就绪则立即绑定并尝试 prepare。
+        attachSurfaceIfPossible();
+        maybePrepare("setDisplay");
     }
 
     private void MPPrepare(String nowurl) {
         ijkPlayer.setOnPreparedListener(this);
+        // 记录 prepare 时的会话 id，用于 TimerTask/回调的过期判断
+        final int sessionAtPrepare = playerSessionId;
 
         if (isLiveMode) {
             runOnUiThread(() -> loading_text0.setText("载入直播中"));
@@ -801,6 +1084,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         ijkPlayer.setOnCompletionListener(iMediaPlayer -> {
+            if (destroyed || resourcesReleased || iMediaPlayer != ijkPlayer || sessionAtPrepare != playerSessionId)
+                return;
             finishWatching = true;
             
             if (interactionData != null && interactionData.edges != null && 
@@ -837,17 +1122,24 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         });
 
         ijkPlayer.setOnErrorListener((iMediaPlayer, what, extra) -> {
+            if (destroyed || resourcesReleased || iMediaPlayer != ijkPlayer || sessionAtPrepare != playerSessionId)
+                return false;
             String EReport = "播放器可能遇到错误！\n错误码：" + what + "\n附加：" + extra;
             Logu.e("ijk-err", EReport);
             // Toast.makeText(PlayerActivity.this, EReport, Toast.LENGTH_LONG).show();
             return false;
         });
 
-        ijkPlayer.setOnBufferingUpdateListener(
-                (mp, percent) -> seekbar_progress.setSecondaryProgress(percent * video_all / 100));
+        ijkPlayer.setOnBufferingUpdateListener((mp, percent) -> {
+            if (destroyed || resourcesReleased || mp != ijkPlayer || sessionAtPrepare != playerSessionId)
+                return;
+            seekbar_progress.setSecondaryProgress(percent * video_all / 100);
+        });
 
         if (isOnlineVideo || isLiveMode)
             ijkPlayer.setOnInfoListener((mp, what, extra) -> {
+                if (destroyed || resourcesReleased || mp != ijkPlayer || sessionAtPrepare != playerSessionId)
+                    return false;
                 if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_START) {
                     runOnUiThread(() -> {
                         loading_info.setVisibility(View.VISIBLE);
@@ -881,8 +1173,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     @SuppressLint("SetTextI18n")
     @Override
     public void onPrepared(IMediaPlayer mediaPlayer) {
-        if (destroyed) {
-            ijkPlayer.release();
+        // 防止旧会话的 onPrepared 回调在切清晰度/切分P/听视频模式后仍然执行，导致状态错乱/空指针
+        if (destroyed || resourcesReleased) {
+            try {
+                mediaPlayer.release();
+            } catch (Exception ignore) {
+            }
+            return;
+        }
+        if (mediaPlayer != ijkPlayer) {
+            try {
+                mediaPlayer.release();
+            } catch (Exception ignore) {
+            }
+            Logu.w("prepare", "忽略过期 onPrepared: mp!=ijkPlayer, session=" + playerSessionId);
             return;
         }
 
@@ -973,8 +1277,24 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             updateAudioOnlyUI();
         }
 
-        if (SharedPreferencesUtil.getBoolean("player_from_last", true) && !isLiveMode) {
-            if (progress_history > 5) {
+        // 切换听视频模式：始终跳转到切换前位置（不受“从上次播放位置”开关/5秒阈值影响）。
+        if (!isLiveMode && pendingAudioOnlyToggleSeekMs >= 0L) {
+            final long target = pendingAudioOnlyToggleSeekMs;
+            pendingAudioOnlyToggleSeekMs = -1L;
+            try {
+                ijkPlayer.seekTo(target);
+            } catch (Exception ignore) {
+            }
+            if (hasDanmaku && mDanmakuView != null) {
+                try {
+                    mDanmakuView.seekTo(target);
+                } catch (Exception ignore) {
+                }
+            }
+            Logu.d("进度跳转", String.valueOf(target));
+        } else if (SharedPreferencesUtil.getBoolean("player_from_last", true) && !isLiveMode) {
+            // progress_history 统一为毫秒；保持旧行为“超过 5 秒才跳转”。
+            if (progress_history > 5000L) {
                 ijkPlayer.seekTo(progress_history);
                 if (hasDanmaku && mDanmakuView != null) {
                     mDanmakuView.seekTo(progress_history);
@@ -1013,11 +1333,32 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void showLoadingSpeed() {
+        // 防止 buffering 触发多次导致 loadingTimer 叠加
+        try {
+            if (loadingTimer != null) {
+                loadingTimer.cancel();
+                loadingTimer = null;
+            }
+        } catch (Exception ignore) {
+            loadingTimer = null;
+        }
+        final int session = playerSessionId;
         loadingTimer = new Timer();
         loadingTimer.schedule(new TimerTask() {
             @Override
             public void run() {
-                String text = String.format(Locale.CHINA, "%.1f", ijkPlayer.getTcpSpeed() / 1024f) + "KB/s";
+                if (destroyed || resourcesReleased || session != playerSessionId)
+                    return;
+                IjkMediaPlayer p = ijkPlayer;
+                if (p == null)
+                    return;
+                float speed;
+                try {
+                    speed = p.getTcpSpeed();
+                } catch (Exception ignore) {
+                    return;
+                }
+                String text = String.format(Locale.CHINA, "%.1f", speed / 1024f) + "KB/s";
                 runOnUiThread(() -> loading_text1.setText(text));
             }
         }, 0, 500);
@@ -1070,13 +1411,34 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void progressChange() {
+        // 防止重复启动进度 Timer（切清晰度/切分P/听视频/互动跳转时）
+        try {
+            if (progressTimer != null) {
+                progressTimer.cancel();
+                progressTimer = null;
+            }
+        } catch (Exception ignore) {
+            progressTimer = null;
+        }
+        final int session = playerSessionId;
         progressTimer = new Timer();
         TimerTask task = new TimerTask() {
             @SuppressLint("SetTextI18n")
             @Override
             public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId)
+                    return;
+                IjkMediaPlayer p = ijkPlayer;
+                if (p == null)
+                    return;
                 if (isPrepared && isPlaying && !isSeeking) {
-                    video_now = (int) ijkPlayer.getCurrentPosition();
+                    int pos;
+                    try {
+                        pos = (int) p.getCurrentPosition();
+                    } catch (Exception ignore) {
+                        return;
+                    }
+                    video_now = pos;
                     if (video_now_last != video_now) { // 检测进度是否在变动
                         video_now_last = video_now;
                         float curr_sec = video_now / 1000f;
@@ -1112,11 +1474,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (!SharedPreferencesUtil.getBoolean("player_show_online", false) || isLiveMode || aid == 0 || cid == 0)
             return;
 
+        // 防止重复启动在线人数 Timer
+        try {
+            if (onlineTimer != null) {
+                onlineTimer.cancel();
+                onlineTimer = null;
+            }
+        } catch (Exception ignore) {
+            onlineTimer = null;
+        }
+        final int session = playerSessionId;
         onlineTimer = new Timer();
         TimerTask task = new TimerTask() {
             @SuppressLint("SetTextI18n")
             @Override
             public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId)
+                    return;
                 if (ijkPlayer != null) {
                     try {
                         online_number = VideoInfoApi.getWatching(aid, cid);
@@ -1272,24 +1646,27 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void downdanmuOld() {
-        try {
-            Response response = NetWorkUtil.get(danmaku_url, NetWorkUtil.webHeaders);
-            BufferedSink bufferedSink = null;
-            try {
-                if (!danmakuFile.exists())
-                    danmakuFile.createNewFile();
-                Sink sink = Okio.sink(danmakuFile);
-                byte[] decompressBytes = decompress(Objects.requireNonNull(response.body()).bytes());// 调用解压函数进行解压，返回包含解压后数据的byte数组
-                bufferedSink = Okio.buffer(sink);
-                bufferedSink.write(decompressBytes);// 将解压后数据写入文件（sink）中
-                bufferedSink.close();
-            } catch (Exception e) {
-                e.printStackTrace();
-            } finally {
-                if (bufferedSink != null) {
-                    bufferedSink.close();
-                }
+        final int session = playerSessionId;
+        try (Response response = NetWorkUtil.get(danmaku_url, NetWorkUtil.webHeaders)) {
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            if (response == null || response.body() == null)
+                return;
+
+            // 调用解压函数进行解压，返回包含解压后数据的 byte[]。
+            byte[] decompressBytes = decompress(response.body().bytes());
+
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+
+            if (!danmakuFile.exists())
+                danmakuFile.createNewFile();
+            try (BufferedSink sink = Okio.buffer(Okio.sink(danmakuFile))) {
+                sink.write(decompressBytes);
             }
+
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
             streamDanmaku(danmakuFile.toString(), null);
         } catch (Exception e) {
             runOnUiThread(() -> MsgUtil.err(e));
@@ -1297,6 +1674,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void downdanmuNew() {
+        final int session = playerSessionId;
         try {
             int estimatedDuration = 3600;
 
@@ -1311,9 +1689,16 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             java.util.List<DmSegMobileReply> segments = DanmakuApi.getAllVideoDanmaku(aid, cid, estimatedDuration);
 
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+
             if (segments.isEmpty()) {
                 Logu.w("新版弹幕", "未获取到弹幕，尝试使用旧版接口");
-                CenterThreadPool.run(() -> downdanmuOld());
+                CenterThreadPool.run(() -> {
+                    if (destroyed || resourcesReleased || session != playerSessionId)
+                        return;
+                    downdanmuOld();
+                });
                 return;
             }
 
@@ -1324,7 +1709,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             e.printStackTrace();
             Logu.e("新版弹幕", "获取失败: " + e.getMessage() + "，回退到旧版接口");
             runOnUiThread(() -> MsgUtil.toast("新版弹幕获取失败，使用旧版接口"));
-            CenterThreadPool.run(() -> downdanmuOld());
+            CenterThreadPool.run(() -> {
+                if (destroyed || resourcesReleased || session != playerSessionId)
+                    return;
+                downdanmuOld();
+            });
         }
     }
 
@@ -1351,9 +1740,26 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         ILoader loader = DanmakuLoaderFactory.create(DanmakuLoaderFactory.TAG_BILI);
-
-        assert loader != null;
-        loader.load(stream);
+        if (loader == null) {
+            return new BaseDanmakuParser() {
+                @Override
+                protected Danmakus parse() {
+                    return new Danmakus();
+                }
+            };
+        }
+        try {
+            loader.load(stream);
+        } catch (Exception e) {
+            // 文件损坏/读取失败时回退为空弹幕，避免直接崩溃。
+            Logu.e("danmaku", "loader.load failed: " + e.getMessage());
+            return new BaseDanmakuParser() {
+                @Override
+                protected Danmakus parse() {
+                    return new Danmakus();
+                }
+            };
+        }
         BaseDanmakuParser parser = new BiliDanmukuParser();
         parser.sharedPreferences = SharedPreferencesUtil.getSharedPreferences();
         IDataSource<?> dataSource = loader.getDataSource();
@@ -1361,12 +1767,96 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         return parser;
     }
 
+    /** 当前 Danmaku 请求是否仍有效（会话/销毁/序列保护） */
+    private boolean isDanmakuRequestValid(int session, int seq) {
+        return !destroyed && !resourcesReleased && session == playerSessionId && seq == danmakuPrepareSeq.get();
+    }
+
+    /**
+     * A/B：在每次 prepare 前统一停止并释放旧 Danmaku 会话。
+     * <p>
+     * - 主线程执行（必要时 runOnUiThread）
+     * - 优先 mDanmakuView.release() 停止 DrawHandler/HandlerThread
+     * - 尝试清理 callback，避免 DanmakuView/handler 间接持有 Activity
+     * - 显式释放 lastDanmakuParser，确保 dataSource 立刻 close（解决“新 prepare 覆盖旧 prepare”的窗口期）
+     */
+    private void resetDanmakuBeforePrepare(@NonNull String reason) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> resetDanmakuBeforePrepare(reason));
+            return;
+        }
+
+        Logu.v("danmaku", "resetDanmakuBeforePrepare: " + reason);
+
+        // 1) 先断开 callback，避免旧 handler 回调链继续强引用 Activity
+        if (mDanmakuView != null) {
+            try {
+                mDanmakuView.setCallback(null);
+            } catch (Exception ignore) {
+            }
+        }
+
+        // 2) 停止并释放旧的 DrawHandler/线程
+        if (mDanmakuView != null) {
+            try {
+                mDanmakuView.release();
+            } catch (Exception ignore) {
+            }
+        }
+
+        // 3) release 后再次置空 callback（DanmakuView 内部也持有 mCallback 引用）
+        if (mDanmakuView != null) {
+            try {
+                mDanmakuView.setCallback(null);
+            } catch (Exception ignore) {
+            }
+        }
+
+        // 4) 显式释放上一次 parser（即使 DFM quit 会 release，这里也提前做一次以缩小泄漏窗口）
+        BaseDanmakuParser old = lastDanmakuParser;
+        lastDanmakuParser = null;
+        if (old != null) {
+            try {
+                old.release();
+            } catch (Exception ignore) {
+            }
+        }
+    }
+
     private void streamDanmaku(String danmakuFile) {
         streamDanmaku(danmakuFile, null);
     }
 
     private void streamDanmaku(String danmakuFile, java.util.List<DmSegMobileReply> protobufSegments) {
+        // C：会话防护 + 幂等序列（同一 session 内多次刷新取最后一次）
+        final int session = playerSessionId;
+        final int seq = danmakuPrepareSeq.incrementAndGet();
+
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> streamDanmakuOnMainThread(danmakuFile, protobufSegments, session, seq));
+            return;
+        }
+        streamDanmakuOnMainThread(danmakuFile, protobufSegments, session, seq);
+    }
+
+    private void streamDanmakuOnMainThread(String danmakuFile, java.util.List<DmSegMobileReply> protobufSegments,
+                                          int session, int seq) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> streamDanmakuOnMainThread(danmakuFile, protobufSegments, session, seq));
+            return;
+        }
+        if (!isDanmakuRequestValid(session, seq))
+            return;
+
         Logu.v("danmaku", "stream");
+
+        // A/B：每次 prepare 前都先释放旧会话/旧 parser
+        resetDanmakuBeforePrepare("streamDanmaku");
+        if (!isDanmakuRequestValid(session, seq))
+            return;
+
+        if (mDanmakuView == null)
+            return;
 
         mContext = DanmakuContext.create();
         HashMap<Integer, Integer> maxLinesPair = new HashMap<>();
@@ -1382,36 +1872,83 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 .setDanmakuTransparency(SharedPreferencesUtil.getFloat("player_danmaku_transparency", 0.5f))
                 .preventOverlapping(overlap);
 
+        if (!isDanmakuRequestValid(session, seq))
+            return;
         BaseDanmakuParser mParser = createParser(danmakuFile, protobufSegments);
+        lastDanmakuParser = mParser;
 
-        mDanmakuView.setCallback(new DrawHandler.Callback() {
-            @Override
-            public void prepared() {
-                Logu.v("danmaku", "prepared");
-                String msg = protobufSegments != null
-                        ? "弹幕君准备完毕～(是新来的哦～)"
-                        : "弹幕君准备完毕～(*≧ω≦)";
-                addDanmaku(msg, Color.WHITE);
+        if (!isDanmakuRequestValid(session, seq)) {
+            try {
+                if (mParser != null)
+                    mParser.release();
+            } catch (Exception ignore) {
             }
+            if (lastDanmakuParser == mParser)
+                lastDanmakuParser = null;
+            return;
+        }
 
-            @Override
-            public void updateTimer(DanmakuTimer timer) {
-                if (ijkPlayer != null && isPrepared) {
-                    long currentPos = ijkPlayer.getCurrentPosition();
-                    timer.update(currentPos);
-                }
-            }
-
-            @Override
-            public void danmakuShown(BaseDanmaku danmaku) {
-            }
-
-            @Override
-            public void drawingFinished() {
-            }
-        });
+        final boolean isProtobuf = protobufSegments != null && !protobufSegments.isEmpty();
+        mDanmakuView.setCallback(new SafeDanmakuCallback(this, session, seq, isProtobuf));
         mDanmakuView.enableDanmakuDrawingCache(true);
+        if (!isDanmakuRequestValid(session, seq))
+            return;
         mDanmakuView.prepare(mParser, mContext);
+    }
+
+    /** 避免 callback 强引用 Activity；并带 session/seq 校验，防止旧回调落地 */
+    private static final class SafeDanmakuCallback implements DrawHandler.Callback {
+        private final WeakReference<PlayerActivity> ref;
+        private final int session;
+        private final int seq;
+        private final boolean isProtobuf;
+
+        SafeDanmakuCallback(PlayerActivity act, int session, int seq, boolean isProtobuf) {
+            this.ref = new WeakReference<>(act);
+            this.session = session;
+            this.seq = seq;
+            this.isProtobuf = isProtobuf;
+        }
+
+        private PlayerActivity a() {
+            return ref.get();
+        }
+
+        @Override
+        public void prepared() {
+            PlayerActivity a = a();
+            if (a == null || !a.isDanmakuRequestValid(session, seq))
+                return;
+            Logu.v("danmaku", "prepared");
+            String msg = isProtobuf ? "弹幕君准备完毕～(是新来的哦～)" : "弹幕君准备完毕～(*≧ω≦)";
+            a.addDanmaku(msg, Color.WHITE);
+        }
+
+        @Override
+        public void updateTimer(DanmakuTimer timer) {
+            PlayerActivity a = a();
+            if (a == null || !a.isDanmakuRequestValid(session, seq))
+                return;
+            // 避免在 release/onDestroy 后仍访问 ijkPlayer 导致崩溃（部分机型 getCurrentPosition 可能抛异常）
+            IjkMediaPlayer p = a.ijkPlayer;
+            if (p == null || !a.isPrepared)
+                return;
+            long currentPos;
+            try {
+                currentPos = p.getCurrentPosition();
+            } catch (Exception ignore) {
+                return;
+            }
+            timer.update(currentPos);
+        }
+
+        @Override
+        public void danmakuShown(BaseDanmaku danmaku) {
+        }
+
+        @Override
+        public void drawingFinished() {
+        }
     }
 
     public void addDanmaku(String text, int color) {
@@ -1419,8 +1956,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     public void addDanmaku(String text, int color, int textSize, int type, int backgroundColor) {
-        BaseDanmaku danmaku = mContext.mDanmakuFactory.createDanmaku(type);
-        if (text == null || danmaku == null || ijkPlayer == null)
+        // 直播 WebSocket 回调可能在销毁/释放后仍触发；这里做防御避免 NPE。
+        if (destroyed || resourcesReleased)
+            return;
+        if (text == null || ijkPlayer == null || mContext == null || mDanmakuView == null)
+            return;
+
+        BaseDanmaku danmaku;
+        try {
+            danmaku = mContext.mDanmakuFactory.createDanmaku(type);
+        } catch (Exception ignore) {
+            return;
+        }
+        if (danmaku == null)
             return;
         danmaku.text = text;
         danmaku.padding = 5;
@@ -1428,8 +1976,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         danmaku.textColor = color;
         danmaku.backgroundColor = backgroundColor;
         danmaku.textSize = textSize * (mContext.getDisplayer().getDensity() - 0.6f);
-        danmaku.time = mDanmakuView.getCurrentTime() + 100;
-        mDanmakuView.addDanmaku(danmaku);
+        try {
+            danmaku.time = mDanmakuView.getCurrentTime() + 100;
+            mDanmakuView.addDanmaku(danmaku);
+        } catch (Exception ignore) {
+        }
     }
 
     public static byte[] decompress(byte[] data) {
@@ -1645,76 +2196,180 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         Logu.v("onStop");
     }
 
-    WebSocket liveWebSocket = null;
-
     @Override
     protected void onDestroy() {
-        if (!isFinishing()) {
-            super.onDestroy();
-            return; // 貌似有些设备启动activity会先调用一下onDestroy，头大…… 不super还会报错
+        // 修复 isFinishing() 早退导致的泄漏；并保证 onDestroy 多路径进入时幂等释放。
+        // 说明：原注释提到“部分设备启动 activity 会先调用 onDestroy”的异常情况，这里用 try/catch + 判空确保不引入新崩溃。
+        if (resourcesReleased) {
+            try {
+                super.onDestroy();
+            } catch (Exception ignore) {
+            }
+            return;
         }
+        resourcesReleased = true;
 
-        Logu.v("结束");
+        final boolean finishing = isFinishing();
+
+        Logu.v("销毁");
+        destroyed = true;
+        // 让旧会话的回调尽快失效（即使 Timer 未能及时 cancel 也不会再触发实际逻辑）
+        invalidatePlayerSession("onDestroy");
+
         if (eventBusInit) {
-            EventBus.getDefault().unregister(this);
+            try {
+                EventBus.getDefault().unregister(this);
+            } catch (Exception ignore) {
+            }
             eventBusInit = false;
         }
-        destroyed = true;
 
-        cancelAllTimers();
+        stopAllPeriodicTasks();
+
+        // Surface/Texture 回调与 native Surface 释放（避免 callback 持有 Activity、Surface 泄漏）
+        try {
+            if (surfaceHolder != null) {
+                surfaceHolder.removeCallback(surfaceCallback);
+            }
+        } catch (Exception ignore) {
+        }
+        try {
+            releaseTextureSurface();
+        } catch (Exception ignore) {
+        }
 
         if (mDanmakuView != null) {
-            mDanmakuView.release();
+            // Danmaku 会话也做幂等释放（callback + parser + handlerThread）
+            try {
+                resetDanmakuBeforePrepare("onDestroy");
+            } catch (Exception ignore) {
+            }
             mDanmakuView = null;
         }
-        if (ijkPlayer != null) {
-            ijkPlayer.release();
-            ijkPlayer = null;
+
+        // 直播弹幕 WebSocket/Listener/OkHttp 释放（避免线程/Timer/Activity 引用残留）
+        if (liveWebSocket != null) {
+            try {
+                liveWebSocket.close(1000, "");
+            } catch (Exception ignore) {
+            }
+            liveWebSocket = null;
+        }
+        if (liveDanmuListener != null) {
+            try {
+                liveDanmuListener.release();
+            } catch (Exception ignore) {
+            }
+            liveDanmuListener = null;
+        }
+        if (okHttpClient != null) {
+            try {
+                okHttpClient.dispatcher().cancelAll();
+            } catch (Exception ignore) {
+            }
+            try {
+                okHttpClient.connectionPool().evictAll();
+            } catch (Exception ignore) {
+            }
+            try {
+                okHttpClient.dispatcher().executorService().shutdown();
+            } catch (Exception ignore) {
+            }
+            okHttpClient = null;
         }
 
-        if (isOnlineVideo && danmakuFile != null && danmakuFile.exists())
-            danmakuFile.delete();
+        releaseIjkPlayerSafely("onDestroy");
 
-        if (liveWebSocket != null) {
-            liveWebSocket.close(1000, "");
-            liveWebSocket = null;
+        if (isOnlineVideo && danmakuFile != null && danmakuFile.exists()) {
+            try {
+                danmakuFile.delete();
+            } catch (Exception ignore) {
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && mediaSession != null) {
-            mediaSession.release();
+            try {
+                mediaSession.release();
+            } catch (Exception ignore) {
+            }
             mediaSession = null;
         }
 
-        setRequestedOrientation(SharedPreferencesUtil.getBoolean("ui_landscape", false)
-                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        // 保持旧行为：仅在真正退出播放器（finishing）时尝试恢复方向，避免影响因配置变更触发的销毁流程。
+        if (finishing) {
+            try {
+                setRequestedOrientation(SharedPreferencesUtil.getBoolean("ui_landscape", false)
+                        ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+            } catch (Exception ignore) {
+            }
+        }
 
         super.onDestroy();
     }
 
-    private void cancelAllTimers() {
-        if (surfaceTimer != null) {
-            surfaceTimer.cancel();
-            surfaceTimer = null;
-        }
-        if (progressTimer != null) {
-            progressTimer.cancel();
+    /**
+     * 停止所有周期任务/延迟任务，确保重建会话或销毁时不会出现 Timer 叠加、回调泄漏、release 后访问 ijkPlayer 崩溃。
+     * <p>
+     * 说明：保留 Timer 实现以最小行为改动，但做到“同类任务任意时刻最多一个”。
+     */
+    private void stopAllPeriodicTasks() {
+        try {
+            if (progressTimer != null) {
+                progressTimer.cancel();
+                progressTimer = null;
+            }
+        } catch (Exception ignore) {
             progressTimer = null;
         }
-        if (onlineTimer != null) {
-            onlineTimer.cancel();
+        try {
+            if (onlineTimer != null) {
+                onlineTimer.cancel();
+                onlineTimer = null;
+            }
+        } catch (Exception ignore) {
             onlineTimer = null;
         }
-        if (loadingTimer != null) {
-            loadingTimer.cancel();
+        try {
+            if (loadingTimer != null) {
+                loadingTimer.cancel();
+                loadingTimer = null;
+            }
+        } catch (Exception ignore) {
             loadingTimer = null;
         }
-        if (mainHandler != null) {
-            mainHandler.removeCallbacksAndMessages(null);
+        try {
+            if (speedTimer != null) {
+                speedTimer.cancel();
+                speedTimer = null;
+            }
+        } catch (Exception ignore) {
+            speedTimer = null;
         }
-        layout_control.removeCallbacks(hidecon);
-        text_volume.removeCallbacks(hideVolume);
-        seekbar_progress.removeCallbacks(progressbarEnable);
+
+        if (mainHandler != null) {
+            try {
+                mainHandler.removeCallbacksAndMessages(null);
+            } catch (Exception ignore) {
+            }
+        }
+
+        // 这些是 UI 上的延迟隐藏/启用，不属于播放会话但也应在销毁时清理
+        try {
+            if (layout_control != null)
+                layout_control.removeCallbacks(hidecon);
+        } catch (Exception ignore) {
+        }
+        try {
+            if (text_volume != null)
+                text_volume.removeCallbacks(hideVolume);
+        } catch (Exception ignore) {
+        }
+        try {
+            if (seekbar_progress != null)
+                seekbar_progress.removeCallbacks(progressbarEnable);
+        } catch (Exception ignore) {
+        }
     }
 
     OkHttpClient okHttpClient;
@@ -1722,6 +2377,34 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private void danmuSocketConnect() {
         CenterThreadPool.run(() -> {
             try {
+                // 防止重复连接/旧 listener 泄漏（切会话或异常重连时）
+                try {
+                    if (liveWebSocket != null) {
+                        liveWebSocket.close(1000, "");
+                        liveWebSocket = null;
+                    }
+                } catch (Exception ignore) {
+                    liveWebSocket = null;
+                }
+                try {
+                    if (liveDanmuListener != null) {
+                        liveDanmuListener.release();
+                        liveDanmuListener = null;
+                    }
+                } catch (Exception ignore) {
+                    liveDanmuListener = null;
+                }
+                try {
+                    if (okHttpClient != null) {
+                        okHttpClient.dispatcher().cancelAll();
+                        okHttpClient.connectionPool().evictAll();
+                        okHttpClient.dispatcher().executorService().shutdown();
+                        okHttpClient = null;
+                    }
+                } catch (Exception ignore) {
+                    okHttpClient = null;
+                }
+
                 String url = "https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo?type=0&id=" + aid;
                 ArrayList<String> mHeaders = new ArrayList<>() {
                     {
@@ -1735,9 +2418,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         add(USER_AGENT_WEB);
                     }
                 };
-                Response response = NetWorkUtil.get(ConfInfoApi.signWBI(url), mHeaders);
-                JSONObject data = new JSONObject(Objects.requireNonNull(response.body()).string())
-                        .getJSONObject("data");
+                JSONObject data;
+                // StrictMode/资源泄漏修复：必须关闭 Response，避免连接池泄漏。
+                try (Response response = NetWorkUtil.get(ConfInfoApi.signWBI(url), mHeaders)) {
+                    data = new JSONObject(Objects.requireNonNull(response.body()).string())
+                            .getJSONObject("data");
+                }
                 JSONObject host = data.getJSONArray("host_list").getJSONObject(0);
 
                 url = "wss://" + host.getString("host") + ":" + host.getInt("wss_port") + "/sub";
@@ -1755,6 +2441,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 listener.mid = mid;
                 listener.roomid = aid;
                 listener.key = data.getString("token");
+                liveDanmuListener = listener;
                 listener.playerActivity = this;
 
                 liveWebSocket = okHttpClient.newWebSocket(request, listener);
@@ -1943,8 +2630,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture, int i, int i1) {
                     Logu.v("surfacetexture", "available");
                     mSurfaceTexture = surfaceTexture;
-                    if (isPrepared && ijkPlayer != null)
-                        ijkPlayer.setSurface(new Surface(surfaceTexture));
+                    attachSurfaceIfPossible();
+                    maybePrepare("onSurfaceTextureAvailable");
                 }
 
                 @Override
@@ -1956,8 +2643,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
                     Logu.v("surfacetexture", "destroyed");
                     mSurfaceTexture = null;
-                    if (ijkPlayer != null)
-                        ijkPlayer.setSurface(null);
+                    if (ijkPlayer != null) {
+                        try {
+                            ijkPlayer.setSurface(null);
+                        } catch (Exception ignore) {
+                        }
+                    }
+                    releaseTextureSurface();
                     return true;
                 }
 
@@ -1968,6 +2660,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             layout_video.addView(textureView, params);
         } else {
             surfaceView = new SurfaceView(this);
+            surfaceHolder = surfaceView.getHolder();
+            try {
+                surfaceHolder.addCallback(surfaceCallback);
+            } catch (Exception ignore) {
+            }
             layout_video.addView(surfaceView, params);
         }
 
@@ -2084,17 +2781,44 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
-                if (speedTimer != null)
-                    speedTimer.cancel();
+                // 防止速度条隐藏 Timer 叠加
+                try {
+                    if (speedTimer != null) {
+                        speedTimer.cancel();
+                        speedTimer = null;
+                    }
+                } catch (Exception ignore) {
+                    speedTimer = null;
+                }
             }
 
             @Override
             public void onStopTrackingTouch(SeekBar seekBar) {
+                // 防止重复启动；并在 Activity 销毁后不再执行
+                try {
+                    if (speedTimer != null) {
+                        speedTimer.cancel();
+                        speedTimer = null;
+                    }
+                } catch (Exception ignore) {
+                    speedTimer = null;
+                }
+                final int session = playerSessionId;
                 speedTimer = new Timer();
                 TimerTask timerTask = new TimerTask() {
                     @Override
                     public void run() {
-                        runOnUiThread(() -> layout_speed.setVisibility(View.GONE));
+                        if (destroyed || resourcesReleased || session != playerSessionId) {
+                            try {
+                                cancel();
+                            } catch (Exception ignore) {
+                            }
+                            return;
+                        }
+                        runOnUiThread(() -> {
+                            if (layout_speed != null)
+                                layout_speed.setVisibility(View.GONE);
+                        });
                     }
                 };
                 speedTimer.schedule(timerTask, 200);
@@ -2141,52 +2865,44 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         // 不保存状态，仅在当前播放会话中切换
 
         if (isPrepared && ijkPlayer != null) {
-            final long currentPosition = ijkPlayer.getCurrentPosition();
+            long currentPosition = 0;
+            try {
+                currentPosition = ijkPlayer.getCurrentPosition();
+            } catch (Exception ignore) {
+            }
             final boolean wasPlaying = isPlaying;
 
+            // 记录切换前位置：用于新会话 onPrepared 强制跳回，避免回退到关键帧。
+            pendingAudioOnlyToggleSeekMs = Math.max(0L, currentPosition);
+
             MsgUtil.showMsg(isAudioOnlyMode ? "正在切换到听视频模式..." : "正在切换到普通模式...");
-
-            CenterThreadPool.run(() -> {
-                try {
-                    runOnUiThread(() -> {
-                        if (hasDanmaku && mDanmakuView != null) {
-                            mDanmakuView.pause();
-                        }
-                        if (ijkPlayer != null) {
-                            ijkPlayer.stop();
-                            ijkPlayer.release();
-                        }
-
-                        loading_info.setVisibility(View.VISIBLE);
-                        anim_loading.start();
-                        loading_text0.setText(isAudioOnlyMode ? "切换到听视频模式" : "切换到普通模式");
-                        isPrepared = false;
-                        isPlaying = false;
-
-                        updateAudioOnlyButton();
-                        updateAudioOnlyUI();
-                    });
-
-                    Thread.sleep(100);
-
-                    runOnUiThread(() -> {
-                        ijkPlayer = new IjkMediaPlayer();
-                        progress_history = currentPosition;
-
-                        setDisplay();
-                    });
-                } catch (Exception e) {
-                    runOnUiThread(() -> {
-                        MsgUtil.showMsg("切换失败，请重试");
-                        isAudioOnlyMode = oldMode;
-                        // 不保存状态
-                        updateAudioOnlyButton();
-                        updateAudioOnlyUI();
-                        loading_info.setVisibility(View.GONE);
-                        anim_loading.stop();
-                    });
+            try {
+                if (hasDanmaku && mDanmakuView != null) {
+                    mDanmakuView.pause();
                 }
-            });
+
+                loading_info.setVisibility(View.VISIBLE);
+                anim_loading.start();
+                loading_text0.setText(isAudioOnlyMode ? "切换到听视频模式" : "切换到普通模式");
+                isPrepared = false;
+                isPlaying = false;
+
+                updateAudioOnlyButton();
+                updateAudioOnlyUI();
+
+                // 统一重建播放会话，确保 stopAllPeriodicTasks + release old ijkPlayer + session 防过期回调
+                rebuildPlayerSession("toggleAudioOnlyMode", currentPosition);
+                autohideReset();
+            } catch (Exception e) {
+                MsgUtil.showMsg("切换失败，请重试");
+                isAudioOnlyMode = oldMode;
+                pendingAudioOnlyToggleSeekMs = -1L;
+                // 不保存状态
+                updateAudioOnlyButton();
+                updateAudioOnlyUI();
+                loading_info.setVisibility(View.GONE);
+                anim_loading.stop();
+            }
         } else {
             updateAudioOnlyButton();
             updateAudioOnlyUI();
@@ -2365,13 +3081,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     if (destroyed)
                         return;
 
-                    if (ijkPlayer != null) {
-                        ijkPlayer.stop();
-                        ijkPlayer.release();
-                    }
-                    if (mDanmakuView != null) {
-                        mDanmakuView.release();
-                        mDanmakuView = null;
+                    long currentPosition = 0;
+                    // 切分P时通常从 0 开始，但这里保留读取以兼容未来逻辑（并避免异常）
+                    try {
+                        if (ijkPlayer != null)
+                            currentPosition = ijkPlayer.getCurrentPosition();
+                    } catch (Exception ignore) {
                     }
 
                     cid = newCid;
@@ -2411,19 +3126,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         interactionChoiceLayout.removeAllViews();
                     }
 
-                    ijkPlayer = new IjkMediaPlayer();
-                    mDanmakuView = findViewById(R.id.sv_danmaku);
+                    // 统一重建播放会话（包含 stopAllPeriodicTasks + release old player），并从 0 播放新分P
+                    rebuildPlayerSession("switchToPage", 0);
+                    autohideReset();
 
-                    setDisplay();
-
-                    layout_control.postDelayed(() -> CenterThreadPool.run(() -> {
-                        if (destroyed)
+	                    final int sessionAfterRebuild = playerSessionId;
+	                    layout_control.postDelayed(() -> CenterThreadPool.run(() -> {
+	                        if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
                             return;
 
-                        runOnUiThread(() -> {
+	                        runOnUiThread(() -> {
+	                            if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
+	                                return;
                             loading_text0.setText("装填弹幕中");
                             loading_text1.setText("(≧∇≦)");
                         });
+	                        if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
+	                            return;
 
                         if (isOnlineVideo) {
                             danmakuFile = new File(getCacheDir(), "danmaku.xml");
@@ -2433,19 +3152,21 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                             downdanmu();
                         }
 
-                        if (!destroyed && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true)) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId
+	                                && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true)) {
                             downSubtitle(false);
                         }
 
-                        if (!destroyed && isOnlineVideo && aid > 0 && cid > 0) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId && isOnlineVideo && aid > 0 && cid > 0) {
                             loadHighEnergyData();
                         }
 
-                        if (!destroyed && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId
+	                                && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
                             loadViewPoints();
                         }
 
-                        if (!destroyed && isOnlineVideo && aid > 0 && cid > 0) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId && isOnlineVideo && aid > 0 && cid > 0) {
                             loadInteractionVideo();
                         }
                     }), 60);
@@ -2522,13 +3243,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     if (destroyed)
                         return;
 
-                    final long currentPosition = ijkPlayer != null ? ijkPlayer.getCurrentPosition() : 0;
-                    final boolean wasPlaying = isPlaying;
-
-                    if (ijkPlayer != null) {
-                        ijkPlayer.stop();
-                        ijkPlayer.release();
+                    long currentPosition = 0;
+                    try {
+                        if (ijkPlayer != null)
+                            currentPosition = ijkPlayer.getCurrentPosition();
+                    } catch (Exception ignore) {
                     }
+                    final boolean wasPlaying = isPlaying;
 
                     video_url = playerData.videoUrl;
                     currentQuality = newQuality;
@@ -2544,10 +3265,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     isPrepared = false;
                     isPlaying = false;
 
-                    ijkPlayer = new IjkMediaPlayer();
-                    progress_history = currentPosition;
-
-                    setDisplay();
+                    // 统一重建播放会话，确保 stopAllPeriodicTasks + release old ijkPlayer + session 防过期回调
+                    rebuildPlayerSession("switchQuality", currentPosition);
+                    autohideReset();
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> {
@@ -2903,19 +3623,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 runOnUiThread(() -> {
                     if (destroyed)
                         return;
-                    
-                    if (ijkPlayer != null) {
-                        ijkPlayer.stop();
-                        ijkPlayer.release();
-                    }
+
+                    // 统一重建播放会话（先 stopAllPeriodicTasks + release old ijkPlayer），避免 Timer 叠加/释放后访问崩溃。
+                    // 保持旧行为：互动跳转时重置弹幕层（release 后重新 findViewById）。
                     if (mDanmakuView != null) {
-                        mDanmakuView.release();
+                        try {
+                            mDanmakuView.release();
+                        } catch (Exception ignore) {
+                        }
                         mDanmakuView = null;
                     }
+                    mDanmakuView = findViewById(R.id.sv_danmaku);
                     
                     cid = targetCid;
                     video_url = playerData.videoUrl;
                     danmaku_url = playerData.danmakuUrl;
+                    isOnlineVideo = video_url != null && video_url.contains("http");
+                    hasDanmaku = danmaku_url != null && !danmaku_url.equals("");
                     text_title.setText(newData.title);
                     videoTitle = newData.title;
                     currentEdgeId = newData.edgeId;
@@ -2949,20 +3673,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         interactionChoiceLayout.setVisibility(View.GONE);
                         interactionChoiceLayout.removeAllViews();
                     }
-                    
-                    ijkPlayer = new IjkMediaPlayer();
-                    mDanmakuView = findViewById(R.id.sv_danmaku);
-                    
-                    setDisplay();
-                    
-                    layout_control.postDelayed(() -> CenterThreadPool.run(() -> {
-                        if (destroyed)
+
+                    rebuildPlayerSession("jumpToInteractionPage", 0);
+                    autohideReset();
+	                    
+	                    final int sessionAfterRebuild = playerSessionId;
+	                    layout_control.postDelayed(() -> CenterThreadPool.run(() -> {
+	                        if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
                             return;
-                        
-                        runOnUiThread(() -> {
+	                        
+	                        runOnUiThread(() -> {
+	                            if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
+	                                return;
                             loading_text0.setText("装填弹幕中");
                             loading_text1.setText("(≧∇≦)");
                         });
+	                        if (destroyed || resourcesReleased || sessionAfterRebuild != playerSessionId)
+	                            return;
                         
                         if (isOnlineVideo) {
                             danmakuFile = new File(getCacheDir(), "danmaku.xml");
@@ -2972,15 +3699,17 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                             downdanmu();
                         }
                         
-                        if (!destroyed && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true)) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId
+	                                && SharedPreferencesUtil.getBoolean("player_subtitle_autoshow", true)) {
                             downSubtitle(false);
                         }
                         
-                        if (!destroyed && isOnlineVideo && aid > 0 && cid > 0) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId && isOnlineVideo && aid > 0 && cid > 0) {
                             loadHighEnergyData();
                         }
                         
-                        if (!destroyed && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
+	                        if (!destroyed && !resourcesReleased && sessionAfterRebuild == playerSessionId
+	                                && isOnlineVideo && aid > 0 && cid > 0 && SharedPreferencesUtil.getBoolean("player_show_viewpoints", false)) {
                             loadViewPoints();
                         }
                     }), 60);
