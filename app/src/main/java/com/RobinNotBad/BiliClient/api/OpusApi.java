@@ -1136,7 +1136,6 @@ public class OpusApi {
         colorMap.put("color-blue-02", "#02a2ff");
         colorMap.put("color-blue-03", "#0176ba");
         colorMap.put("color-blue-04", "#004e80");
-        colorMap.put("color-default", "#222");
         colorMap.put("color-gray-01", "#d6d5d5");
         colorMap.put("color-gray-02", "#929292");
         colorMap.put("color-gray-03", "#5f5f5f");
