@@ -7,8 +7,6 @@ import android.view.ViewGroup;
 import android.widget.Button;
 
 import androidx.annotation.NonNull;
-import androidx.appcompat.content.res.AppCompatResources;
-import androidx.core.view.ViewCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.RobinNotBad.BiliClient.R;
@@ -81,12 +79,10 @@ public class SubtitleAdapter extends RecyclerView.Adapter<SubtitleAdapter.Holder
             button.setText(list[currentIndex].lang);
             if (isSelected) {
                 button.setTextColor(0xcc262626);
-                ViewCompat.setBackgroundTintList(button, AppCompatResources.getColorStateList(itemView.getContext(),
-                        R.color.background_button_selected));
+                button.setBackgroundResource(R.drawable.bg_subtitle_item_selected);
             } else {
                 button.setTextColor(0xffebe0e2);
-                ViewCompat.setBackgroundTintList(button,
-                        AppCompatResources.getColorStateList(itemView.getContext(), R.color.background_button));
+                button.setBackgroundResource(R.drawable.bg_subtitle_item_normal);
             }
             button.setOnClickListener(v -> {
                 setSelectedItemIndex(currentIndex);
