@@ -19,7 +19,7 @@ import okhttp3.ResponseBody;
 
 public class HistoryApi {
 
-    public static final int ARTICLE_HISTORY_TYPE = 3;
+    public static final int ARTICLE_HISTORY_TYPE = 5;
     public static final int ARTICLE_LIST_HISTORY_TYPE = 5;
 
     /**
@@ -78,6 +78,40 @@ public class HistoryApi {
         postHistoryReport(url, per);
     }
 
+    /**
+     * 调试用途：模拟网页端访问 viewinfo，以观察是否触发 view_at 前置。
+     */
+    public static void touchArticleViewInfoForDebug(long cvid) {
+        if (cvid <= 0) return;
+        try {
+            String url = "https://api.bilibili.com/x/article/viewinfo?"
+                    + "id=" + cvid
+                    + "&gaia_source=main_web"
+                    + "&web_location=333.976"
+                    + "&mobi_app=pc"
+                    + "&from=web";
+            String signedUrl = ConfInfoApi.signWBI(url);
+
+            JSONObject result = NetWorkUtil.getJson(signedUrl);
+            if (result == null) {
+                Logu.e("HistoryReport", "viewinfo touch: empty response, cvid=" + cvid);
+                return;
+            }
+
+            int code = result.optInt("code", -1);
+            String message = result.optString("message", "");
+            JSONObject data = result.optJSONObject("data");
+            boolean hasVoucher = data != null && data.has("v_voucher");
+
+            Logu.i("HistoryReport", "viewinfo touch: code=" + code
+                    + ", message=" + message
+                    + ", hasVoucher=" + hasVoucher
+                    + ", cvid=" + cvid);
+        } catch (Exception e) {
+            Logu.e("HistoryReport", "viewinfo touch failed: cvid=" + cvid + ", err=" + e.getMessage());
+        }
+    }
+
     private static void postHistoryReport(String url, String form) throws IOException {
         try (Response response = NetWorkUtil.post(url, form, NetWorkUtil.webHeaders)) {
             if (response == null) return;
@@ -90,13 +124,169 @@ public class HistoryApi {
                 int code = json.optInt("code", -1);
                 String message = json.optString("message", "");
                 if (code != 0) {
-                    Logu.e("HistoryReport", "history/report failed: code=" + code + ", message=" + message + ", form=" + form);
+                    Logu.e("HistoryReport", "history/report failed: code=" + code + ", message=" + message + ", form=" + form
+                            + ", body=" + body);
                 } else {
-                    Logu.i("HistoryReport", "history/report ok: form=" + form);
+                    Logu.i("HistoryReport", "history/report ok: code=" + code + ", message=" + message + ", form=" + form
+                            + ", body=" + body);
+                    dumpArticleHistorySnapshotForDebug(form);
                 }
             } catch (Exception ignored) {
                 Logu.e("HistoryReport", "history/report invalid response: " + body);
             }
+        }
+    }
+
+    /**
+     * 调试辅助：上报成功后，立即拉取 article 历史快照，帮助判断服务端是否真正写入/前置。
+     */
+    private static void dumpArticleHistorySnapshotForDebug(String triggerForm) {
+        TargetHistory target = TargetHistory.fromForm(triggerForm);
+        if (target == null) {
+            Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", cannot parse target");
+            return;
+        }
+
+        long max = 0;
+        long viewAt = 0;
+        String business = "";
+        int page = 0;
+        long ts = System.currentTimeMillis();
+
+        try {
+            while (page < 3) {
+                page++;
+                StringBuilder url = new StringBuilder("https://api.bilibili.com/x/web-interface/history/cursor?type=article&ps=30");
+                url.append("&view_at=").append(viewAt).append("&max=").append(max).append("&_ts=").append(ts);
+                if (!business.isEmpty()) {
+                    url.append("&business=").append(business);
+                }
+
+                JSONObject result = NetWorkUtil.getJson(url.toString());
+                JSONObject data = result.optJSONObject("data");
+                if (data == null) {
+                    Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", page=" + page + ", data is null, result=" + result);
+                    return;
+                }
+
+                JSONArray list = data.optJSONArray("list");
+                if (list == null || list.length() == 0) {
+                    Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", page=" + page + ", article list empty");
+                    return;
+                }
+
+                boolean found = false;
+                String matchType = "";
+                for (int i = 0; i < list.length(); i++) {
+                    JSONObject item = list.optJSONObject(i);
+                    if (item == null) continue;
+
+                    JSONObject history = item.optJSONObject("history");
+                    String title = item.optString("title", "");
+                    long itemViewAt = item.optLong("view_at", 0);
+                    int progress = item.optInt("progress", 0);
+
+                    String itemBusiness = history == null ? "" : history.optString("business", "");
+                    long oid = history == null ? 0 : history.optLong("oid", 0);
+                    long cid = history == null ? 0 : history.optLong("cid", 0);
+
+                    matchType = target.matchType(itemBusiness, oid, cid);
+                    if (!matchType.isEmpty()) {
+                        Logu.i("HistoryReportSnapshot", "after form=" + triggerForm
+                                + ", page=" + page
+                                + ", idx=" + (i + 1)
+                                + ", title=" + title
+                                + ", matchType=" + matchType
+                                + ", business=" + itemBusiness
+                                + ", oid=" + oid
+                                + ", cid=" + cid
+                                + ", view_at=" + itemViewAt
+                                + ", progress=" + progress);
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (found) return;
+
+                JSONObject cursor = data.optJSONObject("cursor");
+                if (cursor == null) {
+                    Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", page=" + page + ", cursor missing");
+                    return;
+                }
+                max = cursor.optLong("max", 0);
+                viewAt = cursor.optLong("view_at", 0);
+                business = cursor.optString("business", "");
+
+                JSONObject first = list.optJSONObject(0);
+                String firstTitle = first == null ? "" : first.optString("title", "");
+                long firstViewAt = first == null ? 0 : first.optLong("view_at", 0);
+                Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", page=" + page
+                        + ", not found, firstTitle=" + firstTitle + ", firstViewAt=" + firstViewAt);
+
+                if (max == 0 && viewAt == 0) {
+                    Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", page=" + page + ", cursor ended");
+                    return;
+                }
+            }
+
+            Logu.i("HistoryReportSnapshot", "after form=" + triggerForm + ", not found within 3 pages");
+        } catch (Exception e) {
+            Logu.e("HistoryReportSnapshot", "snapshot query failed after form=" + triggerForm + ", err=" + e.getMessage());
+        }
+    }
+
+    private static final class TargetHistory {
+        private final long aid;
+        private final long cid;
+        private final String type;
+
+        private TargetHistory(long aid, long cid, String type) {
+            this.aid = aid;
+            this.cid = cid;
+            this.type = type;
+        }
+
+        private String matchType(String business, long oid, long cidVal) {
+            if (cid > 0) {
+                if ("article-list".equals(business) && oid == aid && cidVal == cid) return "article-list";
+                if ("article".equals(business) && oid == aid && cidVal == cid) return "article-hybrid";
+                if ("article".equals(business) && oid == cid) return "article-cvid";
+                return "";
+            }
+            return ("article".equals(business) && oid == aid) ? "article-cvid" : "";
+        }
+
+        private static TargetHistory fromForm(String form) {
+            if (form == null || form.isEmpty()) return null;
+            long aid = 0;
+            long cid = 0;
+            String type = "";
+            String[] parts = form.split("&");
+            for (String part : parts) {
+                int idx = part.indexOf('=');
+                if (idx <= 0 || idx >= part.length() - 1) continue;
+                String key = part.substring(0, idx);
+                String val = part.substring(idx + 1);
+                try {
+                    switch (key) {
+                        case "aid":
+                            aid = Long.parseLong(val);
+                            break;
+                        case "cid":
+                            cid = Long.parseLong(val);
+                            break;
+                        case "type":
+                            type = val;
+                            break;
+                        default:
+                            break;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            if (aid <= 0) return null;
+            return new TargetHistory(aid, cid, type);
         }
     }
 

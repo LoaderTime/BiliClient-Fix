@@ -122,6 +122,27 @@ public class HistoryActivity extends RefreshListActivity {
             } else {
                 // 发现重复记录：优先保留非占位符
                 VideoCard keptCard = dedup.get(key);
+                boolean currentIsArticle = "article".equals(card.type);
+                boolean keptIsArticle = keptCard != null && "article".equals(keptCard.type);
+
+                // 专栏重复时，不进行服务器删除，避免误删 article-list/article-hybrid 记录。
+                if (currentIsArticle || keptIsArticle) {
+                    int keptPriority = getArticlePriority(keptCard);
+                    int currentPriority = getArticlePriority(card);
+                    boolean keepCurrent = currentPriority > keptPriority;
+
+                    if (keepCurrent) {
+                        dedup.put(key, card);
+                        android.util.Log.d("HistoryActivity", "  -> 专栏重复: 选择高优先级记录, currentPriority="
+                                + currentPriority + ", keptPriority=" + keptPriority + ", kid=" + card.kid);
+                    } else {
+                        android.util.Log.d("HistoryActivity", "  -> 专栏重复: 保留已存在, keptPriority="
+                                + keptPriority + ", currentPriority=" + currentPriority
+                                + ", kid=" + (keptCard != null ? keptCard.kid : "null"));
+                    }
+                    continue;
+                }
+
                 boolean keptPlaceholder = keptCard != null && keptCard.historyPlaceholder;
                 boolean currentPlaceholder = card.historyPlaceholder;
 
@@ -163,5 +184,21 @@ public class HistoryActivity extends RefreshListActivity {
         }
         
         return new ArrayList<>(dedup.values());
+    }
+
+    /**
+     * 专栏历史优先级：article-list > article-hybrid > article-cvid > 其他。
+     */
+    private int getArticlePriority(VideoCard card) {
+        if (card == null || !"article".equals(card.type)) return 0;
+        String business = card.historyBusiness;
+        if ("article-list".equals(business)) return 3;
+        if ("article".equals(business)) {
+            // article-hybrid: oid=rlid, cid=cvid
+            if (card.historyCid > 0 && card.historyOid > 0 && card.historyOid != card.historyCid) return 2;
+            // article-cvid: oid=cvid
+            return 1;
+        }
+        return 0;
     }
 }

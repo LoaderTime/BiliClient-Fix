@@ -91,27 +91,33 @@ public class OpusInfoFragment extends Fragment {
                         recyclerView.requestFocus();
                     });
                     
-                    // 参考 PiliPlus：专栏统一按 article-list(type=5) 上报，aid 使用当前 cvid。
+                    // 历史上报：
+                    // 历史策略：
+                    // - 普通专栏（listId <= 0）：走 history/report (type=5)。
+                    // - 专栏合集（listId > 0）：不走 history/report（避免产生 article-hybrid 错位记录），仅触达 viewinfo
+                    //   以模拟网页端链路，观察是否能前置。
                     CenterThreadPool.run(() -> {
                         try {
-                            long reportId = opus.commentId > 0
-                                    ? opus.commentId
-                                    : (opus.id > 0 ? opus.id : oid);
                             long listId = opus.listId;
-                            if (listId > 0) {
+                            long cvid = opus.id > 0 ? opus.id : oid;
+                            // 安全校验：若 listId 与 cvid 相同，基本可判定并非合集 rlid，回退普通专栏上报。
+                            boolean useListReport = listId > 0 && listId != cvid;
+                            if (useListReport) {
                                 com.RobinNotBad.BiliClient.util.Logu.i("OpusHistory",
-                                        "上报专栏合集历史: opus.id=" + opus.id
-                                                + ", oid=" + oid
-                                                + ", listId=" + listId
-                                                + ", commentId=" + opus.commentId);
-                                HistoryApi.reportArticleListHistory(reportId);
+                                        "Article-list mode: touch viewinfo only (no history/report). listId=" + listId
+                                                + ", cvid=" + cvid
+                                                + ", opus.id=" + opus.id
+                                                + ", oid=" + oid);
+                                HistoryApi.touchArticleViewInfoForDebug(cvid);
                             } else {
+                                String fallbackReason = listId <= 0 ? "listId<=0" : "listId==cvid(" + listId + ")";
                                 com.RobinNotBad.BiliClient.util.Logu.i("OpusHistory",
-                                        "上报普通专栏历史(按article-list): opus.id=" + opus.id
-                                                + ", oid=" + oid
-                                                + ", reportId=" + reportId
+                                        "Article mode: history/report(type=5) for oid=" + oid
+                                                + ", reason=" + fallbackReason
+                                                + ", listId=" + listId
+                                                + ", opus.id=" + opus.id
                                                 + ", commentId=" + opus.commentId);
-                                HistoryApi.reportArticleListHistory(reportId);
+                                HistoryApi.reportArticleListHistory(cvid);
                             }
                         } catch (Exception e) {
                             e.printStackTrace();
