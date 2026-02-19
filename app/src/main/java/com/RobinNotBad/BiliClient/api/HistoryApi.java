@@ -160,8 +160,11 @@ public class HistoryApi {
                     }
                 } else {
                     contentType = "video";
-                    if (progress == 0) viewStr = "还没看过";
-                    else viewStr = "看到" + StringUtil.toTime(videoCard.getInt("progress"));
+                    // progress: 观看进度（秒）。B站接口在“已看完”等情况下可能返回 -1。
+                    // 兼容处理：-1 -> 已看完；0 -> 还没看过；>0 -> 看到xx:xx
+                    if (progress < 0) viewStr = "已看完";
+                    else if (progress == 0) viewStr = "还没看过";
+                    else viewStr = "看到" + StringUtil.toTime(progress);
                 }
 
                 VideoCard card = new VideoCard(title, upName, viewStr, cover, aid, bvid, contentType);

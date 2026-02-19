@@ -109,6 +109,8 @@ public class StringUtil {
     }
 
     public static String toTime(int progress) {
+        // 防御：历史记录等接口可能返回 -1（已看完）或其它负数；避免出现 00:0-1 之类显示。
+        if (progress < 0) progress = 0;
         int cghour = progress / 3600;
         int cgminute = (progress % 3600) / 60;
         int cgsecond = progress % 60;
