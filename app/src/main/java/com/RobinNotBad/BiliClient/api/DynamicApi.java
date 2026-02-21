@@ -28,22 +28,96 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import okhttp3.HttpUrl;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 
 //新的动态api，旧的那个实在太蛋疼而且说不定随时会被弃用（
 
 public class DynamicApi {
+
+    private static boolean isRiskCode(int code) {
+        return code == -352 || code == -412 || code == -403;
+    }
+
+    private static JSONObject getDynamicListJsonWithRetry(String signedUrl, long mid) throws IOException {
+        for (int retry = 0; retry < 2; retry++) {
+            JSONObject all = mid == 0
+                    ? NetWorkUtil.getJson(signedUrl)
+                    : NetWorkUtil.getJson(signedUrl, getSpaceHeaders(mid));
+
+            int code = all.optInt("code", -1);
+            if (!isRiskCode(code) || retry > 0) {
+                return all;
+            }
+
+            Logu.w("dynamic-risk", "code=" + code + ", try reactivate cookies and retry once");
+            try {
+                CookiesApi.checkCookies();
+                CookiesApi.ensureRiskActive(true);
+            } catch (Exception e) {
+                Logu.e("dynamic-risk-retry", String.valueOf(e.getMessage()));
+            }
+        }
+        // 理论上不会到达这里
+        return new JSONObject();
+    }
+
+    private static JSONObject getLegacySpaceHistoryJsonWithRetry(long mid, long offset) throws IOException {
+        for (int retry = 0; retry < 2; retry++) {
+            HttpUrl.Builder builder = Objects.requireNonNull(HttpUrl.parse("https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history")).newBuilder()
+                    .addQueryParameter("host_uid", String.valueOf(mid))
+                    .addQueryParameter("offset_dynamic_id", String.valueOf(Math.max(offset, 0)))
+                    .addQueryParameter("need_top", offset == 0 ? "1" : "0")
+                    .addQueryParameter("platform", "web");
+
+            JSONObject all = NetWorkUtil.getJson(builder.build().toString(), getSpaceHeaders(mid));
+            int code = all.optInt("code", -1);
+            if (!isRiskCode(code) || retry > 0) {
+                return all;
+            }
+
+            Logu.w("dynamic-risk-legacy", "code=" + code + ", try reactivate cookies and retry once");
+            try {
+                CookiesApi.checkCookies();
+                CookiesApi.ensureRiskActive(true);
+            } catch (Exception e) {
+                Logu.e("dynamic-risk-legacy-retry", String.valueOf(e.getMessage()));
+            }
+        }
+        return new JSONObject();
+    }
+
+    private static ArrayList<String> getSpaceHeaders(long mid) {
+        ArrayList<String> headers = NetWorkUtil.getWebHeadersSnapshot();
+        setHeader(headers, "Origin", "https://space.bilibili.com");
+        setHeader(headers, "Referer", "https://space.bilibili.com/" + mid + "/dynamic");
+        return headers;
+    }
+
+    private static void setHeader(List<String> headers, String key, String value) {
+        for (int i = 0; i + 1 < headers.size(); i += 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.set(i + 1, value);
+                return;
+            }
+        }
+        headers.add(key);
+        headers.add(value);
+    }
 
     /**
      * 发送纯文本动态
@@ -302,13 +376,33 @@ public class DynamicApi {
     }
 
     public static long getDynamicList(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
-        String url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/"
-                + (mid == 0 ? "all?type=" + type : "space?platform=web&web_location=333.1387&timezone_offset=-480&host_mid=" + mid)
-                + (offset == 0 ? "" : "&offset=" + offset)
-                + "&features=itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,forwardListHidden,decorationCard,commentsNewVersion,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,avatarAutoTheme,sunflowerStyle,eva3CardOpus,eva3CardVideo,eva3CardComment";
+        if (mid != 0) {
+            Long legacyOffset = tryGetLegacySpaceDynamicList(dynamicList, offset, mid);
+            if (legacyOffset != null) return legacyOffset;
+            Logu.w("dynamic-space", "legacy space_history unavailable, fallback to web dynamic api");
+        }
 
+        HttpUrl.Builder urlBuilder;
+        if (mid == 0) {
+            urlBuilder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")).newBuilder()
+                    .addQueryParameter("type", type)
+                    .addQueryParameter("timezone_offset", "-480")
+                    .addQueryParameter("web_location", "333.1365");
+        } else {
+            urlBuilder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space")).newBuilder()
+                    .addQueryParameter("platform", "web")
+                    .addQueryParameter("web_location", "333.1387")
+                    .addQueryParameter("timezone_offset", "-480")
+                    .addQueryParameter("host_mid", String.valueOf(mid))
+                    .addQueryParameter("x-bili-device-req-json", "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\"}");
+        }
+        if (offset != 0) {
+            urlBuilder.addQueryParameter("offset", String.valueOf(offset));
+        }
+        urlBuilder.addQueryParameter("features", "itemOpusStyle,listOnlyfans");
 
-        JSONObject all = NetWorkUtil.getJson(ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)));
+        String signedUrl = ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(urlBuilder.build().toString()));
+        JSONObject all = getDynamicListJsonWithRetry(signedUrl, mid);
         
         // 检查是否是网络错误返回的错误JSON
         if (all.optBoolean("retry_failed", false)) {
@@ -318,6 +412,7 @@ public class DynamicApi {
         int code = all.optInt("code", -1);
         if (code != 0) {
             String message = all.optString("message", "未知错误");
+            Logu.w("dynamic-list-fail", "code=" + code + ", mid=" + mid + ", offset=" + offset + ", msg=" + message);
             throw new IOException("API错误 (code=" + code + "): " + message);
         }
 
@@ -341,6 +436,307 @@ public class DynamicApi {
         }
 
         return offset_new;
+    }
+
+    private static Long tryGetLegacySpaceDynamicList(List<Dynamic> dynamicList, long offset, long mid) throws IOException {
+        JSONObject all = getLegacySpaceHistoryJsonWithRetry(mid, offset);
+        if (all.optBoolean("retry_failed", false)) return null;
+
+        int code = all.optInt("code", -1);
+        if (code != 0) {
+            Logu.w("legacy-dynamic-list-fail", "code=" + code + ", mid=" + mid + ", offset=" + offset + ", msg=" + all.optString("msg", all.optString("message", "未知错误")));
+            return null;
+        }
+
+        JSONObject data = all.optJSONObject("data");
+        if (data == null) return null;
+
+        JSONArray cards = data.optJSONArray("cards");
+        if (cards == null) return null;
+
+        for (int i = 0; i < cards.length(); i++) {
+            JSONObject cardWrap = cards.optJSONObject(i);
+            if (cardWrap == null) continue;
+            try {
+                Dynamic dynamic = analyzeLegacyDynamic(cardWrap, 0);
+                if (dynamic != null) dynamicList.add(dynamic);
+            } catch (Throwable e) {
+                Logu.w("legacy-dynamic-parse", String.valueOf(e.getMessage()));
+            }
+        }
+
+        boolean hasMore = data.optBoolean("has_more", data.optInt("has_more", 0) == 1);
+        long nextOffset = optLongCompat(data, "next_offset");
+        if (nextOffset <= 0) nextOffset = optLongCompat(data, "offset");
+        return hasMore && nextOffset > 0 ? nextOffset : -1;
+    }
+
+    private static Dynamic analyzeLegacyDynamic(JSONObject cardWrap, int depth) {
+        if (depth > 1 || cardWrap == null) return null;
+
+        JSONObject desc = cardWrap.optJSONObject("desc");
+        JSONObject card = parseLegacyCard(cardWrap.opt("card"));
+        if (desc == null && card == null) return null;
+
+        Dynamic dynamic = new Dynamic();
+        dynamic.dynamicId = optLongCompat(desc, "dynamic_id");
+        if (dynamic.dynamicId == 0) dynamic.dynamicId = optLongCompat(desc, "dynamic_id_str");
+
+        int legacyType = desc == null ? 0 : desc.optInt("type", 0);
+        dynamic.type = mapLegacyDynamicType(legacyType);
+        dynamic.comment_id = optLongCompat(desc, "rid");
+        if (dynamic.comment_id == 0) dynamic.comment_id = optLongCompat(desc, "rid_str");
+        dynamic.comment_type = legacyType;
+        dynamic.pubTime = formatLegacyPubTime(optLongCompat(desc, "timestamp"));
+
+        dynamic.userInfo = parseLegacyUser(desc, card);
+        dynamic.content = parseLegacyContent(card);
+        if (dynamic.content == null) dynamic.content = "";
+
+        fillLegacyMajor(dynamic, desc, card);
+        dynamic.stats = parseLegacyStats(desc);
+        dynamic.canDelete = isSelfDynamic(desc);
+
+        Dynamic forward = parseLegacyForward(desc, card, depth + 1);
+        if (forward != null) dynamic.dynamic_forward = forward;
+
+        if (dynamic.userInfo == null) dynamic.userInfo = new UserInfo();
+        if (dynamic.userInfo.name == null) dynamic.userInfo.name = "";
+        if (dynamic.userInfo.avatar == null) dynamic.userInfo.avatar = "";
+        return dynamic;
+    }
+
+    private static JSONObject parseLegacyCard(Object cardObj) {
+        if (cardObj instanceof JSONObject) return (JSONObject) cardObj;
+        if (cardObj instanceof String) {
+            String cardStr = (String) cardObj;
+            if (!TextUtils.isEmpty(cardStr) && !"null".equalsIgnoreCase(cardStr)) {
+                try {
+                    return new JSONObject(cardStr);
+                } catch (JSONException ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static long optLongCompat(JSONObject json, String key) {
+        if (json == null || TextUtils.isEmpty(key)) return 0;
+        Object v = json.opt(key);
+        if (v instanceof Number) return ((Number) v).longValue();
+        if (v instanceof String) {
+            try {
+                return Long.parseLong((String) v);
+            } catch (Exception ignored) {
+            }
+        }
+        return 0;
+    }
+
+    private static String mapLegacyDynamicType(int type) {
+        switch (type) {
+            case 8:
+                return "DYNAMIC_TYPE_AV";
+            case 64:
+                return "DYNAMIC_TYPE_ARTICLE";
+            case 2:
+                return "DYNAMIC_TYPE_DRAW";
+            case 4:
+                return "DYNAMIC_TYPE_FORWARD";
+            case 0:
+                return "DYNAMIC_TYPE_NONE";
+            default:
+                return "DYNAMIC_TYPE_LEGACY_" + type;
+        }
+    }
+
+    private static String formatLegacyPubTime(long timestamp) {
+        if (timestamp <= 0) return "";
+        try {
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA).format(new Date(timestamp * 1000L));
+        } catch (Exception ignored) {
+            return String.valueOf(timestamp);
+        }
+    }
+
+    private static UserInfo parseLegacyUser(JSONObject desc, JSONObject card) {
+        UserInfo user = new UserInfo();
+        user.mid = optLongCompat(desc, "uid");
+        user.name = "";
+        user.avatar = "";
+
+        if (desc != null) {
+            JSONObject profile = desc.optJSONObject("user_profile");
+            if (profile != null) {
+                JSONObject info = profile.optJSONObject("info");
+                if (info != null) {
+                    if (user.mid == 0) user.mid = optLongCompat(info, "uid");
+                    user.name = info.optString("uname", user.name);
+                    user.avatar = info.optString("face", user.avatar);
+                }
+                JSONObject vip = profile.optJSONObject("vip");
+                if (vip != null) user.vip_nickname_color = vip.optString("nickname_color", "");
+            }
+        }
+
+        if (card != null) {
+            if (TextUtils.isEmpty(user.name) || TextUtils.isEmpty(user.avatar)) {
+                JSONObject owner = card.optJSONObject("owner");
+                if (owner != null) {
+                    if (user.mid == 0) user.mid = optLongCompat(owner, "mid");
+                    if (TextUtils.isEmpty(user.name)) user.name = owner.optString("name", "");
+                    if (TextUtils.isEmpty(user.avatar)) user.avatar = owner.optString("face", "");
+                }
+            }
+            if (TextUtils.isEmpty(user.name) || TextUtils.isEmpty(user.avatar)) {
+                JSONObject cardUser = card.optJSONObject("user");
+                if (cardUser != null) {
+                    if (user.mid == 0) user.mid = optLongCompat(cardUser, "uid");
+                    if (TextUtils.isEmpty(user.name)) user.name = cardUser.optString("uname", "");
+                    if (TextUtils.isEmpty(user.avatar)) user.avatar = cardUser.optString("face", "");
+                }
+            }
+        }
+
+        return user;
+    }
+
+    private static CharSequence parseLegacyContent(JSONObject card) {
+        if (card == null) return "";
+        JSONObject item = card.optJSONObject("item");
+        if (item != null) {
+            String content = item.optString("description", "");
+            if (TextUtils.isEmpty(content)) content = item.optString("content", "");
+            if (TextUtils.isEmpty(content)) content = item.optString("summary", "");
+            if (!TextUtils.isEmpty(content)) return content;
+        }
+
+        String dynamic = card.optString("dynamic", "");
+        if (!TextUtils.isEmpty(dynamic)) return dynamic;
+        String desc = card.optString("desc", "");
+        if (!TextUtils.isEmpty(desc)) return desc;
+        return "";
+    }
+
+    private static void fillLegacyMajor(Dynamic dynamic, JSONObject desc, JSONObject card) {
+        if (dynamic == null || card == null) return;
+
+        JSONObject item = card.optJSONObject("item");
+        JSONArray pictures = null;
+        if (item != null) pictures = item.optJSONArray("pictures");
+        if (pictures == null) pictures = card.optJSONArray("pictures");
+
+        if (pictures != null && pictures.length() > 0) {
+            ArrayList<String> picList = new ArrayList<>();
+            for (int i = 0; i < pictures.length(); i++) {
+                JSONObject pic = pictures.optJSONObject(i);
+                if (pic == null) continue;
+                String url = pic.optString("img_src", "");
+                if (TextUtils.isEmpty(url)) url = pic.optString("src", "");
+                if (TextUtils.isEmpty(url)) url = pic.optString("img_url", "");
+                if (TextUtils.isEmpty(url)) url = pic.optString("url", "");
+                if (!TextUtils.isEmpty(url)) picList.add(url);
+            }
+            if (!picList.isEmpty()) {
+                dynamic.major_type = "MAJOR_TYPE_DRAW";
+                dynamic.major_object = picList;
+                return;
+            }
+        }
+
+        long aid = optLongCompat(card, "aid");
+        String bvid = card.optString("bvid", "");
+        if (TextUtils.isEmpty(bvid) && aid > 0) {
+            bvid = card.optString("short_link_v2", "");
+            if (!TextUtils.isEmpty(bvid) && bvid.startsWith("https://www.bilibili.com/video/")) {
+                bvid = bvid.substring("https://www.bilibili.com/video/".length());
+            }
+        }
+
+        if (aid > 0 || !TextUtils.isEmpty(bvid)) {
+            String title = card.optString("title", "");
+            if (TextUtils.isEmpty(title) && item != null) title = item.optString("title", "");
+            String cover = card.optString("pic", "");
+            if (TextUtils.isEmpty(cover)) cover = card.optString("cover", "");
+            String view = StringUtil.toWan(optLongCompat(desc, "view")) + "观看";
+            dynamic.major_type = "MAJOR_TYPE_ARCHIVE";
+            dynamic.major_object = new VideoCard(title, "投稿视频", view, cover, aid, bvid);
+            return;
+        }
+
+        long articleId = optLongCompat(card, "id");
+        JSONArray imageUrls = card.optJSONArray("image_urls");
+        if (articleId > 0 && imageUrls != null) {
+            String cover = imageUrls.length() > 0 ? imageUrls.optString(0, "") : "";
+            String title = card.optString("title", "");
+            String view = StringUtil.toWan(optLongCompat(desc, "view")) + "阅读";
+            dynamic.major_type = "MAJOR_TYPE_ARTICLE";
+            dynamic.major_object = new ArticleCard(title, articleId, cover, "投稿文章", view);
+        }
+    }
+
+    private static Stats parseLegacyStats(JSONObject desc) {
+        Stats stats = new Stats();
+        if (desc == null) return stats;
+        stats.like = (int) optLongCompat(desc, "like");
+        stats.reply = (int) optLongCompat(desc, "comment");
+        stats.share = (int) optLongCompat(desc, "repost");
+        return stats;
+    }
+
+    private static boolean isSelfDynamic(JSONObject desc) {
+        long uid = optLongCompat(desc, "uid");
+        if (uid <= 0) return false;
+
+        long selfMid = 0;
+        try {
+            selfMid = Long.parseLong(NetWorkUtil.getInfoFromCookie("DedeUserID", SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, "")));
+        } catch (Exception ignored) {
+        }
+        if (selfMid <= 0) {
+            try {
+                selfMid = Long.parseLong(SharedPreferencesUtil.getString(SharedPreferencesUtil.mid, "0"));
+            } catch (Exception ignored) {
+            }
+        }
+        return selfMid > 0 && selfMid == uid;
+    }
+
+    private static Dynamic parseLegacyForward(JSONObject desc, JSONObject card, int depth) {
+        if (card == null || depth > 1) return null;
+        JSONObject originCard = parseLegacyCard(card.opt("origin"));
+        if (originCard == null) return null;
+
+        JSONObject originDesc = desc == null ? null : desc.optJSONObject("origin");
+        if (originDesc == null) {
+            originDesc = new JSONObject();
+            try {
+                originDesc.put("dynamic_id", optLongCompat(desc, "orig_dy_id"));
+                originDesc.put("type", desc == null ? 0 : desc.optInt("orig_type", 0));
+                originDesc.put("timestamp", optLongCompat(desc, "timestamp"));
+            } catch (JSONException ignored) {
+            }
+        }
+
+        JSONObject wrap = new JSONObject();
+        try {
+            wrap.put("desc", originDesc);
+            wrap.put("card", originCard.toString());
+        } catch (JSONException ignored) {
+        }
+
+        Dynamic forward = analyzeLegacyDynamic(wrap, depth);
+        if (forward != null) {
+            JSONObject originUser = card.optJSONObject("origin_user");
+            JSONObject info = originUser == null ? null : originUser.optJSONObject("info");
+            if (info != null) {
+                if (forward.userInfo == null) forward.userInfo = new UserInfo();
+                if (TextUtils.isEmpty(forward.userInfo.name)) forward.userInfo.name = info.optString("uname", "");
+                if (TextUtils.isEmpty(forward.userInfo.avatar)) forward.userInfo.avatar = info.optString("face", "");
+                if (forward.userInfo.mid == 0) forward.userInfo.mid = optLongCompat(info, "uid");
+            }
+        }
+        return forward;
     }
 
     public static Dynamic getDynamic(long id) throws IOException, JSONException {

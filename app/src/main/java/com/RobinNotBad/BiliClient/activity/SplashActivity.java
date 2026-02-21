@@ -82,6 +82,9 @@ public class SplashActivity extends Activity {
                     }
 
                     CookiesApi.checkCookies();
+                    if (SharedPreferencesUtil.getLong("mid", 0) != 0) {
+                        CookiesApi.ensureRiskActiveDaily();
+                    }
 
                     String firstActivity = null;
                     String sortConf = SharedPreferencesUtil.getString(SharedPreferencesUtil.MENU_SORT, "");

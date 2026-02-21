@@ -233,6 +233,24 @@ public class CookiesApi {
         //activeCookieInfo();
     }
 
+    public static boolean ensureRiskActive(boolean force) {
+        int today = ConfInfoApi.getDateCurr();
+        if (!force && SharedPreferencesUtil.getInt(SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY, 0) >= today) {
+            return false;
+        }
+        try {
+            int code = activeCookieInfo();
+            SharedPreferencesUtil.putInt(SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY, today);
+            return code == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static boolean ensureRiskActiveDaily() {
+        return ensureRiskActive(false);
+    }
+
     private static Integer parseInt(String string) {
         try {
             return Integer.parseInt(string);

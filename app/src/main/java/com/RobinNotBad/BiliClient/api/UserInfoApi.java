@@ -14,12 +14,31 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
 //用户信息API
 
 public class UserInfoApi {
+
+    private static ArrayList<String> getSpaceHeaders(long mid, boolean dynamicReferer) {
+        ArrayList<String> headers = NetWorkUtil.getWebHeadersSnapshot();
+        setHeader(headers, "Origin", "https://space.bilibili.com");
+        setHeader(headers, "Referer", "https://space.bilibili.com/" + mid + (dynamicReferer ? "/dynamic" : ""));
+        return headers;
+    }
+
+    private static void setHeader(List<String> headers, String key, String value) {
+        for (int i = 0; i + 1 < headers.size(); i += 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.set(i + 1, value);
+                return;
+            }
+        }
+        headers.add(key);
+        headers.add(value);
+    }
 
     public static UserInfo getUserInfo(long mid) throws IOException, JSONException {
         String url = "https://api.bilibili.com/x/web-interface/card?mid=" + mid;
@@ -90,8 +109,11 @@ public class UserInfoApi {
 
     public static JSONObject getUserSpaceInfo(long mid) throws JSONException, IOException {
         String url = "https://api.bilibili.com/x/space/wbi/acc/info?";
-        url += "mid=" + mid;
-        JSONObject all = NetWorkUtil.getJson(ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)));
+        url += "mid=" + mid + "&token=&platform=web&web_location=1550101";
+        JSONObject all = NetWorkUtil.getJson(
+                ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)),
+                getSpaceHeaders(mid, true)
+        );
         if (all.has("data") && !all.isNull("data")) {
             return all.getJSONObject("data");
         }
@@ -142,28 +164,35 @@ public class UserInfoApi {
     public static int getUserVideos(long mid, int page, String searchKeyword, List<VideoCard> videoList) throws IOException, JSONException {
         String url = "https://api.bilibili.com/x/space/wbi/arc/search?";
         url += "keyword=" + searchKeyword + "&mid=" + mid + "&order_avoided=true&order=pubdate&pn=" + page
-                + "&ps=40&tid=0&web_location=333.999";
-        JSONObject all = NetWorkUtil.getJson(ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)));
+                + "&ps=40&tid=0&platform=web&web_location=1550101";
+        JSONObject all = NetWorkUtil.getJson(
+                ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)),
+                getSpaceHeaders(mid, false)
+        );
         if (all.has("data") && !all.isNull("data")) {
-            JSONObject data = all.getJSONObject("data");
-            JSONObject list = data.getJSONObject("list");
-            if (list.has("vlist") && !list.isNull("vlist")) {
-                JSONArray vlist = list.getJSONArray("vlist");
-                if (vlist.length() == 0) return 1;
-                for (int i = 0; i < vlist.length(); i++) {
-                    JSONObject card = vlist.getJSONObject(i);
-                    String cover = card.getString("pic");
-                    long play = card.getLong("play");
-                    String playStr = StringUtil.toWan(play) + "观看";
-                    long aid = card.getLong("aid");
-                    String bvid = card.getString("bvid");
-                    String upName = card.getString("author");
-                    String title = card.getString("title");
+            JSONObject data = all.optJSONObject("data");
+            if (data == null) return -1;
 
-                    videoList.add(new VideoCard(title, upName, playStr, cover, aid, bvid));
-                }
-                return 0;
-            } else return -1;
+            JSONObject list = data.optJSONObject("list");
+            JSONArray vlist = list != null ? list.optJSONArray("vlist") : data.optJSONArray("vlist");
+            if (vlist == null || vlist.length() == 0) return 1;
+
+            for (int i = 0; i < vlist.length(); i++) {
+                JSONObject card = vlist.optJSONObject(i);
+                if (card == null) continue;
+
+                String cover = card.optString("pic", "");
+                long play = card.optLong("play", 0);
+                String playStr = StringUtil.toWan(play) + "观看";
+                long aid = card.optLong("aid", 0);
+                String bvid = card.optString("bvid", "");
+                String upName = card.optString("author", "");
+                String title = card.optString("title", "");
+
+                if (aid == 0 && bvid.isEmpty()) continue;
+                videoList.add(new VideoCard(title, upName, playStr, cover, aid, bvid));
+            }
+            return videoList.isEmpty() ? 1 : 0;
         } else return -1;
     }
 

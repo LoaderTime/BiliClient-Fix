@@ -12,6 +12,9 @@ import com.RobinNotBad.BiliClient.adapter.video.UserVideoAdapter;
 import com.RobinNotBad.BiliClient.api.UserInfoApi;
 import com.RobinNotBad.BiliClient.model.VideoCard;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
+import com.RobinNotBad.BiliClient.util.MsgUtil;
+
+import org.json.JSONException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -62,6 +65,9 @@ public class UserVideoFragment extends RefreshListFragment {
                     setAdapter(adapter);
                     if (bottom && videoList.isEmpty()) showEmptyView();
                 }
+            } catch (JSONException e) {
+                setRefreshing(false);
+                MsgUtil.showMsgLong("数据解析错误\n建议登陆后再尝试");
             } catch (Exception e) {
                 loadFail(e);
             }
@@ -86,6 +92,9 @@ public class UserVideoFragment extends RefreshListFragment {
                     }
                 }
                 setRefreshing(false);
+            } catch (JSONException e) {
+                setRefreshing(false);
+                MsgUtil.showMsgLong("数据解析错误\n建议登陆后再尝试");
             } catch (Exception e) {
                 loadFail(e);
             }
