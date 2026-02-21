@@ -5,6 +5,7 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Typeface;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.style.StyleSpan;
@@ -31,6 +32,8 @@ import java.util.List;
 
 public class AboutActivity extends BaseActivity {
     int eggClick_authorWords = 0, eggClick_toUncle = 0, eggClick_Dev = 0;
+    int eggClick_versionName = 0;
+    long lastVersionNameClickAt = 0;
 
     @SuppressLint({"MissingInflatedId", "SetTextI18n", "InflateParams"})
     @Override
@@ -147,6 +150,21 @@ public class AboutActivity extends BaseActivity {
             });
 
             if (!ToolsUtil.isDebugBuild()) findViewById(R.id.debug_tip).setVisibility(View.GONE);
+
+            findViewById(R.id.version_name_card).setOnClickListener(view -> {
+                long now = SystemClock.uptimeMillis();
+                if (now - lastVersionNameClickAt > 1000) {
+                    eggClick_versionName = 0;
+                }
+                lastVersionNameClickAt = now;
+
+                eggClick_versionName++;
+                if (eggClick_versionName >= 3) {
+                    eggClick_versionName = 0;
+                    startActivity(new Intent(this, JellyBeanEggActivity.class));
+                }
+            });
+
             findViewById(R.id.version_code_card).setOnClickListener(view -> {
                 if (SharedPreferencesUtil.getBoolean("developer", false)) {
                     MsgUtil.showMsg("已关闭开发者模式！");
