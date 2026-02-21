@@ -20,6 +20,7 @@ public class Dynamic implements Serializable {
     public Object major_object;
     public Dynamic dynamic_forward;
     public boolean canDelete;
+    public String jumpUrl;
 
     public Dynamic() {
     }

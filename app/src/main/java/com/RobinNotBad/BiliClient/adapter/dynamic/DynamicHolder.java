@@ -34,6 +34,7 @@ import com.RobinNotBad.BiliClient.model.LiveRoom;
 import com.RobinNotBad.BiliClient.model.VideoCard;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
 import com.RobinNotBad.BiliClient.util.GlideUtil;
+import com.RobinNotBad.BiliClient.util.LinkUrlUtil;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
 import com.RobinNotBad.BiliClient.util.TerminalContext;
@@ -302,6 +303,20 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                     articleCardHolder.showArticleCard(articleCard, context);
                     cell_dynamic_article.setOnClickListener(
                             view -> TerminalContext.getInstance().enterArticleDetailPage(context, articleCard.id));
+                    cell_dynamic_article.setVisibility(View.VISIBLE);
+                    break;
+
+                case "MAJOR_TYPE_COMMON":
+                    ArticleCard commonCard = (ArticleCard) dynamic.major_object;
+                    if (articleCardHolder == null) {
+                        articleCardHolder = new ArticleCardHolder(cell_dynamic_article);
+                    }
+                    articleCardHolder.showArticleCard(commonCard, context);
+                    cell_dynamic_article.setOnClickListener(view -> {
+                        if (!TextUtils.isEmpty(dynamic.jumpUrl)) {
+                            LinkUrlUtil.handleWebURL(context, dynamic.jumpUrl);
+                        }
+                    });
                     cell_dynamic_article.setVisibility(View.VISIBLE);
                     break;
 

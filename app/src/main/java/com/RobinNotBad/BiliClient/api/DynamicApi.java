@@ -457,8 +457,18 @@ public class DynamicApi {
         for (int i = 0; i < cards.length(); i++) {
             JSONObject cardWrap = cards.optJSONObject(i);
             if (cardWrap == null) continue;
+            JSONObject desc = cardWrap.optJSONObject("desc");
+            long dynamicId = optLongCompat(desc, "dynamic_id");
+            if (dynamicId == 0) dynamicId = optLongCompat(desc, "dynamic_id_str");
             try {
                 Dynamic dynamic = analyzeLegacyDynamic(cardWrap, 0);
+                if (dynamic != null && needsLegacyRepair(dynamic)) {
+                    Dynamic repaired = tryGetDynamicDetail(dynamic.dynamicId);
+                    if (repaired != null) dynamic = repaired;
+                } else if (dynamic == null && dynamicId > 0) {
+                    Dynamic repaired = tryGetDynamicDetail(dynamicId);
+                    if (repaired != null) dynamic = repaired;
+                }
                 if (dynamic != null) dynamicList.add(dynamic);
             } catch (Throwable e) {
                 Logu.w("legacy-dynamic-parse", String.valueOf(e.getMessage()));
@@ -469,6 +479,23 @@ public class DynamicApi {
         long nextOffset = optLongCompat(data, "next_offset");
         if (nextOffset <= 0) nextOffset = optLongCompat(data, "offset");
         return hasMore && nextOffset > 0 ? nextOffset : -1;
+    }
+
+    private static boolean needsLegacyRepair(Dynamic dynamic) {
+        if (dynamic == null) return false;
+        boolean noMajor = dynamic.major_object == null && dynamic.dynamic_forward == null;
+        boolean noContent = dynamic.content == null || TextUtils.isEmpty(dynamic.content.toString().trim());
+        return noMajor && noContent;
+    }
+
+    private static Dynamic tryGetDynamicDetail(long dynamicId) {
+        if (dynamicId <= 0) return null;
+        try {
+            return getDynamic(dynamicId);
+        } catch (Exception e) {
+            Logu.w("legacy-dynamic-repair", "id=" + dynamicId + ", err=" + e.getMessage());
+            return null;
+        }
     }
 
     private static Dynamic analyzeLegacyDynamic(JSONObject cardWrap, int depth) {
@@ -846,7 +873,12 @@ public class DynamicApi {
             if (!module_dynamic.isNull("desc")) {
                 JSONObject desc = module_dynamic.getJSONObject("desc");
                 JSONArray rich_text_nodes = desc.optJSONArray("rich_text_nodes");
-                dynamic.content = analyzeTextContent(rich_text_nodes);
+                CharSequence parsed = analyzeTextContent(rich_text_nodes);
+                if (parsed == null || TextUtils.isEmpty(parsed) || "[动态内容解析异常]".contentEquals(parsed)) {
+                    String rawText = desc.optString("text", "");
+                    if (!TextUtils.isEmpty(rawText)) parsed = rawText;
+                }
+                dynamic.content = parsed;
             } else dynamic.content = "";
 
             //这里面什么都有，直译为主要的
@@ -894,7 +926,28 @@ public class DynamicApi {
                         break;
 
                     case "MAJOR_TYPE_COMMON":
-                        dynamic.content = dynamic.content + "\n[无法显示活动类动态的附加内容]";
+                        JSONObject common = major.optJSONObject("common");
+                        if (common != null) {
+                            String commonTitle = common.optString("title", "");
+                            String commonDesc = common.optString("desc", "");
+                            String commonCover = common.optString("cover", "");
+                            JSONObject badge = common.optJSONObject("badge");
+                            String badgeText = badge == null ? "" : badge.optString("text", "");
+
+                            dynamic.major_object = new ArticleCard(
+                                    commonTitle,
+                                    0,
+                                    commonCover,
+                                    commonDesc,
+                                    badgeText
+                            );
+                            dynamic.jumpUrl = common.optString("jump_url", "");
+                            if ((dynamic.content == null || TextUtils.isEmpty(dynamic.content)) && !TextUtils.isEmpty(commonDesc)) {
+                                dynamic.content = commonDesc;
+                            }
+                        } else {
+                            dynamic.content = dynamic.content + "\n[无法显示活动类动态的附加内容]";
+                        }
                         break;
 
                     case "MAJOR_TYPE_LIVE_RCMD":
