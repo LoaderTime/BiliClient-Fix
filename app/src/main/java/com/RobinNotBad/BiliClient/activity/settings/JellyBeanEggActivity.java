@@ -96,6 +96,8 @@ public class JellyBeanEggActivity extends BaseActivity {
         LinearLayout view = new LinearLayout(this);
         view.setOrientation(LinearLayout.VERTICAL);
         view.setGravity(Gravity.CENTER_HORIZONTAL);
+        // Reserve extra space for descenders like "g" and text shadows.
+        view.setPadding(0, 0, 0, (int) (6 * metrics.density));
         view.setLayoutParams(new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -103,11 +105,16 @@ public class JellyBeanEggActivity extends BaseActivity {
         Typeface light = Typeface.create("sans-serif-light", Typeface.NORMAL);
         Typeface bold = Typeface.create("sans-serif", Typeface.BOLD);
 
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams lpTop = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.gravity = Gravity.CENTER_HORIZONTAL;
-        lp.bottomMargin = (int) (-2 * metrics.density);
+        lpTop.gravity = Gravity.CENTER_HORIZONTAL;
+        lpTop.bottomMargin = (int) (1 * metrics.density);
+
+        LinearLayout.LayoutParams lpBottom = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lpBottom.gravity = Gravity.CENTER_HORIZONTAL;
 
         TextView lineTop = new TextView(this);
         if (light != null) lineTop.setTypeface(light);
@@ -116,7 +123,7 @@ public class JellyBeanEggActivity extends BaseActivity {
         lineTop.setGravity(Gravity.CENTER);
         lineTop.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
         lineTop.setShadowLayer(4 * metrics.density, 0, 2 * metrics.density, 0x66000000);
-        view.addView(lineTop, lp);
+        view.addView(lineTop, lpTop);
 
         TextView lineBottom = new TextView(this);
         if (bold != null) lineBottom.setTypeface(bold);
@@ -124,8 +131,9 @@ public class JellyBeanEggActivity extends BaseActivity {
         lineBottom.setTextColor(0xFFFFFFFF);
         lineBottom.setGravity(Gravity.CENTER);
         lineBottom.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        lineBottom.setPadding(0, 0, 0, (int) (2 * metrics.density));
         lineBottom.setShadowLayer(4 * metrics.density, 0, 2 * metrics.density, 0x66000000);
-        view.addView(lineBottom, lp);
+        view.addView(lineBottom, lpBottom);
 
         return view;
     }
