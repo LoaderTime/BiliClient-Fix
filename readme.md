@@ -2,6 +2,8 @@
 
 # 哔哩终端-Fix
 
+<img src="specialicon\j_platlogo_green_smile.webp" width="120" height="120" alt="Wriggle Bean Logo"/>
+
 轻量的第三方B站Android客户端
 
 在原仓库 [BiliClient](https://github.com/huanli233/BiliClient) 的基础上进行了功能修复并加入了新功能。
