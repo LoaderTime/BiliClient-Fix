@@ -35,6 +35,7 @@ public class JellyBeanEggActivity extends BaseActivity {
 
         DisplayMetrics metrics = new DisplayMetrics();
         getWindowManager().getDefaultDisplay().getMetrics(metrics);
+        final boolean smallScreen = isSmallScreen(metrics);
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF121212);
@@ -57,7 +58,11 @@ public class JellyBeanEggActivity extends BaseActivity {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM);
-        textLp.bottomMargin = Math.max((int) (metrics.heightPixels * 0.16f), (int) (64 * metrics.density));
+        if (smallScreen) {
+            textLp.bottomMargin = Math.max((int) (metrics.heightPixels * 0.08f), (int) (24 * metrics.density));
+        } else {
+            textLp.bottomMargin = Math.max((int) (metrics.heightPixels * 0.16f), (int) (64 * metrics.density));
+        }
         root.addView(textGroup, textLp);
 
         beanView.setOnClickListener(v -> {
@@ -120,7 +125,11 @@ public class JellyBeanEggActivity extends BaseActivity {
         lineTop.setText("Jelly Beans");
         lineTop.setTextColor(0xFFFFFFFF);
         lineTop.setGravity(Gravity.CENTER);
-        lineTop.setTextSize(1.25f * size);
+        if (isSmallScreen(metrics)) {
+            lineTop.setTextSize(TypedValue.COMPLEX_UNIT_PX, 1.25f * size);
+        } else {
+            lineTop.setTextSize(1.25f * size);
+        }
         lineTop.setShadowLayer(4 * metrics.density, 0, 2 * metrics.density, 0x66000000);
         view.addView(lineTop, lpTop);
 
@@ -129,7 +138,11 @@ public class JellyBeanEggActivity extends BaseActivity {
         lineBottom.setText("Wriggle");
         lineBottom.setTextColor(0xFFFFFFFF);
         lineBottom.setGravity(Gravity.CENTER);
-        lineBottom.setTextSize(size);
+        if (isSmallScreen(metrics)) {
+            lineBottom.setTextSize(TypedValue.COMPLEX_UNIT_PX, size);
+        } else {
+            lineBottom.setTextSize(size);
+        }
         lineBottom.setPadding(0, 0, 0, (int) (2 * metrics.density));
         lineBottom.setShadowLayer(4 * metrics.density, 0, 2 * metrics.density, 0x66000000);
         view.addView(lineBottom, lpBottom);
@@ -156,5 +169,10 @@ public class JellyBeanEggActivity extends BaseActivity {
             lastTapY = y;
         }
         return super.dispatchTouchEvent(ev);
+    }
+
+    private static boolean isSmallScreen(DisplayMetrics metrics) {
+        float minDp = Math.min(metrics.widthPixels, metrics.heightPixels) / metrics.density;
+        return minDp < 240f;
     }
 }

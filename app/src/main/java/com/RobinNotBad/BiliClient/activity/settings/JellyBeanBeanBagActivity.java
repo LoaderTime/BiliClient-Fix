@@ -9,6 +9,7 @@ import android.graphics.Paint;
 import android.graphics.drawable.BitmapDrawable;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.util.DisplayMetrics;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -80,6 +81,9 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
         private static final float MIN_SCALE = 0.2f;
         private static final float MAX_SCALE = 1f;
         private static final int MAX_RADIUS = (int) (576 * MAX_SCALE);
+        private static final int TARGET_DPI = 480;
+        private static final float SMALL_SCREEN_MIN_DP = 240f;
+        private static final int SMALL_SCREEN_BEAN_COUNT = 24;
         private static final float LUCKY = 0.001f;
 
         private static final int[] BEANS = {
@@ -112,11 +116,31 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
 
         private int boardWidth;
         private int boardHeight;
+        private final boolean smallScreen;
+        private final int beanCount;
+        private final int effectiveTargetDpi;
+        private final float smallScreenScale;
+        private final float minRespawnPadding;
         private TimeAnimator animator;
 
         public Board(JellyBeanBeanBagActivity context) {
             super(context);
             setBackgroundColor(0xFF121212);
+            DisplayMetrics metrics = getResources().getDisplayMetrics();
+            float minDp = Math.min(metrics.widthPixels, metrics.heightPixels) / metrics.density;
+            smallScreen = minDp < SMALL_SCREEN_MIN_DP;
+            // Keep phone behavior unchanged; on small screens, reduce the effective target dpi.
+            if (smallScreen) {
+                effectiveTargetDpi = metrics.densityDpi;
+                smallScreenScale = Math.max(0.5f, Math.min(1f, minDp / 320f));
+                beanCount = SMALL_SCREEN_BEAN_COUNT;
+                minRespawnPadding = 24f * metrics.density;
+            } else {
+                effectiveTargetDpi = TARGET_DPI;
+                smallScreenScale = 1f;
+                beanCount = NUM_BEANS;
+                minRespawnPadding = 0f;
+            }
         }
 
         private static float randf(float min, float max) {
@@ -134,10 +158,10 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT);
 
-            for (int i = 0; i < NUM_BEANS; i++) {
-                Bean bean = new Bean(getContext());
+            for (int i = 0; i < beanCount; i++) {
+                Bean bean = new Bean(getContext(), effectiveTargetDpi, smallScreenScale);
                 addView(bean, wrap);
-                bean.z = (float) i / NUM_BEANS;
+                bean.z = (float) i / beanCount;
                 bean.z *= bean.z;
                 bean.reset(boardWidth, boardHeight);
                 bean.x = randf(0, boardWidth);
@@ -160,7 +184,15 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
                     bean.setX(bean.x - bean.getPivotX());
                     bean.setY(bean.y - bean.getPivotY());
 
-                    if (bean.x < -MAX_RADIUS || bean.x > boardWidth + MAX_RADIUS
+                    if (smallScreen) {
+                        // On watch-like screens, respawn shortly after leaving the viewport
+                        // to avoid quickly emptying the whole board.
+                        float outPadding = Math.max(bean.r * 2f, minRespawnPadding);
+                        if (bean.x < -outPadding || bean.x > boardWidth + outPadding
+                                || bean.y < -outPadding || bean.y > boardHeight + outPadding) {
+                            bean.reset(boardWidth, boardHeight);
+                        }
+                    } else if (bean.x < -MAX_RADIUS || bean.x > boardWidth + MAX_RADIUS
                             || bean.y < -MAX_RADIUS || bean.y > boardHeight + MAX_RADIUS) {
                         bean.reset(boardWidth, boardHeight);
                     }
@@ -224,10 +256,16 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
             float graby;
             float grabxOffset;
             float grabyOffset;
+            final int targetDpi;
+            final float screenScale;
 
-            Bean(android.content.Context context) {
+            Bean(android.content.Context context, int targetDpi, float screenScale) {
                 super(context);
-                setScaleType(ScaleType.CENTER);
+                this.targetDpi = targetDpi;
+                this.screenScale = screenScale;
+                // On very small screens, CENTER can clip drawable edges when bounds and
+                // drawable density scaling differ. CENTER_INSIDE keeps the full bean visible.
+                setScaleType(screenScale < 1f ? ScaleType.CENTER_INSIDE : ScaleType.CENTER);
             }
 
             private void pickDrawable() {
@@ -236,7 +274,7 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
                     beanRes = R.drawable.j_jandycane;
                 }
                 BitmapDrawable beanDrawable = (BitmapDrawable) getContext().getResources().getDrawable(beanRes);
-                beanDrawable.setTargetDensity(480);
+                beanDrawable.setTargetDensity(targetDpi);
                 Bitmap bitmap = beanDrawable.getBitmap();
                 h = bitmap.getHeight();
                 w = bitmap.getWidth();
@@ -257,10 +295,13 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
                 pickDrawable();
 
                 float scale = MIN_SCALE + (MAX_SCALE - MIN_SCALE) * z;
-                setScaleX(scale);
-                setScaleY(scale);
+                float visualScale = scale * screenScale;
+                setScaleX(visualScale);
+                setScaleY(visualScale);
 
-                r = 0.3f * Math.max(h, w) * scale;
+                int drawableW = getDrawable() != null ? getDrawable().getIntrinsicWidth() : w;
+                int drawableH = getDrawable() != null ? getDrawable().getIntrinsicHeight() : h;
+                r = 0.3f * Math.max(drawableH, drawableW) * visualScale;
                 a = randf(0, 360);
                 va = randf(-30, 30);
                 vx = randf(-40, 40) * z;
