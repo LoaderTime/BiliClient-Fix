@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.util.Log;
@@ -212,9 +213,7 @@ public class DataMigrationActivity extends InstanceActivity {
      */
     private void importSearchHistory() {
         currentImportType = 1; // 搜索记录
-        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-        intent.setType("application/json");
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        Intent intent = createJsonImportIntent();
         startActivityForResult(intent, PICK_IMPORT_SEARCH_HISTORY_REQUEST);
     }
     
@@ -223,10 +222,27 @@ public class DataMigrationActivity extends InstanceActivity {
      */
     private void importSettings() {
         currentImportType = 2; // 设置
-        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-        intent.setType("application/json");
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        Intent intent = createJsonImportIntent();
         startActivityForResult(intent, PICK_IMPORT_SETTINGS_REQUEST);
+    }
+
+    /**
+     * 创建导入文件选择器（兼容低版本/定制系统对JSON MIME识别不一致的问题）
+     */
+    private Intent createJsonImportIntent() {
+        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+        intent.setType("*/*");
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+
+        // 某些设备会把 .json 标为 text/plain 或 application/octet-stream
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                    "application/json",
+                    "text/plain",
+                    "application/octet-stream"
+            });
+        }
+        return intent;
     }
     
     @Override
