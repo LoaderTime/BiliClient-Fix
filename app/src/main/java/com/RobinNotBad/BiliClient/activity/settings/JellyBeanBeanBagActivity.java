@@ -267,11 +267,16 @@ public class JellyBeanBeanBagActivity extends BaseActivity {
                 vy = randf(-40, 40) * z;
 
                 if (RNG.nextBoolean()) {
-                    x = vx < 0 ? boardWidth + 2 * r : -r * 4f;
-                    y = randf(0, Math.max(1, boardHeight - 3 * r));
+                    x = vx < 0 ? boardWidth + 1.5f * r : -r * 1.5f;
+                    // Align spawn distribution with AOSP JellyBean BeanBag:
+                    // bias start position to the half of the board opposite to travel direction
+                    // to reduce "instant leave" and avoid easy "clear screen".
+                    y = randf(0, Math.max(1, boardHeight - 3 * r)) * 0.5f
+                            + ((vy < 0) ? boardHeight * 0.5f : 0);
                 } else {
-                    y = vy < 0 ? boardHeight + 2 * r : -r * 4f;
-                    x = randf(0, Math.max(1, boardWidth - 3 * r));
+                    y = vy < 0 ? boardHeight + 1.5f * r : -r * 1.5f;
+                    x = randf(0, Math.max(1, boardWidth - 3 * r)) * 0.5f
+                            + ((vx < 0) ? boardWidth * 0.5f : 0);
                 }
             }
 
