@@ -24,6 +24,29 @@ import okhttp3.ResponseBody;
 
 public class OpusApi {
 
+    /**
+     * 兼容读取 B 站返回的富文本 attributes/style 标记。
+     * 线上数据可能出现：true/false、1/0、"1"/"0"、"true"/"false" 等。
+     */
+    private static boolean optBooleanCompat(JSONObject obj, String key) {
+        if (obj == null || key == null) return false;
+        Object val = obj.opt(key);
+        if (val == null) return false;
+        if (val instanceof Boolean) return (Boolean) val;
+        if (val instanceof Number) return ((Number) val).intValue() != 0;
+        if (val instanceof String) {
+            String s = ((String) val).trim().toLowerCase(Locale.ROOT);
+            if (s.isEmpty()) return false;
+            if ("true".equals(s) || "1".equals(s) || "yes".equals(s) || "y".equals(s)) return true;
+            if ("false".equals(s) || "0".equals(s) || "no".equals(s) || "n".equals(s)) return false;
+            try {
+                return Integer.parseInt(s) != 0;
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
     public static Opus getOpus(long id) throws IOException, JSONException {
         Opus opus = new Opus();
         opus.id = id;
@@ -722,49 +745,124 @@ public class OpusApi {
     
     private static OpusParagraph[] parseJsonContent(String jsonContent) {
         ArrayList<OpusParagraph> paragraphs = new ArrayList<>();
-        
+
         try {
             JSONObject json = new JSONObject(jsonContent);
-            
-            // 检查是否是ops格式（你提供的示例格式）
-            if (json.has("ops")) {
-                JSONArray ops = json.getJSONArray("ops");
-                for (int i = 0; i < ops.length(); i++) {
-                    JSONObject op = ops.getJSONObject(i);
-                    
-                    // 处理文本
-                    if (op.has("insert") && op.get("insert") instanceof String) {
-                        String text = op.getString("insert");
-                        if (!text.trim().isEmpty() && !text.equals("\n")) {
+
+            // 检查是否是 Quill Delta / ops 格式（B 站旧专栏 content 常见）
+            if (!json.has("ops")) {
+                return new OpusParagraph[0];
+            }
+
+            JSONArray ops = json.getJSONArray("ops");
+
+            // 关键修复：不能把每个 op 当成一个段落。
+            // 例如删除线会把“酱”拆成独立 op，旧实现会导致“梦子 / 酱 / 小姐”错位且丢失删除线。
+            android.text.SpannableStringBuilder lineBuilder = new android.text.SpannableStringBuilder();
+
+            for (int i = 0; i < ops.length(); i++) {
+                JSONObject op = ops.getJSONObject(i);
+                if (!op.has("insert")) continue;
+
+                Object insert = op.get("insert");
+                JSONObject attrs = op.optJSONObject("attributes");
+
+                // 图片等嵌入对象：先落盘当前段落，再插入图片段
+                if (insert instanceof JSONObject) {
+                    if (lineBuilder.length() > 0) {
+                        trimLeadingWhitespaceInPlace(lineBuilder);
+                        if (lineBuilder.length() > 0) {
                             OpusParagraph textParagraph = new OpusParagraph();
                             textParagraph.type = OpusParagraph.TYPE_TEXT;
-                            textParagraph.content = text.trim();
+                            textParagraph.content = lineBuilder;
                             paragraphs.add(textParagraph);
                         }
+                        lineBuilder = new android.text.SpannableStringBuilder();
                     }
-                    
-                    // 处理图片
-                    if (op.has("insert") && op.get("insert") instanceof JSONObject) {
-                        JSONObject insertObj = op.getJSONObject("insert");
-                        if (insertObj.has("native-image")) {
-                            JSONObject nativeImage = insertObj.getJSONObject("native-image");
-                            if (nativeImage.has("url")) {
-                                String imgUrl = fixImageUrl(nativeImage.getString("url"));
-                                if (imgUrl != null && !imgUrl.isEmpty()) {
-                                    OpusParagraph imgParagraph = new OpusParagraph();
-                                    imgParagraph.type = OpusParagraph.TYPE_PIC;
-                                    imgParagraph.content = new String[]{imgUrl};
-                                    paragraphs.add(imgParagraph);
-                                }
+
+                    JSONObject insertObj = (JSONObject) insert;
+                    if (insertObj.has("native-image")) {
+                        JSONObject nativeImage = insertObj.optJSONObject("native-image");
+                        if (nativeImage != null && nativeImage.has("url")) {
+                            String imgUrl = fixImageUrl(nativeImage.optString("url", ""));
+                            if (imgUrl != null && !imgUrl.isEmpty()) {
+                                OpusParagraph imgParagraph = new OpusParagraph();
+                                imgParagraph.type = OpusParagraph.TYPE_PIC;
+                                imgParagraph.content = new String[]{imgUrl};
+                                paragraphs.add(imgParagraph);
                             }
                         }
                     }
+                    continue;
                 }
+
+                if (!(insert instanceof String)) continue;
+                String text = (String) insert;
+                if (text.isEmpty()) continue;
+
+                // 处理文本（支持 insert 中包含 \n：Quill 用它表示段落结束）
+                int cursor = 0;
+                while (cursor < text.length()) {
+                    int nl = text.indexOf('\n', cursor);
+                    String chunk;
+                    boolean endsWithNewline;
+                    if (nl >= 0) {
+                        chunk = text.substring(cursor, nl);
+                        endsWithNewline = true;
+                    } else {
+                        chunk = text.substring(cursor);
+                        endsWithNewline = false;
+                    }
+
+                    if (!chunk.isEmpty()) {
+                        int start = lineBuilder.length();
+                        lineBuilder.append(chunk);
+                        int end = lineBuilder.length();
+
+                        // 仅实现本次需求：删除线（并顺手兼容粗体/斜体）
+                        if (attrs != null && start < end) {
+                            boolean bold = optBooleanCompat(attrs, "bold");
+                            boolean italic = optBooleanCompat(attrs, "italic");
+                            boolean strike = optBooleanCompat(attrs, "strike") || optBooleanCompat(attrs, "strikethrough");
+                            int styleInt = (bold ? android.graphics.Typeface.BOLD : 0) + (italic ? android.graphics.Typeface.ITALIC : 0);
+                            if (styleInt != 0) {
+                                lineBuilder.setSpan(new android.text.style.StyleSpan(styleInt), start, end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            }
+                            if (strike) {
+                                lineBuilder.setSpan(new android.text.style.StrikethroughSpan(), start, end, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            }
+                        }
+                    }
+
+                    if (endsWithNewline) {
+                        // 段落结束，落盘（空行也要保留的话可以不跳过；这里保持原行为：跳过纯空白）
+                        trimLeadingWhitespaceInPlace(lineBuilder);
+                        if (lineBuilder.length() > 0 && !lineBuilder.toString().trim().isEmpty()) {
+                            OpusParagraph textParagraph = new OpusParagraph();
+                            textParagraph.type = OpusParagraph.TYPE_TEXT;
+                            textParagraph.content = lineBuilder;
+                            paragraphs.add(textParagraph);
+                        }
+                        lineBuilder = new android.text.SpannableStringBuilder();
+                        cursor = nl + 1;
+                    } else {
+                        cursor = text.length();
+                    }
+                }
+            }
+
+            // 末尾残留段落
+            trimLeadingWhitespaceInPlace(lineBuilder);
+            if (lineBuilder.length() > 0 && !lineBuilder.toString().trim().isEmpty()) {
+                OpusParagraph textParagraph = new OpusParagraph();
+                textParagraph.type = OpusParagraph.TYPE_TEXT;
+                textParagraph.content = lineBuilder;
+                paragraphs.add(textParagraph);
             }
         } catch (JSONException e) {
             throw new RuntimeException("JSON解析异常", e);
         }
-        
+
         return paragraphs.toArray(new OpusParagraph[0]);
     }
     
@@ -849,6 +947,11 @@ public class OpusApi {
             return;
         }
 
+        // HTML 回退解析时，专栏正文常见用 <del>/<s>/<strike> 表示删除线。
+        // 低版本 Html.fromHtml 对这几个标签兼容不稳定，这里统一转成 style=...line-through...
+        // 再复用下方的 markLineThroughRanges() 逻辑。
+        htmlText = normalizeStrikeTagsToInlineStyle(htmlText);
+
         htmlText = applyArticleColorClassMapping(htmlText);
         htmlText = markLineThroughRanges(htmlText);
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.N) {
@@ -902,6 +1005,10 @@ public class OpusApi {
 
         applyStrikeMarkers(ssb);
 
+        // 专栏正文经常会在段首塞入多个空格作为缩进，这会导致小屏换行错位。
+        // 仅移除本段开头连续空白，不影响正文中间的空格。
+        trimLeadingWhitespaceInPlace(ssb);
+
         if (isCaption) {
             ssb.setSpan(
                     new android.text.style.AlignmentSpan.Standard(android.text.Layout.Alignment.ALIGN_CENTER),
@@ -915,6 +1022,42 @@ public class OpusApi {
         paragraph.type = OpusParagraph.TYPE_TEXT;
         paragraph.content = ssb;
         paragraphs.add(paragraph);
+    }
+
+    private static String normalizeStrikeTagsToInlineStyle(String htmlText) {
+        if (htmlText == null || htmlText.isEmpty()) {
+            return htmlText;
+        }
+
+        // 用一个 span 包裹，交给后续 markLineThroughRanges() 识别 line-through。
+        // (?is) = ignoreCase + dotAll
+        String out = htmlText
+                .replaceAll("(?is)<\\s*del\\b[^>]*>", "<span style=\"text-decoration:line-through;\">")
+                .replaceAll("(?is)<\\s*/\\s*del\\s*>", "</span>")
+                .replaceAll("(?is)<\\s*s\\b[^>]*>", "<span style=\"text-decoration:line-through;\">")
+                .replaceAll("(?is)<\\s*/\\s*s\\s*>", "</span>")
+                .replaceAll("(?is)<\\s*strike\\b[^>]*>", "<span style=\"text-decoration:line-through;\">")
+                .replaceAll("(?is)<\\s*/\\s*strike\\s*>", "</span>");
+
+        return out;
+    }
+
+    private static void trimLeadingWhitespaceInPlace(android.text.SpannableStringBuilder ssb) {
+        if (ssb == null || ssb.length() == 0) {
+            return;
+        }
+        int i = 0;
+        while (i < ssb.length()) {
+            char c = ssb.charAt(i);
+            if (Character.isWhitespace(c) || c == '\u3000' || c == '\u00A0' || c == '\uFEFF') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        if (i > 0) {
+            ssb.delete(0, i);
+        }
     }
 
     /**

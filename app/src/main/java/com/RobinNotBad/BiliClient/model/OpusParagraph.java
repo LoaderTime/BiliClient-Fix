@@ -46,6 +46,59 @@ public class OpusParagraph {
     public Object content;
 
     /**
+     * 兼容读取 B 站返回的富文本 style 标记。
+     * 线上数据可能出现：true/false、1/0、"1"/"0"、"true"/"false" 等。
+     */
+    private static boolean optBooleanCompat(JSONObject obj, String key) {
+        if (obj == null || key == null) return false;
+        Object val = obj.opt(key);
+        if (val == null) return false;
+        if (val instanceof Boolean) return (Boolean) val;
+        if (val instanceof Number) return ((Number) val).intValue() != 0;
+        if (val instanceof String) {
+            String s = ((String) val).trim().toLowerCase();
+            if (s.isEmpty()) return false;
+            if ("true".equals(s) || "1".equals(s) || "yes".equals(s) || "y".equals(s)) return true;
+            if ("false".equals(s) || "0".equals(s) || "no".equals(s) || "n".equals(s)) return false;
+            // 兜底：纯数字字符串
+            try {
+                return Integer.parseInt(s) != 0;
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 仅用于段落开头：剔除前导空白，避免 opus/detail 返回的“缩进空格”导致换行错位。
+     */
+    private static String stripLeadingWhitespaces(String input) {
+        if (input == null || input.isEmpty()) return input;
+        int i = 0;
+        while (i < input.length()) {
+            char c = input.charAt(i);
+            // Character.isWhitespace 覆盖 \t\n\r 等；额外把常见不可见/空格字符也纳入。
+            if (Character.isWhitespace(c) || c == '\u3000' || c == '\u00A0' || c == '\uFEFF') {
+                i++;
+            } else {
+                break;
+            }
+        }
+        return i == 0 ? input : input.substring(i);
+    }
+
+    private static boolean containsNonWhitespace(String input) {
+        if (input == null || input.isEmpty()) return false;
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+            if (!(Character.isWhitespace(c) || c == '\u3000' || c == '\u00A0' || c == '\uFEFF')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 用于 para_type=7 的代码块。
      * 仅保留 B 站 opus/detail 返回的字段：content / lang。
      */
@@ -183,22 +236,37 @@ public class OpusParagraph {
         if (nodes == null) return "";
 
         SpannableStringBuilder stringBuilder = new SpannableStringBuilder();
+        boolean atParagraphStart = true;
         for (int i = 0; i < nodes.length(); i++) {
             JSONObject node = nodes.getJSONObject(i);
             switch (node.optString("type")) {
                 case "TEXT_NODE_TYPE_WORD":
                     JSONObject word = node.getJSONObject("word");
 
+                    String words = word.optString("words", "");
+                    if (atParagraphStart) {
+                        words = stripLeadingWhitespaces(words);
+                    }
+
                     int startPosition = stringBuilder.length();
-                    stringBuilder.append(word.optString("words", ""));
+                    stringBuilder.append(words);
                     int endPosition = stringBuilder.length();
+
+                    if (atParagraphStart && containsNonWhitespace(words)) {
+                        atParagraphStart = false;
+                    }
+
+                    // 若本次没有追加任何字符（例如段首全是空白被剔除），则无需设置 span。
+                    if (endPosition <= startPosition) {
+                        break;
+                    }
 
                     //粗体斜体，BOLD/ITALIC/BOLD_ITALIC 正好对应 1/2/3 所以可以这样减少判断量？
                     JSONObject style = word.optJSONObject("style");
                     if (style != null) {
-                        boolean bold = style.optBoolean("bold");
-                        boolean italic = style.optBoolean("italic");
-                        boolean strikethrough = style.optBoolean("strikethrough");
+                        boolean bold = optBooleanCompat(style, "bold");
+                        boolean italic = optBooleanCompat(style, "italic");
+                        boolean strikethrough = optBooleanCompat(style, "strikethrough");
                         int styleInt = (bold ? Typeface.BOLD : 0) + (italic ? Typeface.ITALIC : 0);
                         if (styleInt != 0)
                             stringBuilder.setSpan(new StyleSpan(styleInt), startPosition, endPosition, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -226,14 +294,26 @@ public class OpusParagraph {
 
                 case "TEXT_NODE_TYPE_RICH":
                     JSONObject rich = node.getJSONObject("rich");
-                    stringBuilder.append(rich.getString("text"));
+                    String richText = rich.getString("text");
+                    if (atParagraphStart) {
+                        richText = stripLeadingWhitespaces(richText);
+                    }
+                    int richStart = stringBuilder.length();
+                    stringBuilder.append(richText);
+                    int richEnd = stringBuilder.length();
+
+                    if (atParagraphStart && containsNonWhitespace(richText)) {
+                        atParagraphStart = false;
+                    }
+
                     switch (rich.optString("type")) {
                         case "RICH_TEXT_NODE_TYPE_EMOJI":
                             JSONObject emoji = rich.getJSONObject("emoji");
-                            EmoteUtil.replaceSingle(stringBuilder, emoji.optString("icon_url"), emoji.optInt("size"), stringBuilder.length() - rich.getString("text").length(), stringBuilder.length(), 1.0f);
+                            // 使用本次追加的区间，避免因为段首剔除空白导致索引错误。
+                            EmoteUtil.replaceSingle(stringBuilder, emoji.optString("icon_url"), emoji.optInt("size"), richStart, richEnd, 1.0f);
                             break;
                         case "RICH_TEXT_NODE_TYPE_RICH":  //TODO:忘记这个叫什么名字了，根据记忆应该是这个，如果不对请调整
-                            stringBuilder.setSpan(new StringUtil.LinkClickableSpan(rich.optString("jump_url"), TYPE_WEB_URL, rich.getString("jump_url")), stringBuilder.length() - rich.getString("text").length(), stringBuilder.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            stringBuilder.setSpan(new StringUtil.LinkClickableSpan(rich.optString("jump_url"), TYPE_WEB_URL, rich.getString("jump_url")), richStart, richEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                             break;
                     }
                     break;
@@ -271,6 +351,7 @@ public class OpusParagraph {
     public CharSequence analyzeOpus(JSONArray rich_list) throws JSONException {
         if (rich_list == null) return "";
         SpannableStringBuilder stringBuilder = new SpannableStringBuilder();
+        boolean atParagraphStart = true;
         for (int i = 0; i < rich_list.length(); i++) {
             JSONObject rich = rich_list.getJSONObject(i);
             int startLength = stringBuilder.length();
@@ -295,8 +376,20 @@ public class OpusParagraph {
                 default:
                     // 解析富文本样式（粗体、颜色、字体大小）
                     String text = rich.getString("orig_text");
+                    if (atParagraphStart) {
+                        text = stripLeadingWhitespaces(text);
+                    }
                     stringBuilder.append(text);
                     int endLength = stringBuilder.length();
+
+                    if (atParagraphStart && containsNonWhitespace(text)) {
+                        atParagraphStart = false;
+                    }
+
+                    // 支持富文本中直接包含换行的场景（换行后的下一段仍可剔除前导空白）
+                    if (endLength > 0 && stringBuilder.charAt(endLength - 1) == '\n') {
+                        atParagraphStart = true;
+                    }
                     
                     // 检查是否有 word 对象（包含样式信息）
                     if (rich.has("word") && !rich.isNull("word")) {
@@ -305,9 +398,9 @@ public class OpusParagraph {
                         // 粗体和斜体
                         JSONObject style = word.optJSONObject("style");
                         if (style != null) {
-                            boolean bold = style.optBoolean("bold");
-                            boolean italic = style.optBoolean("italic");
-                            boolean strikethrough = style.optBoolean("strikethrough");
+                            boolean bold = optBooleanCompat(style, "bold");
+                            boolean italic = optBooleanCompat(style, "italic");
+                            boolean strikethrough = optBooleanCompat(style, "strikethrough");
                             int styleInt = (bold ? Typeface.BOLD : 0) + (italic ? Typeface.ITALIC : 0);
                             if (styleInt != 0) {
                                 stringBuilder.setSpan(new StyleSpan(styleInt), startLength, endLength, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
