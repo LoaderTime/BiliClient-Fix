@@ -135,6 +135,12 @@ public class QRLoginFragment extends Fragment {
                 CenterThreadPool.runOnUiThread(() -> scanStat.setText("正在获取二维码"));
 
                 CookiesApi.checkCookies();
+                // 尝试激活风控环境（可能影响二维码登录成功后是否下发 refresh_token）
+                // 失败不影响继续获取二维码
+                try {
+                    CookiesApi.ensureRiskActiveDaily();
+                } catch (Throwable ignored) {
+                }
                 QRImage = LoginApi.getLoginQR();
                 //CookiesApi.activeCookieInfo();
 
@@ -177,8 +183,7 @@ public class QRLoginFragment extends Fragment {
             @SuppressLint("SetTextI18n")
             @Override
             public void run() {
-                try {
-                    Response response = LoginApi.getLoginState();
+                try (Response response = LoginApi.getLoginState()) {
                     assert response.body() != null;
                     if (!isAdded()) {
                         this.cancel();
@@ -207,11 +212,31 @@ public class QRLoginFragment extends Fragment {
                         case 0:
                             this.cancel();
                             CenterThreadPool.runOnUiThread(() -> scanStat.setText("正在处理登录……"));
+
+                            // 先访问跨域跳转URL，让服务器下发登录态Cookie，再从本地Cookie仓库读取
+                            if (loginJson.getJSONObject("data").has("url")) {
+                                try {
+                                    try (Response ignored = NetWorkUtil.get(loginJson.getJSONObject("data").optString("url"))) {
+                                        // no-op
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+
                             String cookies = SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, "");
 
                             SharedPreferencesUtil.putLong(SharedPreferencesUtil.mid, Long.parseLong(NetWorkUtil.getInfoFromCookie("DedeUserID", cookies)));
                             SharedPreferencesUtil.putString(SharedPreferencesUtil.csrf, NetWorkUtil.getInfoFromCookie("bili_jct", cookies));
-                            SharedPreferencesUtil.putString(SharedPreferencesUtil.refresh_token, loginJson.getJSONObject("data").getString("refresh_token"));
+                            String refreshToken = loginJson.getJSONObject("data").optString("refresh_token", "");
+                            if (!refreshToken.isEmpty()) {
+                                SharedPreferencesUtil.putString(SharedPreferencesUtil.refresh_token, refreshToken);
+                            } else {
+                                // 避免把已有 refresh_token 覆盖成空；同时给出提示（后续 Cookie 刷新可能不可用）
+                                Logu.e("refresh_token为空", "二维码登录成功但接口未下发refresh_token，Cookie刷新可能不可用");
+                                CenterThreadPool.runOnUiThread(() -> MsgUtil.showMsgLong(
+                                        "登录成功，但未获取到refresh_token。\nCookie刷新可能不可用，建议重试登录或反馈开发者。"
+                                ));
+                            }
 
                             SharedPreferencesUtil.putBoolean(SharedPreferencesUtil.cookie_refresh, true);
 
@@ -224,12 +249,6 @@ public class QRLoginFragment extends Fragment {
                             NetWorkUtil.refreshHeaders();
 
                             LoginApi.requestSSOs();
-                            if (loginJson.getJSONObject("data").has("url")) {
-                                try {
-                                    NetWorkUtil.get(loginJson.getJSONObject("data").optString("url"));
-                                } catch (Throwable ignored) {
-                                }
-                            }
 
                             startActivity(new Intent(requireContext(), SplashActivity.class));
 
