@@ -1020,12 +1020,29 @@ public class DynamicApi {
         // 动态Stats
         if (modules.has("module_stat") && !modules.isNull("module_stat")) {
             JSONObject module_stat = modules.getJSONObject("module_stat");
-            JSONObject like = module_stat.getJSONObject("like");
             Stats stats = new Stats();
-            stats.like = like.getInt("count");
-            stats.liked = like.getBoolean("status");
-            stats.like_disabled = like.getBoolean("forbidden");
-            // TODO 转发&回复
+
+            // like
+            JSONObject like = module_stat.optJSONObject("like");
+            if (like != null) {
+                stats.like = like.optInt("count", 0);
+                stats.liked = like.optBoolean("status", false);
+                stats.like_disabled = like.optBoolean("forbidden", false) || like.optBoolean("hidden", false);
+            }
+
+            // comment / reply
+            JSONObject comment = module_stat.optJSONObject("comment");
+            if (comment != null) {
+                stats.reply = comment.optInt("count", 0);
+                stats.reply_disabled = comment.optBoolean("forbidden", false) || comment.optBoolean("hidden", false);
+            }
+
+            // forward / share
+            JSONObject forward = module_stat.optJSONObject("forward");
+            if (forward != null) {
+                stats.share = forward.optInt("count", 0);
+                stats.share_disabled = forward.optBoolean("forbidden", false) || forward.optBoolean("hidden", false);
+            }
 
             dynamic.stats = stats;
         }
