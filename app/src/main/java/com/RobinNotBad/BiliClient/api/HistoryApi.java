@@ -52,6 +52,7 @@ public class HistoryApi {
     public static void reportArticleHistory(long aid, int type) throws IOException {
         String url = "https://api.bilibili.com/x/v2/history/report";
         String per = "aid=" + aid + "&type=" + type
+                + "&dt=2"
                 + "&csrf=" + SharedPreferencesUtil.getString(SharedPreferencesUtil.csrf, "");
         postHistoryReport(url, per);
     }
@@ -74,6 +75,7 @@ public class HistoryApi {
         String per = "aid=" + listId
                 + (cvid > 0 ? "&cid=" + cvid : "")
                 + "&type=" + ARTICLE_LIST_HISTORY_TYPE
+                + "&dt=2"
                 + "&csrf=" + SharedPreferencesUtil.getString(SharedPreferencesUtil.csrf, "");
         postHistoryReport(url, per);
     }
@@ -252,9 +254,15 @@ public class HistoryApi {
                 if ("article-list".equals(business) && oid == aid && cidVal == cid) return "article-list";
                 if ("article".equals(business) && oid == aid && cidVal == cid) return "article-hybrid";
                 if ("article".equals(business) && oid == cid) return "article-cvid";
+                // 部分情况下服务端可能不回显 cid（cid=0），仍尝试用 oid 匹配。
+                if ("article-list".equals(business) && oid == aid && cidVal == 0) return "article-list(oid-only)";
                 return "";
             }
-            return ("article".equals(business) && oid == aid) ? "article-cvid" : "";
+            // 网页端专栏上报常见形态：aid=cvid&type=5&dt=2（不带 cid）。
+            // 服务端回显可能是 article 或 article-list。
+            if ("article".equals(business) && oid == aid) return "article-cvid";
+            if ("article-list".equals(business) && oid == aid) return "article-list(oid-only)";
+            return "";
         }
 
         private static TargetHistory fromForm(String form) {

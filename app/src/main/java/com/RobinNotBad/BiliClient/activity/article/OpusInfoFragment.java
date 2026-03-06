@@ -91,29 +91,32 @@ public class OpusInfoFragment extends Fragment {
                         recyclerView.requestFocus();
                     });
                     
-                    // 历史上报：
-                    // 历史策略：
-                    // - 普通专栏（listId <= 0）：走 history/report (type=5)。
-                    // - 专栏合集（listId > 0）：不走 history/report（避免产生 article-hybrid 错位记录），仅触达 viewinfo
-                    //   以模拟网页端链路，观察是否能前置。
+                    // 历史上报：统一走 /x/v2/history/report 且固定 type=5。
+                    // - 普通专栏：aid=cvid&type=5
+                    // - 专栏合集（article-list）：网页端同样按 aid=cvid&type=5 上报（dt=2），不再携带 listId/cid。
+                    // 说明：曾尝试通过 viewinfo 模拟网页端链路（touchArticleViewInfoForDebug），
+                    // 但会导致 history 中出现多条记录（如 article/article-list），因此暂时禁用该分支。
                     CenterThreadPool.run(() -> {
                         try {
                             long listId = opus.listId;
                             long cvid = opus.id > 0 ? opus.id : oid;
-                            // 安全校验：若 listId 与 cvid 相同，基本可判定并非合集 rlid，回退普通专栏上报。
-                            boolean useListReport = listId > 0 && listId != cvid;
-                            if (useListReport) {
+                            // 安全校验：若 listId 与 cvid 相同，基本可判定并非合集 rlid，按普通专栏处理。
+                            boolean isArticleList = listId > 0 && listId != cvid;
+                            if (isArticleList) {
                                 com.RobinNotBad.BiliClient.util.Logu.i("OpusHistory",
-                                        "Article-list mode: touch viewinfo only (no history/report). listId=" + listId
-                                                + ", cvid=" + cvid
+                                        "Article-list mode: history/report(type=5,dt=2) cvid=" + cvid
+                                                + ", listId=" + listId
                                                 + ", opus.id=" + opus.id
                                                 + ", oid=" + oid);
-                                HistoryApi.touchArticleViewInfoForDebug(cvid);
+                                // 对齐网页端：aid=cvid&type=5&dt=2
+                                HistoryApi.reportArticleListHistory(cvid);
+
+                                // HistoryApi.touchArticleViewInfoForDebug(cvid); // disabled: avoid duplicated history records
                             } else {
-                                String fallbackReason = listId <= 0 ? "listId<=0" : "listId==cvid(" + listId + ")";
+                                String reason = listId <= 0 ? "listId<=0" : "listId==cvid(" + listId + ")";
                                 com.RobinNotBad.BiliClient.util.Logu.i("OpusHistory",
-                                        "Article mode: history/report(type=5) for oid=" + oid
-                                                + ", reason=" + fallbackReason
+                                        "Article mode: history/report(type=5,dt=2) cvid=" + cvid
+                                                + ", reason=" + reason
                                                 + ", listId=" + listId
                                                 + ", opus.id=" + opus.id
                                                 + ", commentId=" + opus.commentId);
