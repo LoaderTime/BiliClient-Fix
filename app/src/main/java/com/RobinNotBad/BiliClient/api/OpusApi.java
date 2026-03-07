@@ -869,9 +869,13 @@ public class OpusApi {
     private static OpusParagraph[] parseHtmlContent(String html) {
         ArrayList<OpusParagraph> paragraphs = new ArrayList<>();
 
-        java.util.regex.Pattern imgPattern =
-                java.util.regex.Pattern.compile("<figure[^>]*>(.*?)</figure>", java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
-        java.util.regex.Matcher figureMatcher = imgPattern.matcher(html);
+        // HTML 回退解析下，专栏横线目前已知至少有两种结构：
+        // 1) <figure class="opus-para-line"><img src="...png"></figure>
+        // 2) <figure class="img-box"><img data-src="...png" class="cut-off-1"></figure>
+        // 它们都应该继续按“远程图片”渲染，但不能套用普通正文图的 @0e_25q_512w 规则。
+        java.util.regex.Pattern figurePattern =
+                java.util.regex.Pattern.compile("<figure([^>]*)>(.*?)</figure>", java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL);
+        java.util.regex.Matcher figureMatcher = figurePattern.matcher(html);
 
         int lastIndex = 0;
         while (figureMatcher.find()) {
@@ -880,17 +884,56 @@ public class OpusApi {
                 addTextParagraphs(paragraphs, before, false);
             }
 
-            String figureHtml = figureMatcher.group(1);
+            String figureAttrs = figureMatcher.group(1);
+            String figureHtml = figureMatcher.group(2);
 
-            java.util.regex.Matcher imgMatcher =
-                    java.util.regex.Pattern.compile("<img[^>]+src=\"([^\"]+)\"", java.util.regex.Pattern.CASE_INSENSITIVE)
+            boolean isLineImage = false;
+            String lineKind = "";
+            if (figureAttrs != null) {
+                String lower = figureAttrs.toLowerCase(Locale.ROOT);
+                if (lower.contains("opus-para-line")) {
+                    isLineImage = true;
+                    lineKind = "opus-para-line";
+                }
+            }
+
+            java.util.regex.Matcher imgTagMatcher =
+                    java.util.regex.Pattern.compile("<img([^>]*)>", java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL)
                             .matcher(figureHtml);
 
-            if (imgMatcher.find()) {
-                String imgUrl = fixImageUrl(imgMatcher.group(1));
+            if (imgTagMatcher.find()) {
+                String imgAttrs = imgTagMatcher.group(1);
+                if (imgAttrs == null) imgAttrs = "";
+                String imgAttrsLower = imgAttrs.toLowerCase(Locale.ROOT);
+
+                if (!isLineImage && imgAttrsLower.contains("cut-off-1")) {
+                    isLineImage = true;
+                    lineKind = "cut-off-1";
+                }
+
+                String imgUrl = "";
+                java.util.regex.Matcher srcMatcher = java.util.regex.Pattern
+                        .compile("\\bsrc=\"([^\"]+)\"", java.util.regex.Pattern.CASE_INSENSITIVE)
+                        .matcher(imgAttrs);
+                if (srcMatcher.find()) {
+                    imgUrl = srcMatcher.group(1);
+                } else {
+                    java.util.regex.Matcher dataSrcMatcher = java.util.regex.Pattern
+                            .compile("\\bdata-src=\"([^\"]+)\"", java.util.regex.Pattern.CASE_INSENSITIVE)
+                            .matcher(imgAttrs);
+                    if (dataSrcMatcher.find()) {
+                        imgUrl = dataSrcMatcher.group(1);
+                    }
+                }
+
+                imgUrl = fixImageUrl(imgUrl);
                 OpusParagraph imgParagraph = new OpusParagraph();
                 imgParagraph.type = OpusParagraph.TYPE_PIC;
-                imgParagraph.content = new String[]{imgUrl};
+                imgParagraph.content = new OpusParagraph.ImageContent(
+                        new String[]{imgUrl},
+                        isLineImage,
+                        lineKind
+                );
                 paragraphs.add(imgParagraph);
             }
 

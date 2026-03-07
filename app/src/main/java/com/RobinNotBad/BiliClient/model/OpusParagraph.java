@@ -112,6 +112,35 @@ public class OpusParagraph {
         }
     }
 
+    /**
+     * 图片段落数据。
+     * lineImage=true 仅表示“这是专栏中的横线类远程图片”，
+     * 仍然按图片加载，不使用本地 drawable 替代。
+     */
+    public static class ImageContent {
+        public final String[] urls;
+        public final boolean lineImage;
+        public final String lineKind;
+        public final int width;
+        public final int height;
+
+        public ImageContent(String[] urls) {
+            this(urls, false, "", 0, 0);
+        }
+
+        public ImageContent(String[] urls, boolean lineImage, String lineKind) {
+            this(urls, lineImage, lineKind, 0, 0);
+        }
+
+        public ImageContent(String[] urls, boolean lineImage, String lineKind, int width, int height) {
+            this.urls = urls == null ? new String[0] : urls;
+            this.lineImage = lineImage;
+            this.lineKind = lineKind == null ? "" : lineKind;
+            this.width = width;
+            this.height = height;
+        }
+    }
+
     public OpusParagraph() {
     }
 
@@ -325,27 +354,37 @@ public class OpusParagraph {
         return stringBuilder;
     }
 
-    public String[] analyzePic(JSONObject allJson) throws JSONException {
-        if (allJson == null) return new String[0];
+    public ImageContent analyzePic(JSONObject allJson) throws JSONException {
+        if (allJson == null) return new ImageContent(new String[0]);
         JSONArray picsJson = allJson.optJSONArray("pics");
-        if (picsJson == null) return new String[0];
+        if (picsJson == null) return new ImageContent(new String[0]);
         String[] pics = new String[picsJson.length()];
+        int firstWidth = 0;
+        int firstHeight = 0;
         for (int i = 0; i < picsJson.length(); i++) {
-            String url = picsJson.getJSONObject(i).optString("url", "");
+            JSONObject picObj = picsJson.getJSONObject(i);
+            String url = picObj.optString("url", "");
             if (url == null || url.isEmpty()) {
                 pics[i] = "";
             } else {
                 pics[i] = url.startsWith("http") ? url : "http:" + url;
             }
+            if (i == 0) {
+                firstWidth = picObj.optInt("width", 0);
+                firstHeight = picObj.optInt("height", 0);
+            }
         }
-        return pics;
+        return new ImageContent(pics, false, "", firstWidth, firstHeight);
     }
 
-    public String[] analyzeDivider(JSONObject allJson) throws JSONException {
-        if (allJson == null) return new String[0];
-        String url = allJson.getJSONObject("pic").optString("url", "");
-        if (url == null || url.isEmpty()) return new String[0];
-        return new String[]{url.startsWith("http") ? url : "http:" + url};
+    public ImageContent analyzeDivider(JSONObject allJson) throws JSONException {
+        if (allJson == null) return new ImageContent(new String[0], true, "api-divider", 0, 0);
+        JSONObject pic = allJson.getJSONObject("pic");
+        String url = pic.optString("url", "");
+        int width = pic.optInt("width", 0);
+        int height = pic.optInt("height", 0);
+        if (url == null || url.isEmpty()) return new ImageContent(new String[0], true, "api-divider", width, height);
+        return new ImageContent(new String[]{url.startsWith("http") ? url : "http:" + url}, true, "api-divider", width, height);
     }
 
     public CharSequence analyzeOpus(JSONArray rich_list) throws JSONException {

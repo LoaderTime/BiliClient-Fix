@@ -24,24 +24,64 @@ import com.RobinNotBad.BiliClient.model.Opus;
 import com.RobinNotBad.BiliClient.model.OpusParagraph;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
 import com.RobinNotBad.BiliClient.util.GlideUtil;
+import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
 import com.RobinNotBad.BiliClient.util.ToolsUtil;
 import com.bumptech.glide.Glide;
+import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.engine.GlideException;
 import com.bumptech.glide.load.resource.bitmap.RoundedCorners;
+import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.RequestOptions;
+import com.bumptech.glide.request.target.Target;
+import com.bumptech.glide.signature.ObjectKey;
 import com.google.android.material.card.MaterialCardView;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 //文章内容Adapter by RobinNotBad
 
 public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.ArticleLineHolder> {
+
+    /**
+     * 版本号：用于让历史的“坏缓存”（例如 decoded=5x5）失效。
+     * 每次修复缓存相关问题时递增。
+     */
+    private static final String ARTICLE_IMAGE_SIGNATURE = "ArticleImageFix_v4";
+
+    /**
+     * 记录普通图片请求的“刷新版本号”。
+     *
+     * key: 请求 URL（通常是 @0e_25q_512w.webp）
+     * value: 已触发的刷新版本
+     *
+     * 目的：
+     * - 避免使用固定的 :cmp:refresh 签名导致“坏刷新缓存”再次被命中
+     * - 每次检测到 tiny decoded 时递增版本号，强制绕过旧缓存重新拉取
+     */
+    private static final Map<String, Integer> REFRESH_IMAGE_REVISIONS = new ConcurrentHashMap<>();
+
+    /**
+     * 普通图片在多次 refresh 仍返回 tiny 图后，临时切换到 baseUrl 原图链路。
+     *
+     * 注意：
+     * - 这不是早前的“直接黑名单强制 baseUrl”逻辑；
+     * - 只有在压缩图多次刷新仍失败后，才在当前进程内对该 requestUrl 启用原图兜底。
+     */
+    private static final Set<String> BASE_FALLBACK_REQUESTS =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    private static final int MAX_REFRESH_RETRY = 3;
 
     final Activity context;
     final Opus article;
@@ -53,6 +93,16 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
         this.context = context;
         this.article = article;
         this.paragraphs = article.paragraphs;
+    }
+
+    private OpusParagraph.ImageContent asImageContent(Object content) {
+        if (content instanceof OpusParagraph.ImageContent) {
+            return (OpusParagraph.ImageContent) content;
+        }
+        if (content instanceof String[]) {
+            return new OpusParagraph.ImageContent((String[]) content);
+        }
+        return null;
     }
 
     @NonNull
@@ -112,29 +162,240 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                 ImageFilterView imageView = holder.itemView.findViewById(R.id.imageView);
                 TextView imageCount = holder.itemView.findViewById(R.id.imageCount);
 
-                if (paragraphs[realPosition].content instanceof String[]) {
-                    String[] urls = (String[]) paragraphs[realPosition].content;
+                OpusParagraph.ImageContent imageContent = asImageContent(paragraphs[realPosition].content);
+                if (imageContent != null) {
+                    String[] urls = imageContent.urls;
                     int length = urls != null ? urls.length : 0;
                     if (length > 0 && urls[0] != null) {
-                        String imageUrl = GlideUtil.url(urls[0]);
-                        if (!imageUrl.equals(holder.lastImageUrl)) {
-                            holder.lastImageUrl = imageUrl;
-                            Glide.with(BiliTerminal.context).asDrawable().load(imageUrl)
-                                    .placeholder(R.mipmap.placeholder)
-                                    .transition(GlideUtil.getTransitionOptions())
-                                    .diskCacheStrategy(DiskCacheStrategy.DATA)
-                                    .into(imageView);
+                        boolean lineImage = imageContent.lineImage;
+                        String lineKind = imageContent.lineKind;
+                        imageView.setRound(lineImage ? 0f : context.getResources().getDimension(R.dimen.card_round));
+                        String rawUrl = urls[0];
+                        String baseUrl = GlideUtil.stripBfsTransform(rawUrl);
+                        String requestUrl = lineImage
+                                ? GlideUtil.buildLineRequestUrl(rawUrl, lineKind)
+                                : GlideUtil.buildRequestUrl(rawUrl);
+                        String fallbackUrl = lineImage
+                                ? GlideUtil.buildLineFallbackUrl(rawUrl, lineKind)
+                                : baseUrl;
+
+                        final int expectedWidth = imageContent.width;
+                        final int expectedHeight = imageContent.height;
+                        boolean baseFallbackVariant = !lineImage
+                                && requestUrl != null && !requestUrl.isEmpty()
+                                && BASE_FALLBACK_REQUESTS.contains(requestUrl)
+                                && baseUrl != null && !baseUrl.isEmpty();
+                        int refreshRevision = !lineImage && !baseFallbackVariant && requestUrl != null && !requestUrl.isEmpty()
+                                ? Math.max(0, REFRESH_IMAGE_REVISIONS.getOrDefault(requestUrl, 0))
+                                : 0;
+                        boolean refreshVariant = refreshRevision > 0;
+                        final String effectiveUrl = baseFallbackVariant ? baseUrl : requestUrl;
+
+                        if (!effectiveUrl.equals(holder.lastImageUrl)) {
+                            holder.lastImageUrl = effectiveUrl;
+
+                            // 调试日志：仅在 URL 发生变化时输出，避免 Recycler 频繁 bind 造成刷屏。
+                            Logu.w("ArticleImage",
+                                    "cv=" + article.id
+                                            + ", pos=" + realPosition
+                                            + ", type=" + (viewType == OpusParagraph.TYPE_DIVIDER ? "DIVIDER" : "PIC")
+                                            + ", image_request_jpg=" + SharedPreferencesUtil.getBoolean("image_request_jpg", false)
+                                            + ", lineImage=" + lineImage
+                                            + ", lineKind=" + lineKind
+                                            + ", expected=" + expectedWidth + "x" + expectedHeight
+                                            + ", raw=" + rawUrl
+                                            + ", base=" + baseUrl
+                                            + ", fallback=" + fallbackUrl
+                                            + ", req=" + effectiveUrl
+                                            + ", baseFallbackVariant=" + baseFallbackVariant
+                                            + ", refreshVariant=" + refreshVariant
+                                            + ", refreshRevision=" + refreshRevision);
+
+                            com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> builder;
+                            com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> errorBuilder = null;
+                            if (fallbackUrl != null && !fallbackUrl.isEmpty() && !fallbackUrl.equals(effectiveUrl)) {
+                                errorBuilder = Glide.with(BiliTerminal.context)
+                                        .asDrawable()
+                                        .load(fallbackUrl)
+                                        .signature(new ObjectKey(ARTICLE_IMAGE_SIGNATURE + (lineImage ? ":lineFallback" : ":base")));
+                            }
+
+                            builder = Glide.with(BiliTerminal.context)
+                                    .asDrawable()
+                                    .load(effectiveUrl)
+                                    .placeholder(lineImage ? R.drawable.empty : R.mipmap.placeholder)
+                                    .signature(new ObjectKey(ARTICLE_IMAGE_SIGNATURE
+                                            + (lineImage
+                                            ? ":line:" + lineKind
+                                            : (baseFallbackVariant
+                                            ? ":base:final"
+                                            : (refreshVariant ? ":cmp:refresh:" + refreshRevision : ":cmp")))));
+
+                            if (refreshVariant || baseFallbackVariant) {
+                                builder = builder.skipMemoryCache(true);
+                            }
+
+                            if (errorBuilder != null) {
+                                builder = builder.error(errorBuilder);
+                            } else {
+                                builder = builder.error(lineImage ? R.drawable.empty : R.mipmap.placeholder);
+                            }
+
+                            builder.listener(new RequestListener<android.graphics.drawable.Drawable>() {
+                                        @Override
+                                        public boolean onLoadFailed(GlideException e, Object model, Target<android.graphics.drawable.Drawable> target, boolean isFirstResource) {
+                                            Logu.e("ArticleImage",
+                                                    "FAIL cv=" + article.id
+                                                            + ", pos=" + realPosition
+                                                            + ", req=" + effectiveUrl
+                                                            + ", err=" + (e == null ? "null" : e.getClass().getSimpleName() + ":" + e.getMessage()));
+                                            return false;
+                                        }
+
+                                        @Override
+                                        public boolean onResourceReady(android.graphics.drawable.Drawable resource, Object model, Target<android.graphics.drawable.Drawable> target, DataSource dataSource, boolean isFirstResource) {
+                                            int w = -1, h = -1;
+                                            try {
+                                                if (resource instanceof android.graphics.drawable.BitmapDrawable) {
+                                                    android.graphics.Bitmap bm = ((android.graphics.drawable.BitmapDrawable) resource).getBitmap();
+                                                    if (bm != null) {
+                                                        w = bm.getWidth();
+                                                        h = bm.getHeight();
+                                                    }
+                                                }
+                                            } catch (Exception ignored) {
+                                            }
+                                            Logu.w("ArticleImage",
+                                                    "OK cv=" + article.id
+                                                            + ", pos=" + realPosition
+                                                            + ", req=" + effectiveUrl
+                                                            + ", lineImage=" + lineImage
+                                                            + ", lineKind=" + lineKind
+                                                            + ", expected=" + expectedWidth + "x" + expectedHeight
+                                                            + ", decoded=" + w + "x" + h
+                                                            + ", source=" + dataSource
+                                                            + ", baseFallbackVariant=" + baseFallbackVariant
+                                                            + ", refreshRevision=" + refreshRevision);
+
+                                            // 普通图片若出现异常小图，改为“刷新签名重试”，而不是旧版 forceBase 黑名单。
+                                            boolean looksTiny = w > 0 && h > 0 && w <= 64 && h <= 64;
+                                            boolean expectedLarge = expectedWidth > 0 && expectedHeight > 0
+                                                    && expectedWidth >= 256 && expectedHeight >= 256;
+                                            boolean canRetryMore = refreshRevision < MAX_REFRESH_RETRY;
+                                            boolean shouldRefreshRetry = !lineImage && !baseFallbackVariant && canRetryMore
+                                                    && looksTiny
+                                                    && (expectedLarge || expectedWidth <= 0 || expectedHeight <= 0);
+                                            boolean shouldFinalBaseFallback = !lineImage
+                                                    && !baseFallbackVariant
+                                                    && !canRetryMore
+                                                    && looksTiny
+                                                    && baseUrl != null && !baseUrl.isEmpty();
+
+                                            if (shouldRefreshRetry) {
+                                                int nextRevision = refreshRevision + 1;
+                                                REFRESH_IMAGE_REVISIONS.put(effectiveUrl, nextRevision);
+                                                Logu.w("ArticleImage",
+                                                        "TINY_DECODED_REFRESH cv=" + article.id
+                                                                + ", pos=" + realPosition
+                                                                + ", expected=" + expectedWidth + "x" + expectedHeight
+                                                                + ", tiny=" + w + "x" + h
+                                                                + ", retryReq=" + effectiveUrl
+                                                                + ", nextRevision=" + nextRevision);
+
+                                                // 注意：Glide 不允许在 RequestListener 回调里直接再次 into()。
+                                                // 这里 post 到主线程消息队列下一轮再触发“刷新签名重试”，避免 CallbackException。
+                                                final String currentLoadKey = effectiveUrl;
+                                                final int currentNextRevision = nextRevision;
+                                                holder.lastImageUrl = currentLoadKey + "#refresh-pending:" + currentNextRevision;
+                                                imageView.post(() -> {
+                                                    try {
+                                                        if (!(currentLoadKey + "#refresh-pending:" + currentNextRevision).equals(holder.lastImageUrl)) {
+                                                            return;
+                                                        }
+                                                        int adapterPosition = holder.getAdapterPosition();
+                                                        if (adapterPosition == RecyclerView.NO_POSITION) {
+                                                            return;
+                                                        }
+                                                        holder.lastImageUrl = null;
+                                                        notifyItemChanged(adapterPosition);
+                                                    } catch (Exception e) {
+                                                        Logu.e("ArticleImage", "POST_FALLBACK_FAIL cv=" + article.id
+                                                                + ", pos=" + realPosition
+                                                                + ", req=" + currentLoadKey
+                                                                + ", err=" + e.getMessage());
+                                                    }
+                                                });
+                                                return true;
+                                            }
+
+                                            if (shouldFinalBaseFallback) {
+                                                BASE_FALLBACK_REQUESTS.add(requestUrl);
+                                                Logu.w("ArticleImage",
+                                                        "TINY_DECODED_BASE_FALLBACK cv=" + article.id
+                                                                + ", pos=" + realPosition
+                                                                + ", expected=" + expectedWidth + "x" + expectedHeight
+                                                                + ", tiny=" + w + "x" + h
+                                                                + ", fallbackBase=" + baseUrl);
+
+                                                holder.lastImageUrl = requestUrl + "#base-pending";
+                                                imageView.post(() -> {
+                                                    try {
+                                                        if (!(requestUrl + "#base-pending").equals(holder.lastImageUrl)) {
+                                                            return;
+                                                        }
+                                                        int adapterPosition = holder.getAdapterPosition();
+                                                        if (adapterPosition == RecyclerView.NO_POSITION) {
+                                                            return;
+                                                        }
+                                                        holder.lastImageUrl = null;
+                                                        notifyItemChanged(adapterPosition);
+                                                    } catch (Exception e) {
+                                                        Logu.e("ArticleImage", "POST_BASE_FALLBACK_FAIL cv=" + article.id
+                                                                + ", pos=" + realPosition
+                                                                + ", req=" + requestUrl
+                                                                + ", err=" + e.getMessage());
+                                                    }
+                                                });
+                                                return true;
+                                            }
+
+                                            if (baseFallbackVariant && looksTiny) {
+                                                Logu.w("ArticleImage",
+                                                        "BASE_FALLBACK_STILL_TINY_KEEP_OLD cv=" + article.id
+                                                                + ", pos=" + realPosition
+                                                                + ", tiny=" + w + "x" + h
+                                                                + ", base=" + baseUrl);
+                                                return true;
+                                            }
+                                            return false;
+                                        }
+                                    })
+                                    .transition(GlideUtil.getTransitionOptions());
+
+                            builder = builder.diskCacheStrategy((refreshVariant || baseFallbackVariant)
+                                    ? DiskCacheStrategy.NONE
+                                    : DiskCacheStrategy.DATA);
+                            builder.into(imageView);
                         }
 
-                        imageView.setOnClickListener(view -> {
-                            Intent intent = new Intent();
-                            intent.setClass(context, ImageViewerActivity.class);
-                            intent.putExtra("imageList", new ArrayList<>(Arrays.asList(urls)));
-                            context.startActivity(intent);
-                        });
+                        if (lineImage) {
+                            imageView.setOnClickListener(null);
+                            imageView.setClickable(false);
+                            imageView.setFocusable(false);
+                        } else {
+                            imageView.setClickable(true);
+                            imageView.setFocusable(true);
+                            imageView.setOnClickListener(view -> {
+                                Intent intent = new Intent();
+                                intent.setClass(context, ImageViewerActivity.class);
+                                intent.putExtra("imageList", new ArrayList<>(Arrays.asList(urls)));
+                                context.startActivity(intent);
+                            });
+                        }
 
-                        if (length > 1)
+                        if (!lineImage && length > 1)
                             imageCount.setText(String.format(Locale.CHINA, "共%d张图片", length));
+                        imageCount.setVisibility(!lineImage && length > 1 ? View.VISIBLE : View.GONE);
                     }
                 }
                 break;
@@ -155,11 +416,25 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                     title.setVisibility(View.GONE);
 
                 if (!TextUtils.isEmpty(article.cover)) {
-                    String coverUrl = GlideUtil.url(article.cover);
+                    String rawCover = article.cover;
+                    String baseCover = GlideUtil.stripBfsTransform(rawCover);
+                    String coverUrl = GlideUtil.buildRequestUrl(rawCover);
+
                     if (!coverUrl.equals(holder.lastTopImageUrl)) {
                         holder.lastTopImageUrl = coverUrl;
+
+                        Logu.w("ArticleImage",
+                                "cv=" + article.id
+                                        + ", pos=-1"
+                                        + ", type=TOP_COVER"
+                                        + ", image_request_jpg=" + SharedPreferencesUtil.getBoolean("image_request_jpg", false)
+                                        + ", raw=" + rawCover
+                                        + ", base=" + baseCover
+                                        + ", req=" + coverUrl);
+
                         Glide.with(BiliTerminal.context).asDrawable().load(coverUrl)
                                 .placeholder(R.mipmap.placeholder)
+                                .error(Glide.with(BiliTerminal.context).asDrawable().load(baseCover))
                                 .transition(GlideUtil.getTransitionOptions())
                                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))))
                                 .format(DecodeFormat.PREFER_RGB_565)
@@ -168,11 +443,25 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                     }
                     topCount.setVisibility(View.GONE);
                 } else if (article.topImages != null && article.topImages.size() > 0) {
-                    String firstImageUrl = GlideUtil.url(article.topImages.get(0));
+                    String rawTop = article.topImages.get(0);
+                    String baseTop = GlideUtil.stripBfsTransform(rawTop);
+                    String firstImageUrl = GlideUtil.buildRequestUrl(rawTop);
+
                     if (!firstImageUrl.equals(holder.lastTopImageUrl)) {
                         holder.lastTopImageUrl = firstImageUrl;
+
+                        Logu.w("ArticleImage",
+                                "cv=" + article.id
+                                        + ", pos=-1"
+                                        + ", type=TOP_IMAGES[0]"
+                                        + ", image_request_jpg=" + SharedPreferencesUtil.getBoolean("image_request_jpg", false)
+                                        + ", raw=" + rawTop
+                                        + ", base=" + baseTop
+                                        + ", req=" + firstImageUrl);
+
                         Glide.with(BiliTerminal.context).asDrawable().load(firstImageUrl)
                                 .placeholder(R.mipmap.placeholder)
+                                .error(Glide.with(BiliTerminal.context).asDrawable().load(baseTop))
                                 .transition(GlideUtil.getTransitionOptions())
                                 .apply(RequestOptions.bitmapTransform(new RoundedCorners(ToolsUtil.dp2px(4))))
                                 .format(DecodeFormat.PREFER_RGB_565)
@@ -377,6 +666,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
         holder.lastTopImageUrl = null;
         holder.lastAvatarUrl = null;
         holder.lastImageUrl = null;
+        holder.lastDividerUrl = null;
         super.onViewRecycled(holder);
     }
 
@@ -401,6 +691,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
         String lastTopImageUrl;
         String lastAvatarUrl;
         String lastImageUrl;
+        String lastDividerUrl;
 
         public ArticleLineHolder(@NonNull View itemView) {
             super(itemView);
