@@ -26,6 +26,7 @@ import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import org.json.JSONException;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class JumpToPlayerActivity extends BaseActivity {
     String title;
@@ -35,24 +36,31 @@ public class JumpToPlayerActivity extends BaseActivity {
 
     int download;
 
+    private final AtomicBoolean exitRequested = new AtomicBoolean(false);
+    private final AtomicBoolean playerResultHandled = new AtomicBoolean(false);
+    private static final String PLAYER_RESULT_FALLBACK_TOAST = "播放器已退出，但未返回播放进度";
+
     final ActivityResultLauncher<Intent> launcher = registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), new ActivityResultCallback<>() {
         @Override
         public void onActivityResult(ActivityResult o) {
+            if (!playerResultHandled.compareAndSet(false, true)) {
+                Logu.w("进度回调", "重复收到播放器返回结果，忽略后续结果");
+                return;
+            }
+
             int code = o.getResultCode();
             Intent result = o.getData();
             Logu.d("进度回调", "onActivityResult");
-            if (code == RESULT_OK && result != null) {
+            if (code == RESULT_OK && result != null && result.hasExtra("progress")) {
                 int progress = result.getIntExtra("progress", 0);
                 Logu.d("进度回调", String.valueOf(progress));
 
-                CenterThreadPool.run(() -> {
-                    if (playerData.mid != 0 && playerData.aid != 0) try {
-                        HistoryApi.reportHistory(playerData.aid, playerData.cid, progress / 1000);
-                    } catch (Exception e) {
-                        MsgUtil.err("进度上报：", e);
-                    }
-                    finish();
-                });
+                reportHistoryAsync(progress);
+                requestExitOnce();
+            } else {
+                Logu.w("进度回调", "播放器返回异常：code=" + code + ", result=" + result);
+                MsgUtil.toast(PLAYER_RESULT_FALLBACK_TOAST);
+                setClickExit("播放器已退出，但未返回播放进度\n点击返回");
             }
         }
     });
@@ -123,13 +131,40 @@ public class JumpToPlayerActivity extends BaseActivity {
 
     @Override
     public void onBackPressed() {
-        finish();
+        requestExitOnce();
     }
 
     private void setClickExit(String reason) {
         runOnUiThread(() -> {
             textView.setText(reason);
-            textView.setOnClickListener((view) -> finish());
+            textView.setOnClickListener((view) -> requestExitOnce());
+        });
+    }
+
+    private void requestExitOnce() {
+        if (!exitRequested.compareAndSet(false, true)) {
+            return;
+        }
+        runOnUiThread(() -> {
+            if (!isFinishing() && !isDestroyed()) {
+                finish();
+            }
+        });
+    }
+
+    private void reportHistoryAsync(int progress) {
+        CenterThreadPool.run(() -> {
+            if (playerData == null || playerData.mid == 0 || playerData.aid == 0) {
+                Logu.w("进度上报", "缺少必要参数，跳过上报");
+                return;
+            }
+            try {
+                HistoryApi.reportHistory(playerData.aid, playerData.cid, progress / 1000);
+            } catch (IOException e) {
+                Logu.e("进度上报", "上报失败：" + e.getMessage());
+            } catch (Exception e) {
+                Logu.e("进度上报", "上报异常：" + e.getMessage());
+            }
         });
     }
 }
