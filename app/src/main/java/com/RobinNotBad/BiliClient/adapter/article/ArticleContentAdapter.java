@@ -23,23 +23,79 @@ import com.RobinNotBad.BiliClient.model.ArticleInfo;
 import com.RobinNotBad.BiliClient.model.ArticleLine;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
 import com.RobinNotBad.BiliClient.util.GlideUtil;
+import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
 import com.RobinNotBad.BiliClient.util.ToolsUtil;
+import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.engine.GlideException;
 import com.bumptech.glide.load.resource.bitmap.RoundedCorners;
+import com.bumptech.glide.request.RequestListener;
 import com.bumptech.glide.request.RequestOptions;
+import com.bumptech.glide.request.target.Target;
+import com.bumptech.glide.signature.ObjectKey;
 import com.google.android.material.card.MaterialCardView;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 //文章内容Adapter by RobinNotBad
 
 public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAdapter.ArticleLineHolder> {
+
+    /**
+     * 专栏正文图的缓存签名版本。
+     */
+    private static final String ARTICLE_IMAGE_SIGNATURE = "LegacyArticleImageFix_v1";
+
+    /**
+     * 对同一压缩图请求做“刷新签名重试”。
+     */
+    private static final Map<String, Integer> REFRESH_IMAGE_REVISIONS = new ConcurrentHashMap<>();
+
+    /**
+     * 当压缩图多次重试仍解码成异常小图时，退回 baseUrl 原图链路。
+     */
+    private static final Set<String> BASE_FALLBACK_REQUESTS =
+            Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /**
+     * baseUrl 兜底链路本身失败时的重试计数。
+     */
+    private static final Map<String, Integer> BASE_FAIL_RETRY_COUNTS = new ConcurrentHashMap<>();
+
+    private static final int MAX_REFRESH_RETRY = 3;
+
+    private void scheduleImageReload(ArticleLineHolder holder, View reloadAnchor, String pendingKey, String logTag, int position, String req) {
+        holder.lastImageUrl = pendingKey;
+        reloadAnchor.post(() -> {
+            try {
+                if (!pendingKey.equals(holder.lastImageUrl)) {
+                    return;
+                }
+                int adapterPosition = holder.getAdapterPosition();
+                if (adapterPosition == RecyclerView.NO_POSITION) {
+                    return;
+                }
+                holder.lastImageUrl = null;
+                notifyItemChanged(adapterPosition);
+            } catch (Exception e) {
+                Logu.e("ArticleImage",
+                        logTag + " cv=" + articleInfo.id
+                                + ", pos=" + position
+                                + ", req=" + req
+                                + ", err=" + e.getMessage());
+            }
+        });
+    }
 
     final Activity context;
     final ArrayList<ArticleLine> article;
@@ -94,12 +150,198 @@ public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAd
                 if (line == null || line.content == null)
                     break;
 
-                String url = GlideUtil.url(line.content);
-                if (!url.equals(holder.lastImageUrl)) {
-                    holder.lastImageUrl = url;
-                    Glide.with(BiliTerminal.context).asDrawable().load(url).placeholder(R.mipmap.placeholder)
+                String rawUrl = line.content;
+                String baseUrl = GlideUtil.stripBfsTransform(rawUrl);
+                String requestUrl = GlideUtil.buildRequestUrl(rawUrl);
+                boolean baseFallbackVariant = requestUrl != null && !requestUrl.isEmpty()
+                        && BASE_FALLBACK_REQUESTS.contains(requestUrl)
+                        && baseUrl != null && !baseUrl.isEmpty();
+                int refreshRevision = !baseFallbackVariant && requestUrl != null && !requestUrl.isEmpty()
+                        ? Math.max(0, REFRESH_IMAGE_REVISIONS.getOrDefault(requestUrl, 0))
+                        : 0;
+                int baseFailRetryCount = baseFallbackVariant && requestUrl != null && !requestUrl.isEmpty()
+                        ? Math.max(0, BASE_FAIL_RETRY_COUNTS.getOrDefault(requestUrl, 0))
+                        : 0;
+                boolean refreshVariant = refreshRevision > 0;
+                final String effectiveUrl = baseFallbackVariant ? baseUrl : requestUrl;
+
+                if (!effectiveUrl.equals(holder.lastImageUrl)) {
+                    holder.lastImageUrl = effectiveUrl;
+
+                    Logu.w("ArticleImage",
+                            "legacy cv=" + articleInfo.id
+                                    + ", pos=" + realPosition
+                                    + ", raw=" + rawUrl
+                                    + ", base=" + baseUrl
+                                    + ", req=" + effectiveUrl
+                                    + ", baseFallbackVariant=" + baseFallbackVariant
+                                    + ", refreshRevision=" + refreshRevision
+                                    + ", baseFailRetryCount=" + baseFailRetryCount);
+
+                    com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> errorBuilder = null;
+                    if (baseUrl != null && !baseUrl.isEmpty() && !baseUrl.equals(effectiveUrl)) {
+                        errorBuilder = Glide.with(BiliTerminal.context)
+                                .asDrawable()
+                                .load(baseUrl)
+                                .signature(new ObjectKey(ARTICLE_IMAGE_SIGNATURE + ":base"));
+                    }
+
+                    com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> builder = Glide.with(BiliTerminal.context)
+                            .asDrawable()
+                            .load(effectiveUrl)
+                            .placeholder(R.mipmap.placeholder)
+                            .signature(new ObjectKey(ARTICLE_IMAGE_SIGNATURE
+                                    + (baseFallbackVariant
+                                    ? ":base:final:" + baseFailRetryCount
+                                    : (refreshVariant ? ":cmp:refresh:" + refreshRevision : ":cmp"))));
+
+                    if (refreshVariant || baseFallbackVariant) {
+                        builder = builder.skipMemoryCache(true);
+                    }
+
+                    if (errorBuilder != null) {
+                        builder = builder.error(errorBuilder);
+                    } else {
+                        builder = builder.error(R.mipmap.placeholder);
+                    }
+
+                    final String finalRequestUrl = requestUrl;
+                    final String finalBaseUrl = baseUrl;
+                    final int finalRefreshRevision = refreshRevision;
+                    final int finalBaseFailRetryCount = baseFailRetryCount;
+                    final boolean finalBaseFallbackVariant = baseFallbackVariant;
+                    builder.listener(new RequestListener<android.graphics.drawable.Drawable>() {
+                                @Override
+                                public boolean onLoadFailed(GlideException e, Object model, Target<android.graphics.drawable.Drawable> target, boolean isFirstResource) {
+                                    Logu.e("ArticleImage",
+                                            "LEGACY_FAIL cv=" + articleInfo.id
+                                                    + ", pos=" + realPosition
+                                                    + ", req=" + effectiveUrl
+                                                    + ", baseFallbackVariant=" + finalBaseFallbackVariant
+                                                    + ", refreshRevision=" + finalRefreshRevision
+                                                    + ", baseFailRetryCount=" + finalBaseFailRetryCount
+                                                    + ", err=" + (e == null ? "null" : e.getClass().getSimpleName() + ":" + e.getMessage()));
+
+                                    if (!finalBaseFallbackVariant && finalRequestUrl != null && !finalRequestUrl.isEmpty()) {
+                                        if (finalRefreshRevision < MAX_REFRESH_RETRY) {
+                                            int nextRevision = finalRefreshRevision + 1;
+                                            REFRESH_IMAGE_REVISIONS.put(finalRequestUrl, nextRevision);
+                                            Logu.w("ArticleImage",
+                                                    "LEGACY_FAIL_REFRESH cv=" + articleInfo.id
+                                                            + ", pos=" + realPosition
+                                                            + ", req=" + finalRequestUrl
+                                                            + ", nextRevision=" + nextRevision);
+                                            scheduleImageReload(holder, imageView,
+                                                    finalRequestUrl + "#fail-refresh-pending:" + nextRevision,
+                                                    "LEGACY_POST_FAIL_REFRESH_FAIL", realPosition, finalRequestUrl);
+                                            return true;
+                                        }
+
+                                        if (finalBaseUrl != null && !finalBaseUrl.isEmpty()) {
+                                            BASE_FALLBACK_REQUESTS.add(finalRequestUrl);
+                                            Logu.w("ArticleImage",
+                                                    "LEGACY_FAIL_SWITCH_BASE cv=" + articleInfo.id
+                                                            + ", pos=" + realPosition
+                                                            + ", req=" + finalRequestUrl
+                                                            + ", base=" + finalBaseUrl);
+                                            scheduleImageReload(holder, imageView,
+                                                    finalRequestUrl + "#fail-base-pending",
+                                                    "LEGACY_POST_FAIL_BASE_FAIL", realPosition, finalRequestUrl);
+                                            return true;
+                                        }
+                                    }
+
+                                    if (finalBaseFallbackVariant && finalRequestUrl != null && !finalRequestUrl.isEmpty()) {
+                                        int nextBaseRetryCount = finalBaseFailRetryCount + 1;
+                                        if (nextBaseRetryCount <= MAX_REFRESH_RETRY) {
+                                            BASE_FAIL_RETRY_COUNTS.put(finalRequestUrl, nextBaseRetryCount);
+                                            Logu.w("ArticleImage",
+                                                    "LEGACY_BASE_FAIL_RETRY cv=" + articleInfo.id
+                                                            + ", pos=" + realPosition
+                                                            + ", req=" + finalRequestUrl
+                                                            + ", base=" + finalBaseUrl
+                                                            + ", nextBaseRetryCount=" + nextBaseRetryCount);
+                                            scheduleImageReload(holder, imageView,
+                                                    finalRequestUrl + "#base-fail-retry-pending:" + nextBaseRetryCount,
+                                                    "LEGACY_POST_BASE_RETRY_FAIL", realPosition, finalRequestUrl);
+                                            return true;
+                                        }
+                                    }
+                                    return false;
+                                }
+
+                                @Override
+                                public boolean onResourceReady(android.graphics.drawable.Drawable resource, Object model, Target<android.graphics.drawable.Drawable> target, DataSource dataSource, boolean isFirstResource) {
+                                    int w = -1, h = -1;
+                                    try {
+                                        if (resource instanceof android.graphics.drawable.BitmapDrawable) {
+                                            android.graphics.Bitmap bm = ((android.graphics.drawable.BitmapDrawable) resource).getBitmap();
+                                            if (bm != null) {
+                                                w = bm.getWidth();
+                                                h = bm.getHeight();
+                                            }
+                                        }
+                                    } catch (Exception ignored) {
+                                    }
+
+                                    Logu.w("ArticleImage",
+                                            "LEGACY_OK cv=" + articleInfo.id
+                                                    + ", pos=" + realPosition
+                                                    + ", req=" + effectiveUrl
+                                                    + ", decoded=" + w + "x" + h
+                                                    + ", source=" + dataSource
+                                                    + ", baseFallbackVariant=" + finalBaseFallbackVariant
+                                                    + ", refreshRevision=" + finalRefreshRevision);
+
+                                    if (finalRequestUrl != null && !finalRequestUrl.isEmpty()) {
+                                        BASE_FAIL_RETRY_COUNTS.remove(finalRequestUrl);
+                                    }
+
+                                    boolean looksTiny = w > 0 && h > 0 && w <= 32 && h <= 32;
+                                    boolean canRetryMore = finalRefreshRevision < MAX_REFRESH_RETRY;
+                                    boolean shouldRefreshRetry = !finalBaseFallbackVariant && canRetryMore && looksTiny;
+                                    boolean shouldFinalBaseFallback = !finalBaseFallbackVariant
+                                            && !canRetryMore
+                                            && looksTiny
+                                            && finalBaseUrl != null && !finalBaseUrl.isEmpty();
+
+                                    if (shouldRefreshRetry) {
+                                        int nextRevision = finalRefreshRevision + 1;
+                                        REFRESH_IMAGE_REVISIONS.put(finalRequestUrl, nextRevision);
+                                        Logu.w("ArticleImage",
+                                                "LEGACY_TINY_REFRESH cv=" + articleInfo.id
+                                                        + ", pos=" + realPosition
+                                                        + ", tiny=" + w + "x" + h
+                                                        + ", retryReq=" + finalRequestUrl
+                                                        + ", nextRevision=" + nextRevision);
+
+                                        scheduleImageReload(holder, imageView,
+                                                finalRequestUrl + "#refresh-pending:" + nextRevision,
+                                                "LEGACY_POST_REFRESH_FAIL", realPosition, finalRequestUrl);
+                                        return true;
+                                    }
+
+                                    if (shouldFinalBaseFallback) {
+                                        BASE_FALLBACK_REQUESTS.add(finalRequestUrl);
+                                        Logu.w("ArticleImage",
+                                                "LEGACY_TINY_BASE_FALLBACK cv=" + articleInfo.id
+                                                        + ", pos=" + realPosition
+                                                        + ", tiny=" + w + "x" + h
+                                                        + ", fallbackBase=" + finalBaseUrl);
+
+                                        scheduleImageReload(holder, imageView,
+                                                finalRequestUrl + "#base-pending",
+                                                "LEGACY_POST_BASE_FAIL", realPosition, finalRequestUrl);
+                                        return true;
+                                    }
+
+                                    return false;
+                                }
+                            })
                             .transition(GlideUtil.getTransitionOptions())
-                            .diskCacheStrategy(DiskCacheStrategy.DATA)
+                            .diskCacheStrategy((refreshVariant || baseFallbackVariant)
+                                    ? DiskCacheStrategy.NONE
+                                    : DiskCacheStrategy.DATA)
                             .into(imageView);
                 }
 
@@ -107,7 +349,7 @@ public class ArticleContentAdapter extends RecyclerView.Adapter<ArticleContentAd
                     Intent intent = new Intent();
                     intent.setClass(context, ImageViewerActivity.class);
                     ArrayList<String> imageList = new ArrayList<>();
-                    imageList.add(url);
+                    imageList.add(rawUrl);
                     intent.putExtra("imageList", imageList);
                     context.startActivity(intent);
                 });

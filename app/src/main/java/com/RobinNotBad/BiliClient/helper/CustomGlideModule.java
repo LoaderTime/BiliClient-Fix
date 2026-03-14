@@ -49,71 +49,8 @@ public class CustomGlideModule extends AppGlideModule {
             NetWorkUtil.addHeaders(requestBuilder, headers);
             return chain.proceed(requestBuilder.build());
         });
-
-        // 防止弱网/异常返回导致“极小图片(如 5x5) 被写入磁盘缓存”，从而滚动复用时稳定变糊。
-        // 仅对我们拼接的 @0e_* 压缩请求生效，避免误伤站内小图标。
-        builder.addInterceptor(chain -> {
-            Request req = chain.request();
-            String url = req.url().toString();
-
-            Response resp = chain.proceed(req);
-
-            try {
-                // 只校验 BFS 图片 + 我们的压缩参数（专栏正文图用）
-                boolean isBfs = url.contains(".hdslb.com/bfs/") || url.contains("hdslb.com/bfs/");
-                boolean isCompressed = url.contains("@0e_");
-                if (!isBfs || !isCompressed) {
-                    return resp;
-                }
-
-                // 响应体为空直接返回
-                if (resp.body() == null) {
-                    return resp;
-                }
-
-                String contentType = resp.header("Content-Type", "");
-                long len = resp.body().contentLength();
-
-                // 非 image/* 直接视为失败（避免 HTML/JSON 被当图片缓存）
-                if (contentType != null && !contentType.isEmpty()) {
-                    String lower = contentType.toLowerCase();
-                    if (!lower.startsWith("image/")) {
-                        resp.close();
-                        throw new IOException("Non-image response for image url, contentType=" + contentType);
-                    }
-                }
-
-                // 对极小响应做拒绝：5x5 webp 通常 content-length 很小。
-                // 阈值取保守值（2KB），且仅对 @0e_ 压缩请求生效。
-                if (len > 0 && len < 2048) {
-                    Logu.w("ArticleImage", "Reject tiny image response: len=" + len + ", url=" + url);
-                    resp.close();
-                    throw new IOException("Tiny image response rejected, len=" + len);
-                }
-
-                // 某些场景 content-length 可能为 -1（chunked），此时用 peekBody 再兜底一次。
-                if (len < 0) {
-                    try {
-                        long peekBytes = resp.peekBody(2048).bytes().length;
-                        if (peekBytes > 0 && peekBytes < 2048) {
-                            Logu.w("ArticleImage", "Reject tiny image response(peek): len=-1, peek=" + peekBytes + ", url=" + url);
-                            resp.close();
-                            throw new IOException("Tiny image response rejected(peek), peek=" + peekBytes);
-                        }
-                    } catch (IOException e) {
-                        throw e;
-                    } catch (Exception ignored) {
-                    }
-                }
-            } catch (IOException e) {
-                // 继续抛出给 Glide，触发 error() 回退逻辑，并阻止写入缓存。
-                throw e;
-            } catch (Exception ignored) {
-                // 不影响正常加载
-            }
-
-            return resp;
-        });
+        // “专栏正文图的异常小图恢复”改为在专栏 Adapter 内部按场景处理，
+        // 避免在全局网络层误伤头像、封面等本来体积就很小的正常图片。
 
         // 修复 Android 4.x 上的 OkHttp 响应头解析兼容性问题
         // 在 Android 4.x 上，某些响应头值可能导致类型转换异常

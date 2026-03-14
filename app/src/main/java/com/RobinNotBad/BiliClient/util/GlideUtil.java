@@ -19,6 +19,51 @@ public class GlideUtil {
     public static final int MAX_W_HIGH = 1024;
     public static final int MAX_W_LOW = 512;
 
+    private static String normalizeImageUrl(String url) {
+        if (url == null || url.isEmpty()) return "";
+        String u = url.trim();
+        if (u.startsWith("//")) return "https:" + u;
+
+        String lower = u.toLowerCase();
+        boolean isBiliImageHost = lower.startsWith("http://")
+                && (lower.contains("hdslb.com/") || lower.contains("biliimg.com/"));
+        if (isBiliImageHost) return "https://" + u.substring("http://".length());
+
+        return u;
+    }
+
+    private static boolean isBfsImage(String url) {
+        if (url == null || url.isEmpty()) return false;
+        String lower = url.toLowerCase();
+        return lower.contains(".hdslb.com/bfs/") || lower.contains("hdslb.com/bfs/");
+    }
+
+    private static String buildSizedUrl(String url, int quality, int maxW) {
+        if (url == null || url.isEmpty()) return "";
+
+        String normalized = normalizeImageUrl(url);
+        String lower = normalized.toLowerCase();
+        if (!lower.startsWith("http") || lower.contains(".gif") || lower.contains("afdian") || lower.contains("afdiancdn.com"))
+            return normalized;
+
+        // 对 B 站 BFS 图统一先去掉服务端自带的 @... 变换（如 web-avatar.avif），
+        // 再按当前客户端可稳定解码的格式重新拼接，避免旧设备直接吃到 avif。
+        String requestBase = isBfsImage(normalized) ? stripBfsTransform(normalized) : normalized;
+        String requestLower = requestBase.toLowerCase();
+
+        if (SharedPreferencesUtil.getBoolean("image_request_jpg", false)) {
+            if (requestLower.endsWith("jpeg") || requestLower.endsWith("jpg")) return requestBase;
+            return requestBase + "@0e_"
+                    + quality + "q_"
+                    + maxW + "w.jpeg";
+        } else {
+            if (requestLower.endsWith("webp")) return requestBase;
+            return requestBase + "@0e_"
+                    + quality + "q_"
+                    + maxW + "w.webp";
+        }
+    }
+
     /**
      * 移除 B 站 BFS 图片 URL 自带的 "@..." 变换参数。
      * 
@@ -32,17 +77,14 @@ public class GlideUtil {
      */
     public static String stripBfsTransform(String url) {
         if (url == null || url.isEmpty()) return "";
-        // 统一协议，避免 //i0.hdslb.com 这种情况
-        String u = url;
-        if (u.startsWith("//")) u = "https:" + u;
+        String u = normalizeImageUrl(url);
 
         // 仅处理 BFS 图片（避免误删 afdiancdn / 其他带 @ 的链接）
         String lower = u.toLowerCase();
-        boolean isBfs = (lower.contains(".hdslb.com/bfs/") || lower.contains("hdslb.com/bfs/"));
-        if (!isBfs) return u;
+        if (!isBfsImage(u)) return u;
 
         // gif 不做处理（gif 经常带参数）
-        if (lower.endsWith(".gif")) return u;
+        if (lower.contains(".gif")) return u;
 
         int at = u.indexOf('@');
         if (at <= 0) return u;
@@ -90,41 +132,11 @@ public class GlideUtil {
     }
 
     public static String url(String url) {
-        if (url == null || url.isEmpty()) return "";
-        if (!url.startsWith("http") || url.endsWith("gif") || url.contains("@") || url.contains("afdian"))
-            return url;
-        if (SharedPreferencesUtil.getBoolean("image_request_jpg", false)) {
-            if (url.endsWith("jpeg") || url.endsWith("jpg")) return url;
-            return url + "@0e_"
-                    + QUALITY_LOW + "q_"
-                    //+ MAX_H_LOW + "h_"
-                    + MAX_W_LOW + "w.jpeg";
-        } else {
-            if (url.endsWith("webp")) return url;
-            return url + "@0e_"
-                    + QUALITY_LOW + "q_"
-                    //+ MAX_H_LOW + "h_"
-                    + MAX_W_LOW + "w.webp";
-        }
+        return buildSizedUrl(url, QUALITY_LOW, MAX_W_LOW);
     }
 
     public static String url_hq(String url) {
-        if (url == null || url.isEmpty()) return "";
-        if (!url.startsWith("http") || url.endsWith("gif") || url.contains("@") || url.contains("afdiancdn.com"))
-            return url;
-        if (SharedPreferencesUtil.getBoolean("image_request_jpg", false)) {
-            if (url.endsWith("jpeg") || url.endsWith("jpg")) return url;
-            return url + "@0e_"
-                    + QUALITY_HIGH + "q_"
-                    //+ MAX_H_HIGH + "h_"
-                    + MAX_W_HIGH + "w.jpeg";
-        } else {
-            if (url.endsWith("webp")) return url;
-            return url + "@0e_"
-                    + QUALITY_HIGH + "q_"
-                    //+ MAX_H_HIGH + "h_"
-                    + MAX_W_HIGH + "w.webp";
-        }
+        return buildSizedUrl(url, QUALITY_HIGH, MAX_W_HIGH);
     }
 
     public static void request(ImageView view, String url, int placeholder) {
