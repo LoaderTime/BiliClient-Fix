@@ -135,10 +135,38 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final long DANMAKU_WATCHDOG_INTERVAL_MS = 2000L;
     /** 连续判定“弹幕时间轴不前进”的次数阈值（2 次=约 4 秒） */
     private static final int DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT = 2;
+    /** watchdog 软恢复后，短时间内再次卡住则升级为硬恢复 */
+    private static final long DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS = 8000L;
     private Runnable danmakuWatchdogRunnable;
     private long lastWatchdogVideoPos = -1L;
     private long lastWatchdogDanmakuTime = -1L;
     private int danmakuWatchdogStuckCount = 0;
+    private long lastDanmakuWatchdogRecoverUptimeMs = 0L;
+    private boolean lastDanmakuWatchdogRecoverWasSoft = false;
+
+    /**
+     * 由播放器侧维护的“最新播放位置”缓存。
+     * <p>
+     * 目的：避免在 DFM 的 updateTimer 线程里高频直接调用 ijkPlayer.getCurrentPosition()，
+     * 参考 PiliPlus 的“播放器位置驱动弹幕”思路，改为由播放器侧推送/缓存位置，弹幕线程只消费缓存。
+     */
+    private volatile long latestPlayerPositionMs = 0L;
+    private volatile long latestPlayerPositionUptimeMs = 0L;
+
+    /** 当前弹幕源缓存，供 watchdog 硬恢复时直接重建弹幕会话使用 */
+    private volatile String currentDanmakuFilePath;
+    private volatile java.util.List<DmSegMobileReply> currentDanmakuSegments;
+    private volatile int currentDanmakuSourceSessionId = -1;
+    private volatile long currentDanmakuSourceCid = -1L;
+    private volatile int currentDanmakuPreparedSessionId = -1;
+    private volatile int currentDanmakuPreparedPrepareSeq = -1;
+
+    /** watchdog 硬恢复时，在新弹幕 prepare 完成后自动 start/seek 到当前位置 */
+    private volatile boolean pendingDanmakuRestartAfterPrepare = false;
+    private volatile long pendingDanmakuRestartPositionMs = 0L;
+    private volatile int pendingDanmakuRestartSessionId = -1;
+    private volatile int pendingDanmakuRestartPrepareSeq = -1;
+    private volatile boolean pendingDanmakuRestartVisible = true;
 
     /**
      * ijkPlayer.getCurrentPosition() 在部分设备/网络流上可能出现轻微“回跳”，会导致弹幕时间轴倒退，从而产生视觉抖动。
@@ -437,6 +465,236 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
     }
 
+    private void updateLatestPlayerPosition(long positionMs) {
+        latestPlayerPositionMs = Math.max(0L, positionMs);
+        latestPlayerPositionUptimeMs = android.os.SystemClock.uptimeMillis();
+        if (pendingDanmakuRestartAfterPrepare && pendingDanmakuRestartSessionId == playerSessionId) {
+            pendingDanmakuRestartPositionMs = latestPlayerPositionMs;
+        }
+    }
+
+    private long getLatestPlayerPositionForDanmaku() {
+        long cached = Math.max(0L, latestPlayerPositionMs);
+        long cachedAt = latestPlayerPositionUptimeMs;
+        if (cachedAt > 0L) {
+            long age = android.os.SystemClock.uptimeMillis() - cachedAt;
+            if (age <= 1500L) {
+                return cached;
+            }
+        }
+        if (seekbar_progress != null) {
+            try {
+                return Math.max(cached, seekbar_progress.getProgress());
+            } catch (Exception ignore) {
+            }
+        }
+        return cached;
+    }
+
+    private void cacheCurrentDanmakuSource(String danmakuFile,
+                                           java.util.List<DmSegMobileReply> protobufSegments) {
+        if (protobufSegments != null && !protobufSegments.isEmpty()) {
+            currentDanmakuFilePath = null;
+            currentDanmakuSegments = new ArrayList<>(protobufSegments);
+            currentDanmakuSourceSessionId = playerSessionId;
+            currentDanmakuSourceCid = cid;
+            return;
+        }
+
+        if (danmakuFile != null && !danmakuFile.isEmpty()) {
+            currentDanmakuFilePath = danmakuFile;
+            currentDanmakuSegments = null;
+            currentDanmakuSourceSessionId = playerSessionId;
+            currentDanmakuSourceCid = cid;
+            return;
+        }
+        // 非直播场景下，若本次传入的是“空源”，保留上一次有效弹幕源。
+        // 这样 watchdog 硬恢复时不会因为一次空调用把可重建数据冲掉。
+    }
+
+    private void resetDanmakuPreparedState() {
+        currentDanmakuPreparedSessionId = -1;
+        currentDanmakuPreparedPrepareSeq = -1;
+    }
+
+    private void markDanmakuPrepared(int session, int seq) {
+        currentDanmakuPreparedSessionId = session;
+        currentDanmakuPreparedPrepareSeq = seq;
+    }
+
+    private boolean isCurrentDanmakuPrepared() {
+        if (currentDanmakuPreparedSessionId != playerSessionId)
+            return false;
+        if (currentDanmakuPreparedPrepareSeq != danmakuPrepareSeq.get())
+            return false;
+        if (mDanmakuView == null)
+            return false;
+        try {
+            return mDanmakuView.isPrepared();
+        } catch (Exception ignore) {
+            return false;
+        }
+    }
+
+    private boolean isCurrentDanmakuSourceAvailable() {
+        if (currentDanmakuSourceSessionId != playerSessionId)
+            return false;
+        if (currentDanmakuSourceCid != cid)
+            return false;
+        boolean hasFile = false;
+        if (currentDanmakuFilePath != null && !currentDanmakuFilePath.isEmpty()) {
+            try {
+                hasFile = new File(currentDanmakuFilePath).exists();
+            } catch (Exception ignore) {
+            }
+        }
+        boolean hasSegments = currentDanmakuSegments != null && !currentDanmakuSegments.isEmpty();
+        return hasFile || hasSegments;
+    }
+
+    private void clearDanmakuRecoveryState() {
+        pendingDanmakuRestartAfterPrepare = false;
+        pendingDanmakuRestartPositionMs = 0L;
+        pendingDanmakuRestartSessionId = -1;
+        pendingDanmakuRestartPrepareSeq = -1;
+        pendingDanmakuRestartVisible = true;
+        lastDanmakuWatchdogRecoverUptimeMs = 0L;
+        lastDanmakuWatchdogRecoverWasSoft = false;
+    }
+
+    private void performDanmakuSoftRecovery(long positionMs, @NonNull String reason) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> performDanmakuSoftRecovery(positionMs, reason));
+            return;
+        }
+        if (destroyed || resourcesReleased || mDanmakuView == null)
+            return;
+        if (!isDanmakuVisible)
+            return;
+
+        long target = Math.max(0L, positionMs);
+        try {
+            // 重要：这里显式模拟“用户关再开一次弹幕”。
+            // 仅 showAndResumeDrawTask(position) 在 handler 仍处于 visible=true 时可能被 DrawHandler 直接短路，
+            // 无法真正触发 RESUME，因此必须先 hide 再 show。
+            mDanmakuView.hideAndPauseDrawTask();
+        } catch (Exception ignore) {
+        }
+        try {
+            mDanmakuView.showAndResumeDrawTask(target);
+        } catch (Exception ignore) {
+        }
+        if (!isPlaying) {
+            try {
+                mDanmakuView.pause();
+            } catch (Exception ignore) {
+            }
+        }
+        Logu.w("danmaku", "watchdog soft recover: reason=" + reason + ", pos=" + target);
+    }
+
+    private void requestDanmakuHardRecovery(long positionMs, @NonNull String reason) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> requestDanmakuHardRecovery(positionMs, reason));
+            return;
+        }
+        if (destroyed || resourcesReleased || isLiveMode || !hasDanmaku || mDanmakuView == null)
+            return;
+
+        if (!isCurrentDanmakuPrepared()) {
+            Logu.w("danmaku", "watchdog hard recover skipped: danmaku not ready in current session, reason=" + reason);
+            return;
+        }
+
+        if (!isCurrentDanmakuSourceAvailable()) {
+            Logu.w("danmaku", "watchdog hard recover skipped: source not match current session/cid, reason="
+                    + reason + ", sourceSession=" + currentDanmakuSourceSessionId
+                    + ", playerSession=" + playerSessionId
+                    + ", sourceCid=" + currentDanmakuSourceCid + ", cid=" + cid);
+            performDanmakuSoftRecovery(positionMs, reason + "-fallbackSoft");
+            return;
+        }
+
+        final String cachedFile = currentDanmakuFilePath;
+        final java.util.List<DmSegMobileReply> cachedSegments = currentDanmakuSegments;
+        final boolean hasCachedFile = cachedFile != null && !cachedFile.isEmpty() && new File(cachedFile).exists();
+        final boolean hasCachedSegments = cachedSegments != null && !cachedSegments.isEmpty();
+
+        if (!hasCachedFile && !hasCachedSegments) {
+            Logu.w("danmaku", "watchdog hard recover skipped: no cached source, reason=" + reason);
+            performDanmakuSoftRecovery(positionMs, reason + "-fallbackSoft");
+            return;
+        }
+
+        pendingDanmakuRestartAfterPrepare = true;
+        pendingDanmakuRestartPositionMs = Math.max(0L, positionMs);
+        pendingDanmakuRestartSessionId = playerSessionId;
+        pendingDanmakuRestartVisible = isDanmakuVisible;
+        Logu.w("danmaku", "watchdog hard recover: reason=" + reason + ", pos="
+                + pendingDanmakuRestartPositionMs + ", source="
+                + (hasCachedSegments ? "protobuf" : "file"));
+
+        streamDanmaku(hasCachedSegments ? null : cachedFile,
+                hasCachedSegments ? cachedSegments : null,
+                playerSessionId,
+                danmakuPrepareSeq.incrementAndGet(),
+                true,
+                true);
+    }
+
+    private void handleDanmakuPrepared(int session, int seq, boolean isProtobuf) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread(() -> handleDanmakuPrepared(session, seq, isProtobuf));
+            return;
+        }
+        if (!isDanmakuRequestValid(session, seq) || mDanmakuView == null)
+            return;
+
+        try {
+            mDanmakuView.setSpeed(getPlaybackSpeed());
+        } catch (Exception ignore) {
+        }
+
+        if (!pendingDanmakuRestartAfterPrepare)
+            return;
+        if (session != pendingDanmakuRestartSessionId || seq != pendingDanmakuRestartPrepareSeq)
+            return;
+
+        long target = Math.max(0L, pendingDanmakuRestartPositionMs);
+        boolean shouldShow = pendingDanmakuRestartVisible && isDanmakuVisible;
+        pendingDanmakuRestartAfterPrepare = false;
+        pendingDanmakuRestartPositionMs = 0L;
+        pendingDanmakuRestartSessionId = -1;
+        pendingDanmakuRestartPrepareSeq = -1;
+        pendingDanmakuRestartVisible = true;
+
+        try {
+            mDanmakuView.start(target);
+        } catch (Exception e) {
+            Logu.w("danmaku", "hard recover start failed: " + e.getMessage());
+            try {
+                mDanmakuView.resume();
+            } catch (Exception ignore) {
+            }
+        }
+
+        if (shouldShow) {
+            applyDanmakuVisibility(true, "hardRecoverPrepared");
+        } else {
+            try {
+                mDanmakuView.hideAndPauseDrawTask();
+            } catch (Exception ignore) {
+            }
+        }
+        if (!isPlaying) {
+            try {
+                mDanmakuView.pause();
+            } catch (Exception ignore) {
+            }
+        }
+        Logu.d("danmaku", "hard recover prepared: pos=" + target + ", protobuf=" + isProtobuf);
+    }
+
     private boolean finishWatching = false;
     private boolean loop_enabled;
     private boolean auto_next_enabled = false;
@@ -526,6 +784,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
         if (progress_history < 0L)
             progress_history = 0L;
+        updateLatestPlayerPosition(progress_history);
         Logu.d("history", String.valueOf(progress_history));
 
         isLiveMode = intent.getBooleanExtra("live_mode", false);
@@ -2360,6 +2619,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 } catch (Exception ignore) {
                 }
             }
+            syncProgressUiFromPlayer(target);
             Logu.d("进度跳转", String.valueOf(target));
         } else if (!isLiveMode && pendingForcedSeekMs >= 0L) {
             final long target = pendingForcedSeekMs;
@@ -2375,6 +2635,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 } catch (Exception ignore) {
                 }
             }
+            syncProgressUiFromPlayer(target);
             Logu.d("进度跳转", "forced=" + target);
         } else if (shouldRestoreFromLastPosition()) {
             // progress_history 统一为毫秒；保持旧行为“超过 5 秒才跳转”。
@@ -2383,6 +2644,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             if (hasDanmaku && mDanmakuView != null) {
                 mDanmakuView.seekTo(progress_history);
             }
+            syncProgressUiFromPlayer(progress_history);
             Logu.d("进度跳转", String.valueOf(progress_history));
             runOnUiThread(() -> MsgUtil.showMsg("已从上次的位置播放"));
         }
@@ -2535,9 +2797,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     try {
                         pos = (int) p.getCurrentPosition();
                     } catch (Exception ignore) {
-                        return;
+                        pos = (int) getLatestPlayerPositionForDanmaku();
+                        if (pos <= 0)
+                            return;
                     }
                     video_now = pos;
+                    updateLatestPlayerPosition(pos);
 
                     // 兜底：部分设备/本地文件场景可能收不到 MEDIA_INFO_VIDEO_RENDERING_START，
                     // 导致 loading 一直不消失。若检测到进度已在前进，则认为画面应已恢复（至少不应无限 loading）。
@@ -2911,6 +3176,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         Logu.v("danmaku", "resetDanmakuBeforePrepare: " + reason);
+        resetDanmakuPreparedState();
 
         // 1) 先断开 callback，避免旧 handler 回调链继续强引用 Activity
         if (mDanmakuView != null) {
@@ -2952,9 +3218,30 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void streamDanmaku(String danmakuFile, java.util.List<DmSegMobileReply> protobufSegments) {
-        // C：会话防护 + 幂等序列（同一 session 内多次刷新取最后一次）
-        final int session = playerSessionId;
-        final int seq = danmakuPrepareSeq.incrementAndGet();
+        // 普通 stream 请求会覆盖之前待完成的硬恢复语义，避免后来的外部调用被误当成“硬恢复完成”。
+        pendingDanmakuRestartAfterPrepare = false;
+        pendingDanmakuRestartSessionId = -1;
+        pendingDanmakuRestartPrepareSeq = -1;
+        pendingDanmakuRestartVisible = true;
+        resetDanmakuPreparedState();
+        streamDanmaku(danmakuFile, protobufSegments, playerSessionId,
+                danmakuPrepareSeq.incrementAndGet(), true, false);
+    }
+
+    private void streamDanmaku(String danmakuFile,
+                               java.util.List<DmSegMobileReply> protobufSegments,
+                               int session,
+                               int seq,
+                               boolean cacheSource,
+                               boolean fromHardRecovery) {
+        if (cacheSource) {
+            cacheCurrentDanmakuSource(danmakuFile, protobufSegments);
+        }
+        if (fromHardRecovery) {
+            pendingDanmakuRestartSessionId = session;
+            pendingDanmakuRestartPrepareSeq = seq;
+        }
+        resetDanmakuPreparedState();
 
         if (Looper.myLooper() != Looper.getMainLooper()) {
             runOnUiThread(() -> streamDanmakuOnMainThread(danmakuFile, protobufSegments, session, seq));
@@ -3062,9 +3349,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             PlayerActivity a = a();
             if (a == null || !a.isDanmakuRequestValid(session, seq))
                 return;
+            a.markDanmakuPrepared(session, seq);
             Logu.v("danmaku", "prepared");
             String msg = isProtobuf ? "弹幕君准备完毕～(是新来的哦～)" : "弹幕君准备完毕～(*≧ω≦)";
             a.addDanmaku(msg, Color.WHITE);
+            a.handleDanmakuPrepared(session, seq, isProtobuf);
         }
 
         @Override
@@ -3076,13 +3365,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             IjkMediaPlayer p = a.ijkPlayer;
             if (p == null || !a.isPrepared)
                 return;
-            long currentPos;
-            try {
-                currentPos = p.getCurrentPosition();
-            } catch (Exception ignore) {
-                return;
-            }
-            currentPos = Math.max(0L, currentPos);
+            long currentPos = a.getLatestPlayerPositionForDanmaku();
 
             // 允许“显式 seek”后短窗口内时间轴回退（不做钳制），避免 seek 后弹幕短暂冻结。
             long nowUptime = android.os.SystemClock.uptimeMillis();
@@ -3567,6 +3850,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cancelLocalSeekVerify();
         cancelBackgroundSurfaceRestore();
         cancelFrameLoadingMinShowGuard();
+        clearDanmakuRecoveryState();
         try {
             if (progressTimer != null) {
                 progressTimer.cancel();
@@ -4129,6 +4413,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             }
             // 同步标记：允许弹幕时间轴在短窗口内回退，防止“回跳钳制”影响正常 seek。
             markExplicitSeek(target);
+            updateLatestPlayerPosition(target);
+            syncProgressUiFromPlayer(target);
 
             // 仅对本地/缓存视频做 seek 落点校验，在线流不启用（避免多次 seek 触发额外缓冲）。
             if (!isLiveMode && !isOnlineVideo && !isAudioOnlyMode) {
@@ -4140,7 +4426,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private long safeGetPlayerPositionMs() {
         try {
             if (ijkPlayer != null && isPrepared) {
-                return Math.max(0L, ijkPlayer.getCurrentPosition());
+                long pos = Math.max(0L, ijkPlayer.getCurrentPosition());
+                updateLatestPlayerPosition(pos);
+                return pos;
             }
         } catch (Exception ignore) {
         }
@@ -4149,6 +4437,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
     private void syncProgressUiFromPlayer(long positionMs) {
         int progress = (int) Math.max(0L, positionMs);
+        updateLatestPlayerPosition(progress);
         try {
             if (seekbar_progress != null) {
                 seekbar_progress.setProgress(progress);
@@ -4235,6 +4524,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (!hasDanmaku && !isLiveMode)
             return;
 
+        // 硬恢复 prepare 尚未完成时，不让外部 show 调用把半初始化状态的弹幕层再次拉起。
+        // 但 hide 仍然允许，以便用户在恢复期关闭弹幕。
+        if (pendingDanmakuRestartAfterPrepare && visible && !"hardRecoverPrepared".equals(reason)) {
+            return;
+        }
+
         try {
             if (!visible) {
                 mDanmakuView.hideAndPauseDrawTask();
@@ -4269,6 +4564,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastWatchdogVideoPos = -1L;
         lastWatchdogDanmakuTime = -1L;
         danmakuWatchdogStuckCount = 0;
+        lastDanmakuWatchdogRecoverUptimeMs = 0L;
+        lastDanmakuWatchdogRecoverWasSoft = false;
 
         danmakuWatchdogRunnable = new Runnable() {
             @Override
@@ -4290,17 +4587,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
                 // 弹幕未 prepare 时不判断（等待正常 prepare 完成）
-                try {
-                    if (!mDanmakuView.isPrepared()) {
-                        mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
-                        return;
-                    }
-                } catch (Exception ignore) {
+                if (!isCurrentDanmakuPrepared()) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
                     return;
                 }
 
-                final long videoPos = safeGetPlayerPositionMs();
+                final long videoPos = getLatestPlayerPositionForDanmaku();
                 long dmTime;
                 try {
                     dmTime = mDanmakuView.getCurrentTime();
@@ -4326,9 +4618,22 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 }
 
                 if (viewPaused || danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT) {
+                    long now = android.os.SystemClock.uptimeMillis();
+                    boolean hardRecover = lastDanmakuWatchdogRecoverWasSoft
+                            && now - lastDanmakuWatchdogRecoverUptimeMs <= DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS;
+
                     Logu.w("danmaku", "watchdog recover: videoPos=" + videoPos + ", dmTime=" + dmTime
-                            + ", paused=" + viewPaused + ", stuckCount=" + danmakuWatchdogStuckCount);
-                    applyDanmakuVisibility(true, "watchdog");
+                            + ", paused=" + viewPaused + ", stuckCount=" + danmakuWatchdogStuckCount
+                            + ", hard=" + hardRecover);
+
+                    if (hardRecover) {
+                        requestDanmakuHardRecovery(videoPos, "watchdogHard");
+                        lastDanmakuWatchdogRecoverWasSoft = false;
+                    } else {
+                        performDanmakuSoftRecovery(videoPos, "watchdogSoft");
+                        lastDanmakuWatchdogRecoverWasSoft = true;
+                    }
+                    lastDanmakuWatchdogRecoverUptimeMs = now;
                     danmakuWatchdogStuckCount = 0;
                 }
 
@@ -4352,6 +4657,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastWatchdogVideoPos = -1L;
         lastWatchdogDanmakuTime = -1L;
         danmakuWatchdogStuckCount = 0;
+        lastDanmakuWatchdogRecoverUptimeMs = 0L;
+        lastDanmakuWatchdogRecoverWasSoft = false;
     }
 
     private void toggleAudioOnlyMode() {
