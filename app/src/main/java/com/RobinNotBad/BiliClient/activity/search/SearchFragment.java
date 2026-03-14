@@ -51,15 +51,20 @@ public class SearchFragment extends Fragment {
             @Override
             public void onScrollStateChanged(@NonNull RecyclerView recyclerView, int newState) {
                 super.onScrollStateChanged(recyclerView, newState);
-                if (newState != RecyclerView.SCROLL_STATE_DRAGGING) return;
-
-                if (!recyclerView.canScrollVertically(-1)) {
-                    if (requireActivity() instanceof SearchActivity) {
-                        SearchActivity activity = (SearchActivity) requireActivity();  //不能向上滚动了就显示搜索栏
-                        activity.onScrolled(-114);
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                    if (!recyclerView.canScrollVertically(-1)) {
+                        if (requireActivity() instanceof SearchActivity) {
+                            SearchActivity activity = (SearchActivity) requireActivity();  //不能向上滚动了就显示搜索栏
+                            activity.onScrolled(-114);
+                        }
+                    } else if (listener != null && !recyclerView.canScrollVertically(1) && !swipeRefreshLayout.isRefreshing() && !bottom) {
+                        goOnLoad();
                     }
-                } else if (listener != null && !recyclerView.canScrollVertically(1) && !swipeRefreshLayout.isRefreshing() && !bottom) {
-                    goOnLoad();
+                } else if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                    // 滚动/惯性完全停止后再恢复焦点，避免滚动过程中抢焦点导致 fling 被打断。
+                    if (isAdded() && requireActivity() instanceof SearchActivity) {
+                        ((SearchActivity) requireActivity()).requestFocusAfterScrollStopped();
+                    }
                 }
             }
 
@@ -74,11 +79,12 @@ public class SearchFragment extends Fragment {
                     if (lastItemPosition >= (itemCount - 3) && dy > 0 && !swipeRefreshLayout.isRefreshing() && !bottom) {// 滑动到倒数第三个就可以刷新了
                         goOnLoad();
                     }
+                }
 
-                    if (requireActivity() instanceof SearchActivity) {
-                        SearchActivity activity = (SearchActivity) requireActivity();
-                        activity.onScrolled(dy);
-                    }
+                // 控制搜索栏显示/隐藏不应依赖分页加载 listener 是否存在。
+                if (requireActivity() instanceof SearchActivity) {
+                    SearchActivity activity = (SearchActivity) requireActivity();
+                    activity.onScrolled(dy);
                 }
             }
         });

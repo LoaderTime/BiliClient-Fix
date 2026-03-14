@@ -54,6 +54,18 @@ public class SearchActivity extends InstanceActivity {
     private boolean refreshing = false;
     private long animate_last;
     Handler handler;
+
+    /**
+     * 延迟隐藏搜索栏的任务。
+     * 必须可取消：否则在快速“隐藏->显示”过程中，旧的 runnable 会在 200ms 后把已显示的搜索栏再次 GONE，
+     * 造成“消失且无法恢复”的状态错乱。
+     */
+    private final Runnable hideSearchBarRunnable = () -> {
+        // 只有仍处于隐藏状态时，才真正设为 GONE，避免 race condition
+        if (!searchBarVisible && searchBar != null) {
+            searchBar.setVisibility(View.GONE);
+        }
+    };
     ArrayList<String> searchHistory;
     ArrayList<String> searchSuggestions;
     private Runnable suggestionRunnable;
@@ -397,6 +409,11 @@ public class SearchActivity extends InstanceActivity {
     }
 
     public void onScrolled(int dy) {
+        if (searchBar == null || handler == null) return;
+
+        // 统一取消延迟隐藏任务，避免快速上下滑时出现“显示了但又被旧任务 GONE”的问题
+        handler.removeCallbacks(hideSearchBarRunnable);
+
         float height = searchBar.getHeight() + ToolsUtil.dp2px(2f);
 
         if (System.currentTimeMillis() - animate_last > 200) {
@@ -404,20 +421,29 @@ public class SearchActivity extends InstanceActivity {
                 animate_last = System.currentTimeMillis();
                 this.searchBarVisible = false;
                 @SuppressLint("ObjectAnimatorBinding")
-                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", 0, -height);
+                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", searchBar.getTranslationY(), -height);
+                animator.setDuration(200);
                 animator.start();
-                handler.postDelayed(() -> searchBar.setVisibility(View.GONE), 200);
+                // 延迟在动画结束后隐藏（并带状态判断）
+                handler.postDelayed(hideSearchBarRunnable, 220);
             }
             if (dy < -1 && !searchBarVisible) {
                 animate_last = System.currentTimeMillis();
                 this.searchBarVisible = true;
                 searchBar.setVisibility(View.VISIBLE);
                 @SuppressLint("ObjectAnimatorBinding")
-                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", -height, 0);
+                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", searchBar.getTranslationY(), 0);
+                animator.setDuration(200);
                 animator.start();
             }
         }
+    }
 
+    /**
+     * 供 Fragment 在 RecyclerView 滚动/惯性结束后调用，用于恢复列表焦点。
+     * 不要在 onScrolled 每帧调用，否则会打断 RecyclerView 的 fling。
+     */
+    public void requestFocusAfterScrollStopped() {
         requestFragmentFocus();
     }
 
@@ -425,12 +451,15 @@ public class SearchActivity extends InstanceActivity {
         Fragment fragmentCurr = getSupportFragmentManager()
                 .findFragmentByTag("f" + viewPager.getCurrentItem());
         if (fragmentCurr != null) {
-            ((SearchFragment) fragmentCurr).refresh();
             if (fragmentCurr.getView() != null) {
                 View recyclerView = fragmentCurr.getView().findViewById(R.id.recyclerView);
-                recyclerView.setFocusable(true);
-                recyclerView.setFocusableInTouchMode(true);
-                recyclerView.requestFocus();
+                // 避免滚动过程中频繁抢焦点导致 RecyclerView fling 被打断；
+                // 仅在需要时（比如切 tab 或滚动停止后）再恢复焦点。
+                if (recyclerView != null && !recyclerView.hasFocus()) {
+                    recyclerView.setFocusable(true);
+                    recyclerView.setFocusableInTouchMode(true);
+                    recyclerView.requestFocus();
+                }
             }
         }
     }
