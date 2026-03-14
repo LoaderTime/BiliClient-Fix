@@ -17,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView;
 
 import com.RobinNotBad.BiliClient.R;
 import com.RobinNotBad.BiliClient.model.SettingSection;
+import com.RobinNotBad.BiliClient.util.FileUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 
@@ -134,10 +135,18 @@ public class SettingsAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolde
                 desc.setVisibility(View.VISIBLE);
             }
             switchMaterial.setText(settingSection.name);
-            switchMaterial.setOnCheckedChangeListener(
-                    (buttonView, isChecked) -> SharedPreferencesUtil.putBoolean(settingSection.id, isChecked));
-            switchMaterial.setChecked(SharedPreferencesUtil.getBoolean(settingSection.id,
-                    Boolean.parseBoolean(settingSection.defaultValue)));
+
+            boolean checked = SharedPreferencesUtil.getBoolean(settingSection.id,
+                    Boolean.parseBoolean(settingSection.defaultValue));
+            switchMaterial.setOnCheckedChangeListener(null);
+            switchMaterial.setChecked(checked);
+            switchMaterial.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                SharedPreferencesUtil.putBoolean(settingSection.id, isChecked);
+
+                if ("save_ban_gallery".equals(settingSection.id)) {
+                    FileUtil.syncVideoDownloadNomedia();
+                }
+            });
         }
     }
 

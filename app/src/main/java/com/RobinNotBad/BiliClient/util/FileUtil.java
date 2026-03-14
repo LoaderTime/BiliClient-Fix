@@ -31,6 +31,30 @@ public class FileUtil {
         Log.e("debug", "清除了缓存");
     }
 
+    public static void syncVideoDownloadNomedia() {
+        syncVideoDownloadNomedia(new File(SharedPreferencesUtil.getString("save_path_video",
+                Environment.getExternalStorageDirectory() + "/Android/media/" + BiliTerminal.context.getPackageName() + "/")));
+    }
+
+    public static void syncVideoDownloadNomedia(File path) {
+        if (path == null) return;
+
+        try {
+            boolean banGallery = SharedPreferencesUtil.getBoolean("save_ban_gallery", true);
+            File nomedia = new File(path, ".nomedia");
+
+            if (banGallery) {
+                if (!path.exists() && !path.mkdirs())
+                    return;
+                if (!nomedia.exists())
+                    nomedia.createNewFile();
+            } else if (nomedia.exists()) {
+                nomedia.delete();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     public static void deleteFolder(File folder) {
         if (!folder.exists()) return;
 
@@ -92,13 +116,7 @@ public class FileUtil {
         File path = new File(SharedPreferencesUtil.getString("save_path_video",
                 Environment.getExternalStorageDirectory() + "/Android/media/" + BiliTerminal.context.getPackageName() + "/"));
 
-        try {
-            File nomedia = new File(path, ".nomedia");
-            if (SharedPreferencesUtil.getBoolean("save_ban_gallery", true) && !nomedia.exists())
-                nomedia.createNewFile();
-            else if (nomedia.exists()) nomedia.delete();
-        } catch (Exception ignored) {
-        }
+        syncVideoDownloadNomedia(path);
         return path;
     }
 
