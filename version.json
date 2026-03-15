@@ -1,0 +1,12 @@
+{
+    "tag_name": "release-21",
+    "name": "release-21",
+    "body": "",
+    "published_at": "",
+    "assets": [
+        {
+            "name": "app-debug.apk",
+            "browser_download_url": "https://github.com/LoaderTime/BiliClient-Fix/releases/download/release-21/app-debug.apk"
+        }
+    ]
+}

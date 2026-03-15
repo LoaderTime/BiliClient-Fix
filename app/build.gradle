@@ -11,6 +11,12 @@ configurations.all {
 
 int betaVer = 0 //如果为0则是正式版
 
+// 用于“检查更新”的构建标记：由外部通过 -Ptag=release-20 注入。
+// - debug/release 均生效
+// - 默认值为 dev
+def gitTag = project.hasProperty("tag") ? String.valueOf(project.property("tag")) : "dev"
+def hasGitTagProp = project.hasProperty("tag")
+
 android {
 
     namespace 'com.RobinNotBad.BiliClient'
@@ -34,6 +40,9 @@ android {
         versionCode 20260125
         versionName "2.9.5-fix"
 
+        // 当前 APK 对应的 release tag（用于更新判断；不依赖 versionCode/versionName）
+        buildConfigField "String", "GIT_TAG", "\"${gitTag}\""
+
         if (betaVer) {
             versionName += "-BETA" + betaVer
         }
@@ -46,6 +55,39 @@ android {
         }
 
         resConfigs 'zh'
+    }
+
+    // （可选）当通过 -Ptag=... 构建时，生成/更新根目录 version.json，供 jsDelivr 备用源使用。
+    // 注意：该 task 只负责写入文件，不会自动提交到 Git。
+    // jsDelivr URL 示例：https://cdn.jsdelivr.net/gh/LoaderTime/BiliClient-Fix/version.json?t=20260315
+    tasks.register("writeVersionJson") {
+        // 仅当外部显式传入 -Ptag 时才写文件，避免日常开发构建污染工作区。
+        onlyIf { hasGitTagProp }
+        doLast {
+            def outFile = rootProject.file("version.json")
+            def jsonObj = [
+                    tag_name    : gitTag,
+                    name        : gitTag,
+                    body        : "",
+                    published_at: "",
+                    assets      : [[
+                                          name               : "app-debug.apk",
+                                          browser_download_url: "https://github.com/LoaderTime/BiliClient-Fix/releases/download/${gitTag}/app-debug.apk"
+                                  ]]
+            ]
+            outFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(jsonObj)) + "\n"
+            println("[writeVersionJson] Wrote ${outFile} with tag=${gitTag}")
+        }
+    }
+
+    // 让 build/assemble 等任务在 -Ptag 时自动生成 version.json
+    afterEvaluate {
+        def wvj = tasks.findByName("writeVersionJson")
+        if (wvj != null) {
+            tasks.matching { it.name == "preBuild" }.configureEach {
+                dependsOn(wvj)
+            }
+        }
     }
 
     signingConfigs {

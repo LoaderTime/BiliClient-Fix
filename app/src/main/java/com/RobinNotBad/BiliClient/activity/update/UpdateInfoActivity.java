@@ -62,6 +62,7 @@ public class UpdateInfoActivity extends BaseActivity {
         long ctime = intent.getLongExtra("ctime", -1);
         String updateLog = intent.getStringExtra("updateLog");
         int canDownload = intent.getIntExtra("canDownload", 0);
+        String downloadUrl = intent.getStringExtra("downloadUrl");
 
         asyncInflate(R.layout.activity_update_info, (layoutView, resId) -> {
 
@@ -94,7 +95,12 @@ public class UpdateInfoActivity extends BaseActivity {
                 CenterThreadPool.run(() -> {
                     try {
                         runOnUiThread(() -> MsgUtil.showMsg("获取下载地址……"));
-                        String url = AppInfoApi.getDownloadUrl(versionCode);
+                        String url = downloadUrl;
+
+                        if (TextUtils.isEmpty(url)) {
+                            runOnUiThread(() -> MsgUtil.showMsg("没有该版本的下载地址"));
+                            return;
+                        }
 
                         apkFile = new File(FileUtil.getDownloadPath(), FileUtil.getFileNameFromLink(url));
                         if (apkFile.exists()) {
@@ -111,7 +117,8 @@ public class UpdateInfoActivity extends BaseActivity {
                         launcher.launch(downloadIntent);
 
                     } catch (Throwable e) {
-                        MsgUtil.err("下载更新", e);
+                        // 不要把网络异常当成“错误堆栈”弹一大段：按约定给出固定提示语
+                        runOnUiThread(() -> MsgUtil.showMsg("网络异常\n请手动前往Github release下载"));
                     }
                 });
 

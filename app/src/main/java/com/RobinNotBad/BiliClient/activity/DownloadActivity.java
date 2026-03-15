@@ -150,7 +150,14 @@ public class DownloadActivity extends BaseActivity {
             response.body().close();
             response.close();
         } catch (IOException e) {
-            runOnUiThread(() -> MsgUtil.showMsg("下载失败"));
+            // 更新下载（terminal=true）时按约定输出固定提示语；其他下载维持原提示。
+            runOnUiThread(() -> {
+                if (no_bili_headers) {
+                    MsgUtil.showMsg("网络异常\n请手动前往Github release下载");
+                } else {
+                    MsgUtil.showMsg("下载失败");
+                }
+            });
             e.printStackTrace();
             finish();
         }
