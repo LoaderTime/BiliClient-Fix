@@ -95,7 +95,8 @@ public class JumpToPlayerActivity extends BaseActivity {
                 else PlayerApi.getVideo(playerData, download != 0);
 
                 Logu.d("history", String.valueOf(playerData.progress));
-                jump();
+                // ActivityResultLauncher.launch 必须在主线程调用；否则可能导致回调丢失/界面卡住。
+                runOnUiThread(this::jump);
             } catch (IOException e) {
                 setClickExit("网络错误！\n请检查你的网络连接是否正常");
             } catch (JSONException e) {

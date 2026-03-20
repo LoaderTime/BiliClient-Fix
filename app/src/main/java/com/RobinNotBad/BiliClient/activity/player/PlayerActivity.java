@@ -261,6 +261,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private volatile boolean backgroundPlaybackSurfaceRecreated = false;
 
     /**
+     * onResume 中延迟消费后台播放恢复标记，避免部分 ROM 的 surfaceDestroyed/surfaceCreated 时序竞态。
+     * <p>
+     * 典型现象：回前台时 onResume 先于 surfaceDestroyed/surfaceCreated 执行，导致错误地走“非重建”分支，进而出现错帧/回退。
+     */
+    private Runnable consumeBackgroundPlaybackFlagRunnable;
+    private static final long CONSUME_BACKGROUND_PLAYBACK_FLAG_DELAY_MS = 520L;
+
+    /**
      * Activity 生命周期导致的暂停（未开启后台播放时 onPause() 主动 pause），用于在 onResume() 自动恢复播放。
      * <p>
      * 目的：修复“开始播放/后台切回前台 0~1s 内意外暂停，且无法自动 resume”。
@@ -1414,6 +1422,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         // 失效阶段：禁止旧会话再次触发 prepare
         prepareRequested = true;
         displayConfigured = false;
+        cancelConsumeBackgroundPlaybackFlag();
+        skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
+        backgroundPlaybackSurfaceRecreated = false;
         Logu.v("session", "invalidatePlayerSession: " + reason + ", id=" + playerSessionId);
     }
 
@@ -1429,6 +1440,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         // 新会话必须允许再次 prepare
         prepareRequested = false;
         displayConfigured = false;
+        cancelConsumeBackgroundPlaybackFlag();
+        skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
+        backgroundPlaybackSurfaceRecreated = false;
         Logu.v("session", "startNewPlayerSession: " + reason + ", id=" + playerSessionId);
     }
 
@@ -1556,6 +1570,40 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             }
         }
         backgroundSurfaceRefreshRunnable = null;
+    }
+
+    private void cancelConsumeBackgroundPlaybackFlag() {
+        if (mainHandler != null && consumeBackgroundPlaybackFlagRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(consumeBackgroundPlaybackFlagRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        consumeBackgroundPlaybackFlagRunnable = null;
+    }
+
+    private void scheduleConsumeBackgroundPlaybackFlag(@NonNull String reason) {
+        cancelConsumeBackgroundPlaybackFlag();
+        if (destroyed || resourcesReleased)
+            return;
+        if (!skipSeekOnNextSurfaceCreatedFromBackgroundPlayback)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        final int session = playerSessionId;
+        consumeBackgroundPlaybackFlagRunnable = () -> {
+            consumeBackgroundPlaybackFlagRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            // 若已确认 surface 在后台被销毁/重建，则不要在这里消费标记，让 surfaceCreated 分支处理。
+            if (backgroundPlaybackSurfaceRecreated)
+                return;
+            skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
+            backgroundPlaybackSurfaceRecreated = false;
+            Logu.d("surface", "consume background-playback flag(delayed): reason=" + reason);
+        };
+        mainHandler.postDelayed(consumeBackgroundPlaybackFlagRunnable, CONSUME_BACKGROUND_PLAYBACK_FLAG_DELAY_MS);
     }
 
     private void cancelBackgroundResumeRenderHealthCheck() {
@@ -2214,31 +2262,75 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         mainHandler.postDelayed(localSeekVerifyRunnable, LOCAL_SEEK_VERIFY_DELAY_MS);
     }
 
-    /** 安全停止并释放旧 ijkPlayer（避免 IllegalState / NPE） */
+    /**
+     * 安全停止并释放旧 ijkPlayer（避免 IllegalState / NPE）。
+     * <p>
+     * 注意：该方法主要供“重建播放会话”使用（仍在前台、对 UI 线程时延更敏感）。
+     * onDestroy 的释放走后台线程（见 onDestroy）。
+     */
     private void releaseIjkPlayerSafely(@NonNull String reason) {
         IjkMediaPlayer old = ijkPlayer;
         if (old == null)
             return;
 
-        Logu.v("player", "releaseIjkPlayerSafely: " + reason);
-        try {
-            old.setDisplay(null);
-        } catch (Exception ignore) {
-        }
-        try {
-            old.setSurface(null);
-        } catch (Exception ignore) {
-        }
-        try {
-            old.stop();
-        } catch (Exception ignore) {
-        }
-        try {
-            old.release();
-        } catch (Exception ignore) {
-        }
+        releaseIjkPlayerInstanceSafely(old, reason);
         if (ijkPlayer == old)
             ijkPlayer = null;
+    }
+
+    /**
+     * 释放 IjkMediaPlayer 的无异常兜底版本。
+     * <p>
+     * 注意：避免在调用侧持有 Activity 引用；该方法只依赖传入实例。
+     */
+    private static void releaseIjkPlayerInstanceSafely(IjkMediaPlayer player, @NonNull String reason) {
+        if (player == null)
+            return;
+
+        Logu.v("player", "releaseIjkPlayerInstanceSafely: " + reason);
+
+        // 先清 listener，避免 release 卡住时仍持有 Activity 回调链。
+        try {
+            player.setOnPreparedListener(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setOnCompletionListener(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setOnErrorListener(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setOnInfoListener(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setOnBufferingUpdateListener(null);
+        } catch (Exception ignore) {
+        }
+
+        try {
+            player.setDisplay(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setSurface(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.pause();
+        } catch (Exception ignore) {
+        }
+        try {
+            player.stop();
+        } catch (Exception ignore) {
+        }
+        try {
+            player.release();
+        } catch (Exception ignore) {
+        }
     }
 
     /**
@@ -3664,6 +3756,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     protected void onPause() {
         super.onPause();
         Logu.v("onPause");
+        cancelConsumeBackgroundPlaybackFlag();
         if (finishWatching && isPrepared && !isLiveMode) {
             completionReplayNeedsRebuild = true;
             Logu.d("player", "onPause after completion: mark replay rebuild");
@@ -3684,6 +3777,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     protected void onResume() {
         super.onResume();
         Logu.v("onResume");
+        cancelConsumeBackgroundPlaybackFlag();
         if (pausedByLifecycle) {
             boolean canAutoResume = isPrepared && !isPlaying && !finishWatching;
             pausedByLifecycle = false;
@@ -3698,6 +3792,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             syncProgressUiFromPlayer(currentPosition);
             if (isOnlineVideo) {
                 scheduleBackgroundResumeRenderHealthCheck(currentPosition, "onResume-noSurfaceRecreate");
+                // 延迟消费标记：给 surfaceDestroyed/surfaceCreated 留出窗口，避免竞态导致错帧。
+                scheduleConsumeBackgroundPlaybackFlag("onResume-noSurfaceRecreate-online");
             } else {
                 // 本地/缓存视频此前在“未发生 surface recreate”的回前台路径里几乎不做恢复动作，
                 // 容易出现恢复时长 1~5s 的长尾。
@@ -3705,15 +3801,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 // - 能快速恢复则保留旧会话
                 // - 500ms 内仍无有效输出帧则由 local black timeout 兜底重建
                 Logu.w("surface", "onResume: staged local restore without surface recreate, pos=" + currentPosition);
-                skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
-                backgroundPlaybackSurfaceRecreated = false;
+                scheduleConsumeBackgroundPlaybackFlag("onResume-noSurfaceRecreate-local");
                 startBackgroundSurfaceRestore(currentPosition, "onResume-noSurfaceRecreate-local");
                 return;
             }
-            // 若本次回前台没有经历 Surface 重建，则在此消费掉标记，避免影响后续正常 surfaceCreated。
-            skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
-            backgroundPlaybackSurfaceRecreated = false;
-            Logu.d("surface", "onResume: consume background-playback flag without surface recreate, pos=" + currentPosition);
+            Logu.d("surface", "onResume: schedule consume background-playback flag, pos=" + currentPosition);
         }
         if (isPrepared && (!isPlaying || finishWatching)) {
             ensureLoadingHidden("onResume-nonPlaying");
@@ -3808,7 +3900,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             okHttpClient = null;
         }
 
-        releaseIjkPlayerSafely("onDestroy");
+        // 注意：IjkMediaPlayer.stop/release 在部分设备/网络流上可能阻塞，导致退出时假死/ANR。
+        // 这里把“重释放”下沉到后台线程，避免阻塞 UI 线程。
+        final IjkMediaPlayer playerToRelease = ijkPlayer;
+        ijkPlayer = null;
+        if (playerToRelease != null) {
+            CenterThreadPool.run(() -> releaseIjkPlayerInstanceSafely(playerToRelease, "onDestroy"));
+        }
 
         if (isOnlineVideo && danmakuFile != null && danmakuFile.exists()) {
             try {
@@ -3844,6 +3942,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * 说明：保留 Timer 实现以最小行为改动，但做到“同类任务任意时刻最多一个”。
      */
     private void stopAllPeriodicTasks() {
+        cancelConsumeBackgroundPlaybackFlag();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
         cancelFirstVideoFrameFallback();
@@ -5638,13 +5737,36 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     public void finish() {
         if (isPlaying)
             playerPause();
-        if (ijkPlayer != null) {
-            Intent result = new Intent();
-            result.putExtra("progress", (int) ijkPlayer.getCurrentPosition());
-            Logu.d("进度回传", String.valueOf(ijkPlayer.getCurrentPosition()));
-            setResult(RESULT_OK, result);
-        } else
-            setResult(RESULT_CANCELED);
+        // 尽量保证返回 progress，避免跳转页无法上报进度而停留。
+        // 注意：此处不强依赖 ijkPlayer（退出/重建/异常 release 时可能为 null）。
+        int progress = 0;
+        boolean got = false;
+        try {
+            if (ijkPlayer != null && isPrepared) {
+                progress = (int) Math.max(0L, ijkPlayer.getCurrentPosition());
+                got = true;
+            }
+        } catch (Exception ignore) {
+            got = false;
+        }
+        if (!got) {
+            try {
+                progress = (int) Math.max(0L, latestPlayerPositionMs);
+            } catch (Exception ignore) {
+                progress = 0;
+            }
+            if (progress <= 0 && seekbar_progress != null) {
+                try {
+                    progress = Math.max(0, seekbar_progress.getProgress());
+                } catch (Exception ignore) {
+                    progress = 0;
+                }
+            }
+        }
+        Intent result = new Intent();
+        result.putExtra("progress", progress);
+        Logu.d("进度回传", String.valueOf(progress));
+        setResult(RESULT_OK, result);
         super.finish();
     }
 }
