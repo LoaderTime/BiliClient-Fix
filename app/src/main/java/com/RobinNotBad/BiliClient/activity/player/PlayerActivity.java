@@ -132,9 +132,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * <p>
      * 兼容 Android 4.4：仅用 Handler + postDelayed，不依赖高版本 API。
      */
-    private static final long DANMAKU_WATCHDOG_INTERVAL_MS = 2000L;
-    /** 连续判定“弹幕时间轴不前进”的次数阈值（2 次=约 4 秒） */
+    private static final long DANMAKU_WATCHDOG_INTERVAL_MS = 850L;
+    /** 连续判定“弹幕时间轴不前进”的次数阈值（2 次=约 1.7 秒） */
     private static final int DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT = 2;
+    /** 弹幕时间轴明显落后于视频位置时，直接视为异常并优先恢复 */
+    private static final long DANMAKU_WATCHDOG_STUCK_LAG_MS = 1400L;
+    /** soft recovery 后给弹幕线程的恢复宽限期，避免下一次轮询立刻升级为硬恢复 */
+    private static final long DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS = 2200L;
     /** watchdog 软恢复后，短时间内再次卡住则升级为硬恢复 */
     private static final long DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS = 8000L;
     private Runnable danmakuWatchdogRunnable;
@@ -342,11 +346,25 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private Runnable firstVideoFrameFallbackRunnable;
     private Runnable frameLoadingDelayedHideRunnable;
     private volatile long frameLoadingVisibleSinceUptimeMs = 0L;
+    private volatile boolean frameLoadingActive = false;
     /** 在线后台恢复触发 rebuild 后，给新 session 一个更快的首帧 loading 收敛兜底。 */
     private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_FALLBACK_MS = 420L;
     private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS = 120L;
     private Runnable onlineRebuildFirstVideoFrameFallbackRunnable;
     private volatile boolean pendingOnlineRebuildFirstVideoFrameFallback = false;
+
+    /** buffering 事件在部分流上会短促抖动，需做延迟展示去闪烁。 */
+    private static final long BUFFERING_UI_SHOW_DELAY_MS = 260L;
+    private static final long BUFFERING_UI_MIN_SHOW_MS = 320L;
+    private static final long BUFFERING_UI_IGNORE_MOVED_MS = 220L;
+    private static final float BUFFERING_UI_IGNORE_OUTPUT_FPS = 8.0f;
+    private volatile boolean playerReportedBuffering = false;
+    private volatile boolean bufferingUiVisible = false;
+    private volatile long bufferingUiVisibleSinceUptimeMs = 0L;
+    private volatile long bufferingStartPositionMs = 0L;
+    private volatile long bufferingStartUptimeMs = 0L;
+    private Runnable bufferingUiShowRunnable;
+    private Runnable bufferingUiHideRunnable;
 
     /**
      * 开启后台播放时回前台，SurfaceView surface 可能被销毁并重建。
@@ -626,6 +644,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastDanmakuWatchdogRecoverWasSoft = false;
     }
 
+    private void hideDanmakuAndPauseWithoutQuit(@NonNull String reason) {
+        if (mDanmakuView == null)
+            return;
+        try {
+            mDanmakuView.hide();
+        } catch (Exception ignore) {
+        }
+        try {
+            mDanmakuView.pause();
+        } catch (Exception ignore) {
+        }
+        Logu.d("danmaku", "hide/pause without quit: " + reason);
+    }
+
     private void performDanmakuSoftRecovery(long positionMs, @NonNull String reason) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             runOnUiThread(() -> performDanmakuSoftRecovery(positionMs, reason));
@@ -637,13 +669,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             return;
 
         long target = Math.max(0L, positionMs);
-        try {
-            // 重要：这里显式模拟“用户关再开一次弹幕”。
-            // 仅 showAndResumeDrawTask(position) 在 handler 仍处于 visible=true 时可能被 DrawHandler 直接短路，
-            // 无法真正触发 RESUME，因此必须先 hide 再 show。
-            mDanmakuView.hideAndPauseDrawTask();
-        } catch (Exception ignore) {
-        }
+        // 这里显式模拟“用户关再开一次弹幕”，但不 quit drawTask。
+        // hideAndPauseDrawTask() 会在 DFM 内部把 drawTask.quit() 掉，
+        // 某些卡死/半失活状态下再 showAndResume 容易落到已释放 drawTask 上，导致闪退或异常退出。
+        hideDanmakuAndPauseWithoutQuit("softRecovery:" + reason);
         try {
             mDanmakuView.showAndResumeDrawTask(target);
         } catch (Exception ignore) {
@@ -745,10 +774,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (shouldShow) {
             applyDanmakuVisibility(true, "hardRecoverPrepared");
         } else {
-            try {
-                mDanmakuView.hideAndPauseDrawTask();
-            } catch (Exception ignore) {
-            }
+            hideDanmakuAndPauseWithoutQuit("hardRecoverPrepared-hidden");
         }
         if (!isPlaying) {
             try {
@@ -1538,12 +1564,158 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
     private void cancelFrameLoadingMinShowGuard() {
         cancelPendingFrameLoadingHide();
+        frameLoadingActive = false;
         frameLoadingVisibleSinceUptimeMs = 0L;
+    }
+
+    private void cancelBufferingUiShow() {
+        if (mainHandler != null && bufferingUiShowRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(bufferingUiShowRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        bufferingUiShowRunnable = null;
+    }
+
+    private void cancelBufferingUiHide() {
+        if (mainHandler != null && bufferingUiHideRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(bufferingUiHideRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        bufferingUiHideRunnable = null;
+    }
+
+    private void resetBufferingUiState() {
+        playerReportedBuffering = false;
+        bufferingUiVisible = false;
+        bufferingUiVisibleSinceUptimeMs = 0L;
+        bufferingStartPositionMs = 0L;
+        bufferingStartUptimeMs = 0L;
+        cancelBufferingUiShow();
+        cancelBufferingUiHide();
+    }
+
+    private boolean shouldSuppressTransientBufferingUi() {
+        long moved = Math.max(0L, safeGetPlayerPositionMs() - bufferingStartPositionMs);
+        float outputFps = 0f;
+        try {
+            if (ijkPlayer != null) {
+                outputFps = ijkPlayer.getVideoOutputFramesPerSecond();
+            }
+        } catch (Exception ignore) {
+        }
+        return moved >= BUFFERING_UI_IGNORE_MOVED_MS && outputFps >= BUFFERING_UI_IGNORE_OUTPUT_FPS;
+    }
+
+    private void showBufferingUiNow(@NonNull String reason) {
+        if (destroyed || resourcesReleased || isAudioOnlyMode)
+            return;
+        if (frameLoadingActive)
+            return;
+
+        cancelBufferingUiHide();
+        bufferingUiVisible = true;
+        bufferingUiVisibleSinceUptimeMs = android.os.SystemClock.uptimeMillis();
+        runOnUiThreadIfNeeded(() -> {
+            if (loading_info != null)
+                loading_info.setVisibility(View.VISIBLE);
+            if (anim_loading != null)
+                anim_loading.start();
+            if (loading_text0 != null)
+                loading_text0.setText("正在缓冲");
+            showLoadingSpeed();
+        });
+        if (hasDanmaku && mDanmakuView != null && isPlaying) {
+            try {
+                mDanmakuView.pause();
+            } catch (Exception ignore) {
+            }
+        }
+        Logu.d("buffering", "show buffering ui: " + reason);
+    }
+
+    private void scheduleBufferingUiShow(@NonNull String reason) {
+        if (destroyed || resourcesReleased || isAudioOnlyMode)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+        if (frameLoadingActive)
+            return;
+
+        cancelBufferingUiShow();
+        cancelBufferingUiHide();
+        final int session = playerSessionId;
+        bufferingUiShowRunnable = () -> {
+            bufferingUiShowRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            if (!playerReportedBuffering || bufferingUiVisible || frameLoadingActive)
+                return;
+            if (shouldSuppressTransientBufferingUi()) {
+                Logu.d("buffering", "suppress transient buffering ui: " + reason);
+                return;
+            }
+            showBufferingUiNow(reason);
+        };
+        mainHandler.postDelayed(bufferingUiShowRunnable, BUFFERING_UI_SHOW_DELAY_MS);
+    }
+
+    private void hideBufferingUi(@NonNull String reason) {
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        cancelBufferingUiShow();
+        if (!bufferingUiVisible)
+            return;
+
+        long shownAt = bufferingUiVisibleSinceUptimeMs;
+        long elapsed = shownAt > 0L ? (android.os.SystemClock.uptimeMillis() - shownAt) : BUFFERING_UI_MIN_SHOW_MS;
+        long remain = shownAt > 0L ? Math.max(0L, BUFFERING_UI_MIN_SHOW_MS - elapsed) : 0L;
+
+        Runnable hideAction = () -> {
+            bufferingUiHideRunnable = null;
+            bufferingUiVisible = false;
+            bufferingUiVisibleSinceUptimeMs = 0L;
+            try {
+                if (loadingTimer != null) {
+                    loadingTimer.cancel();
+                    loadingTimer = null;
+                }
+            } catch (Exception ignore) {
+                loadingTimer = null;
+            }
+            runOnUiThreadIfNeeded(() -> {
+                if (!frameLoadingActive) {
+                    if (loading_info != null)
+                        loading_info.setVisibility(View.GONE);
+                    if (anim_loading != null)
+                        anim_loading.stop();
+                }
+            });
+            if (!frameLoadingActive && hasDanmaku && mDanmakuView != null && isPlaying) {
+                try {
+                    mDanmakuView.resume();
+                } catch (Exception ignore) {
+                }
+            }
+            Logu.d("buffering", "hide buffering ui: " + reason);
+        };
+
+        if (remain > 0L) {
+            bufferingUiHideRunnable = hideAction;
+            mainHandler.postDelayed(bufferingUiHideRunnable, remain);
+            return;
+        }
+        hideAction.run();
     }
 
     private void showFrameLoading(@NonNull String title, @NonNull String subtitle) {
         if (mainHandler == null)
             mainHandler = new Handler(Looper.getMainLooper());
+        frameLoadingActive = true;
         cancelPendingFrameLoadingHide();
         frameLoadingVisibleSinceUptimeMs = android.os.SystemClock.uptimeMillis();
         runOnUiThreadIfNeeded(() -> {
@@ -1579,12 +1751,24 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         Runnable hideAction = () -> {
             frameLoadingDelayedHideRunnable = null;
+            frameLoadingActive = false;
             frameLoadingVisibleSinceUptimeMs = 0L;
             runOnUiThreadIfNeeded(() -> {
-                if (loading_info != null)
-                    loading_info.setVisibility(View.GONE);
-                if (anim_loading != null)
-                    anim_loading.stop();
+                if (playerReportedBuffering || bufferingUiVisible) {
+                    if (loading_info != null)
+                        loading_info.setVisibility(View.VISIBLE);
+                    if (anim_loading != null)
+                        anim_loading.start();
+                    if (loading_text0 != null)
+                        loading_text0.setText("正在缓冲");
+                    if (playerReportedBuffering)
+                        showLoadingSpeed();
+                } else {
+                    if (loading_info != null)
+                        loading_info.setVisibility(View.GONE);
+                    if (anim_loading != null)
+                        anim_loading.stop();
+                }
             });
             Logu.d("render", "hideFrameLoading: " + reason);
         };
@@ -3117,20 +3301,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 return false;
 
             if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_START) {
-                runOnUiThread(() -> {
-                    cancelFrameLoadingMinShowGuard();
-                    loading_info.setVisibility(View.VISIBLE);
-                    anim_loading.start();
-                    loading_text0.setText("正在缓冲");
-                    showLoadingSpeed();
-                    if (hasDanmaku && mDanmakuView != null && isPlaying) {
-                        mDanmakuView.pause();
-                    }
-                });
+                playerReportedBuffering = true;
+                bufferingStartUptimeMs = android.os.SystemClock.uptimeMillis();
+                bufferingStartPositionMs = safeGetPlayerPositionMs();
+                scheduleBufferingUiShow("MEDIA_INFO_BUFFERING_START");
             } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_END) {
+                playerReportedBuffering = false;
                 runOnUiThread(() -> {
-                    if (loadingTimer != null)
-                        loadingTimer.cancel();
                     if (pendingOnlineRebuildFirstVideoFrameFallback
                             && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
                         pendingOnlineRebuildFirstVideoFrameFallback = false;
@@ -3145,12 +3322,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         onFirstVideoFrameRendered("MEDIA_INFO_BUFFERING_END-after-background-refresh");
                     }
                     if (!waitingForFirstVideoFrame || firstVideoFrameRendered || isAudioOnlyMode) {
-                        cancelFrameLoadingMinShowGuard();
-                        loading_info.setVisibility(View.GONE);
-                        anim_loading.stop();
-                    }
-                    if (hasDanmaku && mDanmakuView != null && isPlaying) {
-                        mDanmakuView.resume();
+                        hideBufferingUi("MEDIA_INFO_BUFFERING_END");
                     }
                 });
             }
@@ -3194,9 +3366,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             mDanmakuView.start();
         }
         if (SharedPreferencesUtil.getBoolean("player_ui_showDanmakuBtn", true)) {
-            // 重要：不要用 DanmakuView.show()/hide() 做开关。
+            // 重要：不要直接用 DanmakuView.show()/hide() 做开关。
             // DFM 内部 show(null) 不会触发 START/RESUME/UPDATE，遇到 quitFlag/等待态时会出现“开了但不动/不出”。
-            // 改用 hideAndPauseDrawTask()/showAndResumeDrawTask(position!=null) 确保绘制线程真正恢复。
+            // 这里统一走 applyDanmakuVisibility()，对关闭侧避免把 drawTask quit 掉。
             isDanmakuVisible = SharedPreferencesUtil.getBoolean("pref_switch_danmaku", true);
             btn_danmaku.setImageResource(isDanmakuVisible ? R.mipmap.danmakuon : R.mipmap.danmakuoff);
             btn_danmaku.setOnClickListener(view -> {
@@ -3282,12 +3454,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
             markExplicitSeek(target);
-            if (hasDanmaku && mDanmakuView != null) {
-                try {
-                    mDanmakuView.seekTo(target);
-                } catch (Exception ignore) {
-                }
-            }
+            alignDanmakuToPreparedPlaybackTarget(target, "pendingAudioOnlyToggleSeek");
             syncProgressUiFromPlayer(target);
             Logu.d("进度跳转", String.valueOf(target));
         } else if (!isLiveMode && pendingForcedSeekMs >= 0L) {
@@ -3298,21 +3465,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
             markExplicitSeek(target);
-            if (hasDanmaku && mDanmakuView != null) {
-                try {
-                    mDanmakuView.seekTo(target);
-                } catch (Exception ignore) {
-                }
-            }
+            alignDanmakuToPreparedPlaybackTarget(target, "pendingForcedSeek");
             syncProgressUiFromPlayer(target);
             Logu.d("进度跳转", "forced=" + target);
         } else if (shouldRestoreFromLastPosition()) {
             // progress_history 统一为毫秒；保持旧行为“超过 5 秒才跳转”。
             ijkPlayer.seekTo(progress_history);
             markExplicitSeek(progress_history);
-            if (hasDanmaku && mDanmakuView != null) {
-                mDanmakuView.seekTo(progress_history);
-            }
+            alignDanmakuToPreparedPlaybackTarget(progress_history, "restoreFromHistory");
             syncProgressUiFromPlayer(progress_history);
             Logu.d("进度跳转", String.valueOf(progress_history));
             runOnUiThread(() -> MsgUtil.showMsg("已从上次的位置播放"));
@@ -4538,6 +4698,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cancelBackgroundSurfaceRestore();
         cancelLocalBackgroundSurfaceAudioRestore();
         cancelFrameLoadingMinShowGuard();
+        resetBufferingUiState();
         clearDanmakuRecoveryState();
         try {
             if (progressTimer != null) {
@@ -5177,6 +5338,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cancelFirstVideoFrameFallback();
         cancelBackgroundSurfaceRestore();
         cancelLocalSeekVerify();
+        resetBufferingUiState();
 
         attachSurfaceIfPossible();
         beginWaitingForFirstVideoFrame("replayAfterCompletion");
@@ -5201,7 +5363,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     /**
      * 应用弹幕显示状态。
      * <p>
-     * - visible=false：hideAndPauseDrawTask（确保 quitFlag=true，避免后台空转/卡死）
+     * - visible=false：hide()+pause()，避免 DFM 在 drawTask.quit() 后再次 show 时落到已释放对象
      * - visible=true：showAndResumeDrawTask(position!=null)（确保触发 START/RESUME/UPDATE）
      */
     private void applyDanmakuVisibility(boolean visible, @NonNull String reason) {
@@ -5220,7 +5382,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         try {
             if (!visible) {
-                mDanmakuView.hideAndPauseDrawTask();
+                hideDanmakuAndPauseWithoutQuit(reason);
                 return;
             }
 
@@ -5243,6 +5405,43 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
     }
 
+    /**
+     * onPrepared 阶段若播放器需要从历史/强制位置恢复，不能只对弹幕调用 seekTo(target)。
+     *
+     * 原因：此时 DFM 可能尚未 prepared，seekTo() 会被直接忽略；随后弹幕 timer 虽然会被播放器位置驱动到目标附近，
+     * 但 drawTask/cache 仍停留在旧起点，表现为“弹幕时间在走，但流卡住/非常卡，拖一下进度条立刻恢复”。
+     *
+     * 这里对可见弹幕统一改成 showAndResumeDrawTask(target)：
+     * - 它会直接走 DrawHandler.SHOW_DANMAKUS(position) 分支，内部不仅会恢复 timer，
+     *   还会立即对 drawTask 执行 seek(position)
+     * - 这比 start(target) 更关键，因为 DrawHandler.START 只会改 pausedPosition，
+     *   并不会同步刷新 drawTask/cache 的可视区间
+     *
+     * 这正对应你当前的残留现象：历史进度进入时 dmTime 卡在旧值附近、随后非常卡，
+     * 但手动拖动进度条（真正走 seek 链）后立刻恢复流畅。
+     */
+    private void alignDanmakuToPreparedPlaybackTarget(long targetMs, @NonNull String reason) {
+        if (destroyed || resourcesReleased || isLiveMode || !hasDanmaku || mDanmakuView == null) {
+            return;
+        }
+        long target = Math.max(0L, targetMs);
+        try {
+            if (isDanmakuVisible) {
+                // DrawHandler 在“当前本来就可见”时，showDanmakus(position) 会被 mDanmakusVisible 直接短路，
+                // 从而丢掉这次关键的 target seek。
+                // 因此这里先做一次不 quit drawTask 的 hide/pause，再 showAndResumeDrawTask(target)，
+                // 强制把 drawTask/cache/timer 一起切到目标时间。
+                hideDanmakuAndPauseWithoutQuit(reason + "-realign");
+                mDanmakuView.showAndResumeDrawTask(target);
+            } else if (mDanmakuView.isPrepared()) {
+                mDanmakuView.seekTo(target);
+            }
+            Logu.d("danmaku", "align prepared target: reason=" + reason
+                    + ", pos=" + target + ", visible=" + isDanmakuVisible);
+        } catch (Exception ignore) {
+        }
+    }
+
     private void startDanmakuWatchdog() {
         stopDanmakuWatchdog();
         if (mainHandler == null)
@@ -5259,6 +5458,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             @Override
             public void run() {
                 if (destroyed || resourcesReleased || isLiveMode) {
+                    return;
+                }
+                if (playerReportedBuffering) {
+                    mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
                     return;
                 }
                 // loading_info 可见时一般处于缓冲/切换状态，跳过避免误判。
@@ -5280,6 +5483,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
+                long now = android.os.SystemClock.uptimeMillis();
+                if (lastDanmakuWatchdogRecoverUptimeMs > 0L
+                        && now - lastDanmakuWatchdogRecoverUptimeMs < DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS) {
+                    mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
+                    return;
+                }
+
                 final long videoPos = getLatestPlayerPositionForDanmaku();
                 long dmTime;
                 try {
@@ -5291,8 +5501,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
                 boolean videoMoving = lastWatchdogVideoPos >= 0L && videoPos > lastWatchdogVideoPos + 500L;
                 boolean danmakuStuck = lastWatchdogDanmakuTime >= 0L && dmTime == lastWatchdogDanmakuTime;
+                long danmakuLag = Math.max(0L, videoPos - dmTime);
+                boolean danmakuLagging = videoMoving && danmakuLag >= DANMAKU_WATCHDOG_STUCK_LAG_MS;
 
-                if (videoMoving && danmakuStuck) {
+                if (videoMoving && (danmakuStuck || danmakuLagging)) {
                     danmakuWatchdogStuckCount++;
                 } else {
                     danmakuWatchdogStuckCount = 0;
@@ -5305,12 +5517,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 } catch (Exception ignore) {
                 }
 
-                if (viewPaused || danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT) {
-                    long now = android.os.SystemClock.uptimeMillis();
+                if (viewPaused || danmakuLagging
+                        || danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT) {
                     boolean hardRecover = lastDanmakuWatchdogRecoverWasSoft
+                            && now - lastDanmakuWatchdogRecoverUptimeMs >= DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS
                             && now - lastDanmakuWatchdogRecoverUptimeMs <= DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS;
 
                     Logu.w("danmaku", "watchdog recover: videoPos=" + videoPos + ", dmTime=" + dmTime
+                            + ", lag=" + danmakuLag
                             + ", paused=" + viewPaused + ", stuckCount=" + danmakuWatchdogStuckCount
                             + ", hard=" + hardRecover);
 

@@ -167,12 +167,34 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
         if (mHandlerThread != null) {
             HandlerThread handlerThread = this.mHandlerThread;
             mHandlerThread = null;
-            try {
-                handlerThread.join();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
+            // 不能在 UI 线程无限 join，否则 watchdog 触发弹幕硬恢复时容易把整个应用主线程卡死。
+            // 这里改成：
+            // 1) 非 UI 线程只做短暂等待；
+            // 2) UI 线程改为后台收尾，不阻塞前台交互。
+            if (Thread.currentThread().getId() != mUiThreadId) {
+                try {
+                    handlerThread.join(300L);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                if (handlerThread.isAlive()) {
+                    handlerThread.quit();
+                }
+            } else {
+                final HandlerThread threadToCleanup = handlerThread;
+                Thread cleanupThread = new Thread(() -> {
+                    try {
+                        threadToCleanup.join(800L);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    if (threadToCleanup.isAlive()) {
+                        threadToCleanup.quit();
+                    }
+                }, "DFM-HandlerThread-Cleanup");
+                cleanupThread.setDaemon(true);
+                cleanupThread.start();
             }
-            handlerThread.quit();
         }
     }
 

@@ -21,6 +21,10 @@ import android.os.HandlerThread;
 import android.os.Message;
 import android.util.Pair;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
+
 import master.flame.danmaku.danmaku.model.AbsDisplayer;
 import master.flame.danmaku.danmaku.model.BaseDanmaku;
 import master.flame.danmaku.danmaku.model.DanmakuTimer;
@@ -203,6 +207,10 @@ public class CacheManagingDrawTask extends DrawTask {
                 return;
             mHandler.requestCancelCaching();
             mHandler.removeMessages(CacheHandler.BUILD_CACHES);
+            mHandler.removeMessages(CacheHandler.ADD_DANMAKKU);
+            mHandler.removeMessages(CacheHandler.BIND_CACHE);
+            mHandler.removeMessages(CacheHandler.REBUILD_CACHE);
+            mHandler.removeMessages(CacheHandler.CLEAR_TIMEOUT_CACHES);
             mHandler.obtainMessage(CacheHandler.SEEK, mills).sendToTarget();
         }
 
@@ -215,10 +223,10 @@ public class CacheManagingDrawTask extends DrawTask {
                             mHandler.createCache(danmaku);
                         }
                     } else {
-                        mHandler.obtainMessage(CacheHandler.BIND_CACHE, danmaku).sendToTarget();
+                        mHandler.enqueueBindCache(danmaku);
                     }
                 } else {
-                    mHandler.obtainMessage(CacheHandler.ADD_DANMAKKU, danmaku).sendToTarget();
+                    mHandler.enqueueAddDanmaku(danmaku);
                 }
             }
         }
@@ -480,12 +488,73 @@ public class CacheManagingDrawTask extends DrawTask {
 
             private boolean mCancelFlag;
 
+            /**
+             * 同一条弹幕在 cache miss 期间可能被 renderer 连续多帧重复 add，导致 CacheHandler 队列暴涨。
+             * 这里用对象身份去重，保证同一时刻每条弹幕最多只有一个待处理缓存任务。
+             */
+            private final Set<BaseDanmaku> mPendingAddDanmakus =
+                    Collections.newSetFromMap(new IdentityHashMap<BaseDanmaku, Boolean>());
+
+            private final Set<BaseDanmaku> mPendingBindDanmakus =
+                    Collections.newSetFromMap(new IdentityHashMap<BaseDanmaku, Boolean>());
+
             public CacheHandler(android.os.Looper looper) {
                 super(looper);
             }
 
+            private boolean markPending(Set<BaseDanmaku> pendingSet, BaseDanmaku danmaku) {
+                if (danmaku == null) {
+                    return false;
+                }
+                synchronized (pendingSet) {
+                    return pendingSet.add(danmaku);
+                }
+            }
+
+            private void unmarkPending(Set<BaseDanmaku> pendingSet, BaseDanmaku danmaku) {
+                if (danmaku == null) {
+                    return;
+                }
+                synchronized (pendingSet) {
+                    pendingSet.remove(danmaku);
+                }
+            }
+
+            private void clearPendingWork() {
+                synchronized (mPendingAddDanmakus) {
+                    mPendingAddDanmakus.clear();
+                }
+                synchronized (mPendingBindDanmakus) {
+                    mPendingBindDanmakus.clear();
+                }
+            }
+
+            public void enqueueAddDanmaku(BaseDanmaku danmaku) {
+                if (danmaku == null || danmaku.hasDrawingCache() || mPause || mCancelFlag || mEndFlag) {
+                    return;
+                }
+                if (!markPending(mPendingAddDanmakus, danmaku)) {
+                    return;
+                }
+                obtainMessage(ADD_DANMAKKU, danmaku).sendToTarget();
+            }
+
+            public void enqueueBindCache(BaseDanmaku danmaku) {
+                if (danmaku == null || danmaku.hasDrawingCache() || mPause || mCancelFlag || mEndFlag) {
+                    return;
+                }
+                if (!markPending(mPendingBindDanmakus, danmaku)) {
+                    return;
+                }
+                obtainMessage(BIND_CACHE, danmaku).sendToTarget();
+            }
+
             public void requestCancelCaching() {
                 mCancelFlag = true;
+                removeMessages(ADD_DANMAKKU);
+                removeMessages(BIND_CACHE);
+                removeMessages(REBUILD_CACHE);
+                clearPendingWork();
             }
 
             @Override
@@ -519,15 +588,26 @@ public class CacheManagingDrawTask extends DrawTask {
                         break;
                     case ADD_DANMAKKU:
                         BaseDanmaku item = (BaseDanmaku) msg.obj;
+                        unmarkPending(mPendingAddDanmakus, item);
+                        if (mPause || mCancelFlag || mEndFlag) {
+                            break;
+                        }
                         addDanmakuAndBuildCache(item);
                         break;
                     case BIND_CACHE:
                         BaseDanmaku danmaku = (BaseDanmaku) msg.obj;
+                        unmarkPending(mPendingBindDanmakus, danmaku);
+                        if (mPause || mCancelFlag || mEndFlag) {
+                            break;
+                        }
                         if (!danmaku.isTimeOut()) {
                             createCache(danmaku);
                         }
                         break;
                     case REBUILD_CACHE:
+                        if (mPause || mCancelFlag || mEndFlag) {
+                            break;
+                        }
                         Pair<BaseDanmaku, Boolean> pair = (Pair<BaseDanmaku, Boolean>) msg.obj;
                         if (pair != null) {
                             BaseDanmaku cacheitem = pair.first;
@@ -574,6 +654,7 @@ public class CacheManagingDrawTask extends DrawTask {
                     case QUIT:
                         removeCallbacksAndMessages(null);
                         mPause = true;
+                        clearPendingWork();
                         evictAll();
                         clearCachePool();
                         this.getLooper().quit();
@@ -883,6 +964,7 @@ public class CacheManagingDrawTask extends DrawTask {
 
             public void pause() {
                 mPause = true;
+                clearPendingWork();
                 removeCallbacksAndMessages(null);
                 sendEmptyMessage(QUIT);
             }
@@ -930,6 +1012,10 @@ public class CacheManagingDrawTask extends DrawTask {
             }
             mHandler.removeMessages(CacheHandler.BUILD_CACHES);
             mHandler.requestCancelCaching();
+            mHandler.removeMessages(CacheHandler.ADD_DANMAKKU);
+            mHandler.removeMessages(CacheHandler.BIND_CACHE);
+            mHandler.removeMessages(CacheHandler.REBUILD_CACHE);
+            mHandler.removeMessages(CacheHandler.CLEAR_TIMEOUT_CACHES);
             mHandler.removeMessages(CacheHandler.CLEAR_ALL_CACHES);
             mHandler.sendEmptyMessage(CacheHandler.CLEAR_ALL_CACHES);
         }
