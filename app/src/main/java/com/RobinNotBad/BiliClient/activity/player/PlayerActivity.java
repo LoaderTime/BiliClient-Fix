@@ -332,6 +332,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private volatile boolean firstVideoFrameRendered = false;
     /** 进入“等待首帧”状态的时间戳（用于兜底：某些场景可能收不到 VIDEO_RENDERING_START） */
     private volatile long waitingForFirstVideoFrameUptimeMs = 0L;
+    /** 进入“等待首帧”时的起始播放位置；用于判断是否真的发生了自然推进，避免用绝对进度误判。 */
+    private volatile long waitingForFirstVideoFrameStartPosMs = 0L;
 
     /** 本地/缓存视频在部分设备上可能收不到首帧事件，增加超时兜底避免 loading 永久悬浮 */
     private static final long FIRST_VIDEO_FRAME_FALLBACK_TIMEOUT_MS = 1200L;
@@ -340,6 +342,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private Runnable firstVideoFrameFallbackRunnable;
     private Runnable frameLoadingDelayedHideRunnable;
     private volatile long frameLoadingVisibleSinceUptimeMs = 0L;
+    /** 在线后台恢复触发 rebuild 后，给新 session 一个更快的首帧 loading 收敛兜底。 */
+    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_FALLBACK_MS = 420L;
+    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS = 120L;
+    private Runnable onlineRebuildFirstVideoFrameFallbackRunnable;
+    private volatile boolean pendingOnlineRebuildFirstVideoFrameFallback = false;
 
     /**
      * 开启后台播放时回前台，SurfaceView surface 可能被销毁并重建。
@@ -353,20 +360,54 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * 这里加一层 UI 兜底：在恢复流程进行一段时间后，根据“播放进度在推进 + surface 有效”推断画面已恢复，自动关闭 loading。
      */
     private Runnable backgroundSurfaceRestoreAutoHideRunnable;
+    private Runnable backgroundSurfaceRestoreProbeRunnable;
+    private Runnable localBackgroundSurfaceFrameCorrectionRunnable;
+    private Runnable localBackgroundSurfaceAudioRestoreRunnable;
     private volatile long backgroundSurfaceRestoreStartPosMs = 0L;
     private volatile int backgroundSurfaceRestoreStep = 0;
     private volatile long backgroundSurfaceRestoreBasePosMs = -1L;
+    /** 背景恢复阶段是否收到过真正的视频首帧事件（而非 outputFps/进度推进推断）。 */
+    private volatile boolean backgroundSurfaceRestoreFrameEventReceived = false;
+    /** 仅用于日志：记录恢复期是否观测到 outputFps>0，避免重复刷屏。 */
+    private volatile boolean backgroundSurfaceRestoreOutputFpsObserved = false;
+    /** 第一次观测到 outputFps>0 的时间，用于避免假阳性时过早判定恢复完成。 */
+    private volatile long backgroundSurfaceRestoreOutputFpsObservedUptimeMs = 0L;
 
-    private static final long BACKGROUND_SURFACE_RESTORE_STEP0_DELAY_MS = 80L;
-    private static final long BACKGROUND_SURFACE_RESTORE_STEP1_DELAY_MS = 100L;
-    private static final long BACKGROUND_SURFACE_RESTORE_STEP2_DELAY_MS = 180L;
-    private static final long BACKGROUND_SURFACE_RESTORE_STEP3_DELAY_MS = 280L;
-    private static final long BACKGROUND_SURFACE_RESTORE_STEP4_DELAY_MS = 520L;
+    private static final long BACKGROUND_SURFACE_RESTORE_STEP0_DELAY_MS = 40L;
+    private static final long BACKGROUND_SURFACE_RESTORE_STEP1_DELAY_MS = 60L;
+    private static final long BACKGROUND_SURFACE_RESTORE_STEP2_DELAY_MS = 100L;
+    private static final long BACKGROUND_SURFACE_RESTORE_STEP3_DELAY_MS = 160L;
+    private static final long BACKGROUND_SURFACE_RESTORE_STEP4_DELAY_MS = 260L;
     private static final long BACKGROUND_SURFACE_RESTORE_GIVEUP_DELAY_MS = 650L;
     private static final long BACKGROUND_SURFACE_RESTORE_AUTO_HIDE_DELAY_MS = 850L;
+    private static final long BACKGROUND_SURFACE_RESTORE_PROBE_INTERVAL_MS = 60L;
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_OBSERVED_MS = 220L;
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_MOVED_MS = 180L;
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_SURFACELESS_GRACE_MS = 180L;
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_FORCE_COMPLETE_MS = 650L;
+    /** 分级恢复在多次 kick 后，尝试一次极小位移的 render-refresh seek，强制催出首帧。 */
+    private static final long BACKGROUND_SURFACE_RESTORE_RENDER_REFRESH_SEEK_OFFSET_MS = 16L;
+    /** sticky 记录恢复期曾观测到的输出帧率，避免 progressTimer 漏采样时无法完成恢复。 */
+    private volatile float backgroundSurfaceRestoreLastObservedOutputFps = 0f;
+    /** 本地后台恢复时做一次极小位移的准确 seek，强制淘汰旧/错帧；音频副作用由短暂静音兜底。 */
+    private static final long LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_DELAY_MS = 90L;
+    private static final long LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_SETTLE_MS = 140L;
+    private static final long LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_SEEK_OFFSET_MS = 8L;
+    private static final long LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_MOVED_MS = 96L;
+    private volatile boolean localBackgroundSurfaceFrameCorrectionPending = false;
+    private volatile boolean localBackgroundSurfaceFrameCorrectionTriggered = false;
+    private volatile long localBackgroundSurfaceFrameCorrectionTriggeredUptimeMs = 0L;
+    /** correction seek 成功后的基准位置；恢复完成判定必须基于这个位置之后的“自然推进”，不能把 seek 自身算进去。 */
+    private volatile long localBackgroundSurfaceFrameCorrectionBasePosMs = -1L;
+    private static final long LOCAL_BACKGROUND_SURFACE_AUDIO_MUTE_MIN_MS = 160L;
+    private static final long LOCAL_BACKGROUND_SURFACE_AUDIO_MUTE_MAX_MS = 360L;
+    private static final long LOCAL_BACKGROUND_SURFACE_AUDIO_RESTORE_MARGIN_MS = 48L;
+    private volatile boolean localBackgroundSurfaceAudioMutedForCorrection = false;
+    private volatile long localBackgroundSurfaceAudioRestorePosMs = -1L;
+    private volatile long localBackgroundSurfaceAudioMuteStartUptimeMs = 0L;
 
-    /** 本地/缓存视频后台回前台黑屏兜底：只给极短恢复窗口，失败就尽快重建，减少 1~5s 波动。 */
-    private static final long LOCAL_BACKGROUND_SURFACE_BLACK_REBUILD_TIMEOUT_MS = 500L;
+    /** 本地/缓存视频后台回前台黑屏兜底：进一步压缩等待窗口，优先更快重建。 */
+    private static final long LOCAL_BACKGROUND_SURFACE_BLACK_REBUILD_TIMEOUT_MS = 1200L;
 
     private Runnable localBackgroundSurfaceBlackRebuildRunnable;
 
@@ -381,18 +422,33 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private volatile long localSeekVerifyTargetMs = -1L;
     private volatile int localSeekVerifyRetry = 0;
 
-    /** 后台连续播放返回前台后，若首帧迟迟不出，则延迟触发一次轻量 refresh seek 来催出画面 */
-    private static final long BACKGROUND_SURFACE_REFRESH_TIMEOUT_MS = 450L;
-    /** refresh seek 只前推极小距离，尽量减少对用户感知进度与回退风险的影响 */
+    /**
+     * 后台连续播放返回前台后，若首帧迟迟不出，则延迟触发一次轻量渲染 kick 来催出画面。
+     * <p>
+     * 参考 PiliPlus：允许后台继续播放时，优先保留旧 session/旧缓冲，不要过早进入 reopen/seek。
+     */
+    private static final long BACKGROUND_SURFACE_REFRESH_TIMEOUT_MS = 220L;
+    /** 保留旧常量名，仅为兼容历史代码注释；当前在线视频恢复不再使用 seek 催首帧。 */
     private static final long BACKGROUND_SURFACE_REFRESH_SEEK_OFFSET_MS = 33L;
     private Runnable backgroundSurfaceRefreshRunnable;
     private volatile boolean backgroundSurfaceRefreshPending = false;
     private volatile boolean backgroundSurfaceRefreshTriggered = false;
+    /** 最近一次主动 refresh 触发时刻/目标位置；用于避免 refresh 刚触发就被旧采样误判为“已恢复”。 */
+    private volatile long backgroundSurfaceRefreshTriggeredUptimeMs = 0L;
+    private volatile long backgroundSurfaceRefreshTriggeredPosMs = -1L;
     /**
      * 后台返回前台但旧 player session 仍在时，对渲染输出做一次短暂健康检查；
      * 若迟迟没有有效输出帧，则直接重建 session，而不是继续等待旧渲染链“自己恢复”。
      */
-    private static final long BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_MS = 700L;
+    /**
+     * 在线视频恢复：先给旧渲染链一个短暂自恢复窗口；若仍未恢复，则升级到 refresh / rebuild。
+     */
+    private static final long BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_MS = 650L;
+    /** 在线恢复做过一次 refresh kick 后，再给一次较短观察窗口；仍失败则直接重建 session。 */
+    private static final long BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_AFTER_REFRESH_MS = 900L;
+    /** refresh 刚触发后，至少等待一小段时间并确认“refresh 后的自然推进”，再允许判定恢复完成。 */
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MIN_MS = 180L;
+    private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MOVED_MS = 120L;
     private Runnable backgroundResumeRenderHealthCheckRunnable;
     private volatile long backgroundResumeRenderHealthCheckStartPosMs = -1L;
 
@@ -1281,13 +1337,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 backgroundPlaybackSurfaceRecreated = false;
 
                 if (isOnlineVideo) {
-                    // 在线视频回到更保守、稳定的策略：
-                    // surface recreate 后直接重建 player session，避免旧解码链把错帧/花屏重新带出来。
+                    // 实测当前项目 + ijk 组合下，在线视频在 surface recreate 后复用旧 session 的渲染恢复非常不稳定：
+                    // 经常走完整个 passive->refresh->rebuild 链路，期间持续黑屏，甚至出现音频继续但画面不回来的情况。
+                    // 因此这里改成更激进但更稳定的策略：直接重建在线播放会话，并强制回到当前进度。
                     pendingForcedSeekMs = restorePosition;
                     progress_history = restorePosition;
+                    pendingOnlineRebuildFirstVideoFrameFallback = true;
                     showFrameLoading("恢复画面中", "(｀・ω・´)");
-                    Logu.w("surface", from + ": rebuild after online background playback surface recreate, pos="
-                            + restorePosition);
+                    Logu.w("surface", from + ": direct rebuild after online background playback surface recreate, pos="
+                            + restorePosition + ", session=" + playerSessionId);
                     rebuildPlayerSession("backgroundSurfaceRecreateRestore", restorePosition);
                 } else {
                     // 本地/缓存视频先保留旧会话音频，走分级恢复；若仍无首帧，再由本地 black timeout 重建。
@@ -1544,11 +1602,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (isAudioOnlyMode) {
             waitingForFirstVideoFrame = false;
             firstVideoFrameRendered = true;
+            waitingForFirstVideoFrameStartPosMs = 0L;
             return;
         }
         waitingForFirstVideoFrame = true;
         firstVideoFrameRendered = false;
         waitingForFirstVideoFrameUptimeMs = android.os.SystemClock.uptimeMillis();
+        long startPos = Math.max(0L, latestPlayerPositionMs);
+        if (ijkPlayer != null && isPrepared) {
+            try {
+                startPos = Math.max(startPos, ijkPlayer.getCurrentPosition());
+            } catch (Exception ignore) {
+            }
+        }
+        waitingForFirstVideoFrameStartPosMs = Math.max(0L, startPos);
 
         // 本地/缓存视频：兜底，避免不触发 MEDIA_INFO_VIDEO_RENDERING_START 时 loading 永久悬浮。
         // 仅对本地启用，避免影响在线 buffering 行为。
@@ -1560,9 +1627,72 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         Logu.d("render", "beginWaitingForFirstVideoFrame: " + reason);
     }
 
+    private void cancelOnlineRebuildFirstVideoFrameFallback() {
+        if (mainHandler != null && onlineRebuildFirstVideoFrameFallbackRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(onlineRebuildFirstVideoFrameFallbackRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        onlineRebuildFirstVideoFrameFallbackRunnable = null;
+        pendingOnlineRebuildFirstVideoFrameFallback = false;
+    }
+
+    private void scheduleOnlineRebuildFirstVideoFrameFallback(@NonNull String reason) {
+        if (!pendingOnlineRebuildFirstVideoFrameFallback || destroyed || resourcesReleased || !isOnlineVideo || isAudioOnlyMode)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        cancelOnlineRebuildFirstVideoFrameFallback();
+        pendingOnlineRebuildFirstVideoFrameFallback = true;
+        final int session = playerSessionId;
+        onlineRebuildFirstVideoFrameFallbackRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId) {
+                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    pendingOnlineRebuildFirstVideoFrameFallback = false;
+                    return;
+                }
+                if (!pendingOnlineRebuildFirstVideoFrameFallback || !waitingForFirstVideoFrame || firstVideoFrameRendered) {
+                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    return;
+                }
+
+                long pos = safeGetPlayerPositionMs();
+                long moved = Math.max(0L, pos - waitingForFirstVideoFrameStartPosMs);
+                float outputFps = 0f;
+                try {
+                    if (ijkPlayer != null) {
+                        outputFps = ijkPlayer.getVideoOutputFramesPerSecond();
+                    }
+                } catch (Exception ignore) {
+                }
+
+                if (moved >= ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS
+                        || (isRenderSurfaceReady() && outputFps > 8f)) {
+                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    pendingOnlineRebuildFirstVideoFrameFallback = false;
+                    onFirstVideoFrameRendered("onlineRebuildFallback:" + reason
+                            + ", moved=" + moved + ", fps=" + outputFps);
+                    return;
+                }
+
+                if (mainHandler != null) {
+                    mainHandler.postDelayed(this, 180L);
+                }
+            }
+        };
+        mainHandler.postDelayed(onlineRebuildFirstVideoFrameFallbackRunnable,
+                ONLINE_REBUILD_FIRST_VIDEO_FRAME_FALLBACK_MS);
+    }
+
     private void cancelBackgroundSurfaceRefreshTimeout() {
         backgroundSurfaceRefreshPending = false;
         backgroundSurfaceRefreshTriggered = false;
+        backgroundSurfaceRefreshTriggeredUptimeMs = 0L;
+        backgroundSurfaceRefreshTriggeredPosMs = -1L;
         if (mainHandler != null && backgroundSurfaceRefreshRunnable != null) {
             try {
                 mainHandler.removeCallbacks(backgroundSurfaceRefreshRunnable);
@@ -1661,22 +1791,48 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
 
+            boolean restoreCompleted = false;
             if (isRenderSurfaceReady() && outputFps > 0.01f) {
-                // 某些 ROM 下收到有效输出帧却未必有首帧事件；此处顺手兜底一次。
                 if (waitingForFirstVideoFrame && !firstVideoFrameRendered) {
-                    onFirstVideoFrameRendered("backgroundResumeHealthCheck-outputFps=" + outputFps);
+                    if (inBackgroundSurfaceRestore) {
+                        restoreCompleted = maybeCompleteBackgroundRestoreByHeuristic(
+                                "backgroundResumeHealthCheck", outputFps);
+                    }
                 } else {
                     cancelBackgroundResumeRenderHealthCheck();
+                    return;
                 }
-                return;
+                if (restoreCompleted)
+                    return;
+            }
+
+            // 在线恢复单独走“两级兜底”：
+            // 1) 首次 health check 未恢复时，先做一次轻量 refresh kick（尽量保留旧 session/缓冲）
+            // 2) refresh 后仍未恢复，再直接 rebuild，避免黑屏长尾拖到数秒
+            if (!backgroundSurfaceRefreshTriggered) {
+                long refreshPosition = Math.max(backgroundResumeRenderHealthCheckStartPosMs,
+                        safeGetPlayerPositionMs());
+                boolean refreshed = performBackgroundSurfaceRefresh("onlineHealthCheck:" + reason);
+                if (refreshed) {
+                    Logu.w("surface", "online restore refresh fallback: reason=" + reason
+                            + ", pos=" + refreshPosition
+                            + ", decodeFps=" + decodeFps
+                            + ", outputFps=" + outputFps
+                            + ", waiting=" + waitingForFirstVideoFrame);
+                    scheduleBackgroundResumeRenderHealthCheck(refreshPosition,
+                            "afterRefresh:" + reason,
+                            BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_AFTER_REFRESH_MS);
+                    return;
+                }
             }
 
             long rebuildPosition = Math.max(backgroundResumeRenderHealthCheckStartPosMs,
                     safeGetPlayerPositionMs());
             pendingForcedSeekMs = rebuildPosition;
             progress_history = rebuildPosition;
+            pendingOnlineRebuildFirstVideoFrameFallback = true;
             showFrameLoading("恢复画面中", "(｀・ω・´)");
-            Logu.w("surface", "background resume quick rebuild: reason=" + reason
+            Logu.w("surface", "online restore rebuild fallback: reason=" + reason
                     + ", pos=" + rebuildPosition
                     + ", decodeFps=" + decodeFps
                     + ", outputFps=" + outputFps
@@ -1697,6 +1853,385 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             target += BACKGROUND_SURFACE_REFRESH_SEEK_OFFSET_MS;
         }
         return Math.max(0L, target);
+    }
+
+    private void markBackgroundRestoreOutputFpsObserved(float outputFps, @NonNull String source) {
+        if (!inBackgroundSurfaceRestore || outputFps <= 0.01f)
+            return;
+        backgroundSurfaceRestoreLastObservedOutputFps = Math.max(backgroundSurfaceRestoreLastObservedOutputFps, outputFps);
+        if (!backgroundSurfaceRestoreOutputFpsObserved) {
+            backgroundSurfaceRestoreOutputFpsObserved = true;
+            backgroundSurfaceRestoreOutputFpsObservedUptimeMs = android.os.SystemClock.uptimeMillis();
+            Logu.w("surface", "bgRestore observed outputFps: source=" + source
+                    + ", fps=" + outputFps
+                    + ", step=" + backgroundSurfaceRestoreStep
+                    + ", frameEvent=" + backgroundSurfaceRestoreFrameEventReceived
+                    + ", session=" + playerSessionId);
+        }
+        if (!isOnlineVideo) {
+            scheduleLocalBackgroundSurfaceFrameCorrection("outputObserved:" + source);
+        }
+    }
+
+    private void restoreAudioAfterLocalFrameCorrection(@NonNull String reason) {
+        if (!localBackgroundSurfaceAudioMutedForCorrection)
+            return;
+        localBackgroundSurfaceAudioMutedForCorrection = false;
+        localBackgroundSurfaceAudioRestorePosMs = -1L;
+        localBackgroundSurfaceAudioMuteStartUptimeMs = 0L;
+        IjkMediaPlayer player = ijkPlayer;
+        if (player != null) {
+            try {
+                player.setVolume(1f, 1f);
+            } catch (Exception ignore) {
+            }
+        }
+        Logu.d("surface", "local frame correction audio restore: reason=" + reason);
+    }
+
+    private void cancelLocalBackgroundSurfaceAudioRestore() {
+        if (mainHandler != null && localBackgroundSurfaceAudioRestoreRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(localBackgroundSurfaceAudioRestoreRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        localBackgroundSurfaceAudioRestoreRunnable = null;
+        restoreAudioAfterLocalFrameCorrection("cancel");
+    }
+
+    private void scheduleLocalBackgroundSurfaceAudioRestore(long fromPositionMs, @NonNull String reason) {
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+        cancelLocalBackgroundSurfaceAudioRestore();
+
+        IjkMediaPlayer player = ijkPlayer;
+        if (player == null)
+            return;
+        try {
+            player.setVolume(0f, 0f);
+            localBackgroundSurfaceAudioMutedForCorrection = true;
+            localBackgroundSurfaceAudioMuteStartUptimeMs = android.os.SystemClock.uptimeMillis();
+            localBackgroundSurfaceAudioRestorePosMs = Math.max(0L,
+                    fromPositionMs + LOCAL_BACKGROUND_SURFACE_AUDIO_RESTORE_MARGIN_MS);
+        } catch (Exception ignore) {
+            localBackgroundSurfaceAudioMutedForCorrection = false;
+            localBackgroundSurfaceAudioRestorePosMs = -1L;
+            localBackgroundSurfaceAudioMuteStartUptimeMs = 0L;
+            return;
+        }
+
+        final int session = playerSessionId;
+        localBackgroundSurfaceAudioRestoreRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId) {
+                    localBackgroundSurfaceAudioRestoreRunnable = null;
+                    restoreAudioAfterLocalFrameCorrection("sessionChanged");
+                    return;
+                }
+                if (!localBackgroundSurfaceAudioMutedForCorrection) {
+                    localBackgroundSurfaceAudioRestoreRunnable = null;
+                    return;
+                }
+
+                long elapsed = android.os.SystemClock.uptimeMillis() - localBackgroundSurfaceAudioMuteStartUptimeMs;
+                long pos = safeGetPlayerPositionMs();
+                if (elapsed >= LOCAL_BACKGROUND_SURFACE_AUDIO_MUTE_MIN_MS
+                        && (pos >= localBackgroundSurfaceAudioRestorePosMs
+                        || elapsed >= LOCAL_BACKGROUND_SURFACE_AUDIO_MUTE_MAX_MS)) {
+                    localBackgroundSurfaceAudioRestoreRunnable = null;
+                    restoreAudioAfterLocalFrameCorrection(reason + ", pos=" + pos + ", elapsed=" + elapsed);
+                    return;
+                }
+                if (mainHandler != null) {
+                    mainHandler.postDelayed(this, 35L);
+                }
+            }
+        };
+        mainHandler.postDelayed(localBackgroundSurfaceAudioRestoreRunnable, 35L);
+    }
+
+    private void cancelLocalBackgroundSurfaceFrameCorrection() {
+        localBackgroundSurfaceFrameCorrectionPending = false;
+        localBackgroundSurfaceFrameCorrectionTriggered = false;
+        localBackgroundSurfaceFrameCorrectionTriggeredUptimeMs = 0L;
+        localBackgroundSurfaceFrameCorrectionBasePosMs = -1L;
+        if (mainHandler != null && localBackgroundSurfaceFrameCorrectionRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(localBackgroundSurfaceFrameCorrectionRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        localBackgroundSurfaceFrameCorrectionRunnable = null;
+    }
+
+    private void scheduleLocalBackgroundSurfaceFrameCorrection(@NonNull String reason) {
+        if (destroyed || resourcesReleased || isOnlineVideo || isAudioOnlyMode)
+            return;
+        if (!inBackgroundSurfaceRestore || !waitingForFirstVideoFrame || firstVideoFrameRendered)
+            return;
+        if (ijkPlayer == null || !isPrepared)
+            return;
+        if (localBackgroundSurfaceFrameCorrectionPending || localBackgroundSurfaceFrameCorrectionTriggered)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        final int session = playerSessionId;
+        localBackgroundSurfaceFrameCorrectionPending = true;
+        localBackgroundSurfaceFrameCorrectionRunnable = () -> {
+            localBackgroundSurfaceFrameCorrectionRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId) {
+                localBackgroundSurfaceFrameCorrectionPending = false;
+                return;
+            }
+            if (!inBackgroundSurfaceRestore || !waitingForFirstVideoFrame || firstVideoFrameRendered) {
+                localBackgroundSurfaceFrameCorrectionPending = false;
+                return;
+            }
+            IjkMediaPlayer player = ijkPlayer;
+            if (player == null || !isPrepared) {
+                localBackgroundSurfaceFrameCorrectionPending = false;
+                return;
+            }
+
+            long currentPosition = safeGetPlayerPositionMs();
+            scheduleLocalBackgroundSurfaceAudioRestore(currentPosition, "frameCorrection:" + reason);
+            long target = Math.max(0L, currentPosition + LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_SEEK_OFFSET_MS);
+            if (video_all > 0) {
+                target = Math.min(target, Math.max(0L, video_all - 1L));
+            }
+
+            try {
+                attachSurfaceIfPossible();
+            } catch (Exception ignore) {
+            }
+            try {
+                player.seekTo(target);
+            } catch (Exception e) {
+                localBackgroundSurfaceFrameCorrectionPending = false;
+                Logu.w("surface", "local frame correction seek failed: reason=" + reason + ", err=" + e.getMessage());
+                return;
+            }
+
+            markExplicitSeek(target);
+            if (hasDanmaku && mDanmakuView != null) {
+                try {
+                    mDanmakuView.seekTo(target);
+                } catch (Exception ignore) {
+                }
+            }
+            syncProgressUiFromPlayer(target);
+            localBackgroundSurfaceFrameCorrectionPending = false;
+            localBackgroundSurfaceFrameCorrectionTriggered = true;
+            localBackgroundSurfaceFrameCorrectionTriggeredUptimeMs = android.os.SystemClock.uptimeMillis();
+            localBackgroundSurfaceFrameCorrectionBasePosMs = target;
+            Logu.w("surface", "local frame correction seek: reason=" + reason
+                    + ", current=" + currentPosition
+                    + ", target=" + target
+                    + ", session=" + playerSessionId);
+        };
+        mainHandler.postDelayed(localBackgroundSurfaceFrameCorrectionRunnable,
+                LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_DELAY_MS);
+    }
+
+    private boolean maybeCompleteBackgroundRestoreByHeuristic(@NonNull String source, float outputFps) {
+        if (!inBackgroundSurfaceRestore || firstVideoFrameRendered || !waitingForFirstVideoFrame)
+            return false;
+        if (outputFps > 0.01f) {
+            markBackgroundRestoreOutputFpsObserved(outputFps, source);
+        }
+        boolean outputObserved = backgroundSurfaceRestoreOutputFpsObserved;
+        float effectiveFps = outputFps > 0.01f ? outputFps : backgroundSurfaceRestoreLastObservedOutputFps;
+        if (!outputObserved && !backgroundSurfaceRestoreFrameEventReceived)
+            return false;
+
+        long now = android.os.SystemClock.uptimeMillis();
+        long observedFor = backgroundSurfaceRestoreOutputFpsObservedUptimeMs > 0L
+                ? (now - backgroundSurfaceRestoreOutputFpsObservedUptimeMs)
+                : 0L;
+        long pos = safeGetPlayerPositionMs();
+        long completionBasePos = Math.max(0L, backgroundSurfaceRestoreStartPosMs);
+        if (isOnlineVideo && backgroundSurfaceRefreshTriggeredPosMs >= 0L) {
+            completionBasePos = Math.max(completionBasePos, backgroundSurfaceRefreshTriggeredPosMs);
+        }
+        if (!isOnlineVideo && localBackgroundSurfaceFrameCorrectionBasePosMs >= 0L) {
+            completionBasePos = Math.max(completionBasePos, localBackgroundSurfaceFrameCorrectionBasePosMs);
+        }
+        long moved = Math.max(0L, pos - completionBasePos);
+        boolean surfaceReady = isRenderSurfaceReady();
+        boolean stableObservedOutput = outputObserved
+                && observedFor >= (BACKGROUND_SURFACE_RESTORE_HEURISTIC_OBSERVED_MS
+                + BACKGROUND_SURFACE_RESTORE_HEURISTIC_SURFACELESS_GRACE_MS);
+        // 在线视频：仅凭 passive reattach 阶段观测到 outputFps>0 不能判定“画面真的已经回来了”。
+        // 你提供的日志里就出现了 outputFps 正常、loading 被隐藏，但屏幕仍持续黑屏的情况。
+        // 因此在线场景必须至少经历一次主动 refresh（render-refresh seek / kick）后，
+        // 才允许用启发式判定恢复完成；否则继续等待 health check 走 refresh/rebuild 链路。
+        boolean restoreAdvanced = isOnlineVideo
+                ? backgroundSurfaceRefreshTriggered
+                : (backgroundSurfaceRestoreStep >= 1 || backgroundSurfaceRefreshTriggered);
+        boolean correctionSettled = isOnlineVideo
+                || (!localBackgroundSurfaceFrameCorrectionPending
+                && (!localBackgroundSurfaceFrameCorrectionTriggered
+                || now - localBackgroundSurfaceFrameCorrectionTriggeredUptimeMs
+                >= LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_SETTLE_MS));
+        long movedThreshold = !isOnlineVideo && localBackgroundSurfaceFrameCorrectionTriggered
+                ? LOCAL_BACKGROUND_SURFACE_FRAME_CORRECTION_MOVED_MS
+                : BACKGROUND_SURFACE_RESTORE_HEURISTIC_MOVED_MS;
+
+        if (backgroundSurfaceRestoreFrameEventReceived) {
+            onFirstVideoFrameRendered("bgRestore-frameEvent+heuristic:" + source + ", fps=" + effectiveFps);
+            return true;
+        }
+
+        // 在线视频后台恢复：不再接受基于 outputFps / 进度推进的启发式“恢复完成”。
+        // 只要没收到真实的首帧事件，就继续等待 health check 触发 refresh / rebuild，
+        // 避免出现“日志显示恢复完成，但屏幕仍黑”的误判。
+        if (isOnlineVideo) {
+            return false;
+        }
+
+        if (isOnlineVideo && backgroundSurfaceRefreshTriggered) {
+            long refreshElapsed = backgroundSurfaceRefreshTriggeredUptimeMs > 0L
+                    ? (now - backgroundSurfaceRefreshTriggeredUptimeMs)
+                    : 0L;
+            if (refreshElapsed < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MIN_MS
+                    || moved < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MOVED_MS) {
+                return false;
+            }
+        }
+
+        // 没有 frame event 时，至少要求：
+        // 1) 已执行到较后阶段/做过 refresh；
+        // 2) outputFps 持续一小段时间；
+        // 3) 播放位置确实在推进。
+        if ((surfaceReady || stableObservedOutput) && restoreAdvanced && outputObserved && correctionSettled
+                && observedFor >= BACKGROUND_SURFACE_RESTORE_HEURISTIC_OBSERVED_MS
+                && moved >= movedThreshold) {
+            Logu.w("surface", "bgRestore heuristic complete: source=" + source
+                    + ", fps=" + effectiveFps
+                    + ", observedFor=" + observedFor + "ms"
+                    + ", moved=" + moved + "ms"
+                    + ", step=" + backgroundSurfaceRestoreStep
+                    + ", surfaceReady=" + surfaceReady);
+            onFirstVideoFrameRendered("bgRestore-heuristic:" + source + ", fps=" + effectiveFps);
+            return true;
+        }
+
+        // 长尾兜底：某些设备上 outputFps 已经稳定出现，但 surfaceReady / currentPosition 推进上报仍可能漏判，
+        // 导致恢复流程卡在半状态数秒甚至更久。此时在“已观测到稳定输出一段时间”后直接认为画面恢复完成，
+        // 优先消除 1~+∞ 的长尾。
+        if (restoreAdvanced && outputObserved && correctionSettled
+                && observedFor >= BACKGROUND_SURFACE_RESTORE_HEURISTIC_FORCE_COMPLETE_MS
+                && effectiveFps > 5f) {
+            Logu.w("surface", "bgRestore force complete after stable output: source=" + source
+                    + ", fps=" + effectiveFps
+                    + ", observedFor=" + observedFor + "ms"
+                    + ", moved=" + moved + "ms"
+                    + ", step=" + backgroundSurfaceRestoreStep
+                    + ", surfaceReady=" + surfaceReady);
+            onFirstVideoFrameRendered("bgRestore-forceComplete:" + source + ", fps=" + effectiveFps);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 恢复期专用高频探针：脱离 progressTimer 的 250ms 低频采样，避免“观测到 outputFps 后又漏判”导致恢复卡住。
+     */
+    private void startBackgroundSurfaceRestoreProbe(@NonNull String reason) {
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        if (backgroundSurfaceRestoreProbeRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(backgroundSurfaceRestoreProbeRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+
+        final int session = playerSessionId;
+        backgroundSurfaceRestoreProbeRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId)
+                    return;
+                if (!inBackgroundSurfaceRestore || !waitingForFirstVideoFrame || firstVideoFrameRendered)
+                    return;
+
+                IjkMediaPlayer player = ijkPlayer;
+                if (player == null || !isPrepared)
+                    return;
+
+                // 高频 probe 顺手重复 reattach，避免某些 ROM 上单次 surfaceCreated 绑定丢失后一直等不到画面恢复。
+                attachSurfaceIfPossible();
+
+                float outputFps = 0f;
+                try {
+                    outputFps = player.getVideoOutputFramesPerSecond();
+                } catch (Exception ignore) {
+                }
+
+                if (!maybeCompleteBackgroundRestoreByHeuristic("restoreProbe", outputFps) && mainHandler != null) {
+                    mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_PROBE_INTERVAL_MS);
+                }
+            }
+        };
+        mainHandler.postDelayed(backgroundSurfaceRestoreProbeRunnable, BACKGROUND_SURFACE_RESTORE_PROBE_INTERVAL_MS);
+        Logu.d("surface", "start bgRestore probe: reason=" + reason
+                + ", interval=" + BACKGROUND_SURFACE_RESTORE_PROBE_INTERVAL_MS + "ms");
+    }
+
+    private boolean performBackgroundSurfaceRenderRefreshSeek(@NonNull String reason, long positionMs) {
+        if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode || !isPrepared)
+            return false;
+
+        IjkMediaPlayer player = ijkPlayer;
+        if (player == null)
+            return false;
+
+        long currentPosition = Math.max(positionMs, safeGetPlayerPositionMs());
+        long target = Math.max(0L, currentPosition + BACKGROUND_SURFACE_RESTORE_RENDER_REFRESH_SEEK_OFFSET_MS);
+        if (video_all > 0) {
+            target = Math.min(target, Math.max(0L, video_all - 1L));
+        }
+        if (target == currentPosition && currentPosition > 0L) {
+            target = Math.max(0L, currentPosition - 1L);
+        }
+
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+        try {
+            player.seekTo(target);
+            markExplicitSeek(target);
+            if (hasDanmaku && mDanmakuView != null) {
+                try {
+                    mDanmakuView.seekTo(target);
+                } catch (Exception ignore) {
+                }
+            }
+            syncProgressUiFromPlayer(target);
+            backgroundSurfaceRefreshTriggered = true;
+            backgroundSurfaceRefreshTriggeredUptimeMs = android.os.SystemClock.uptimeMillis();
+            backgroundSurfaceRefreshTriggeredPosMs = target;
+            if (inBackgroundSurfaceRestore && isOnlineVideo) {
+                backgroundSurfaceRestoreOutputFpsObserved = false;
+                backgroundSurfaceRestoreOutputFpsObservedUptimeMs = 0L;
+                backgroundSurfaceRestoreLastObservedOutputFps = 0f;
+            }
+            Logu.w("surface", "background render-refresh seek triggered: reason=" + reason
+                    + ", current=" + currentPosition
+                    + ", target=" + target
+                    + ", online=" + isOnlineVideo
+                    + ", session=" + playerSessionId);
+            return true;
+        } catch (Exception e) {
+            Logu.w("surface", "background render-refresh seek failed: reason=" + reason + ", err=" + e.getMessage());
+            return false;
+        }
     }
 
     private boolean performBackgroundSurfaceRefresh(@NonNull String reason) {
@@ -1722,29 +2257,62 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
             backgroundSurfaceRefreshTriggered = true;
+            backgroundSurfaceRefreshTriggeredUptimeMs = android.os.SystemClock.uptimeMillis();
+            backgroundSurfaceRefreshTriggeredPosMs = currentPosition;
             syncProgressUiFromPlayer(currentPosition);
             Logu.w("surface", "background refresh kick(no-seek) triggered: reason=" + reason
                     + ", pos=" + currentPosition);
             return true;
         }
 
-        long refreshTarget = getBackgroundRefreshSeekTargetMs(currentPosition);
+        float outputFps = 0f;
+        float decodeFps = 0f;
         try {
-            player.seekTo(refreshTarget);
-            markExplicitSeek(refreshTarget);
-            if (hasDanmaku && mDanmakuView != null) {
-                try {
-                    mDanmakuView.seekTo(refreshTarget);
-                } catch (Exception ignore) {
-                }
-            }
+            outputFps = player.getVideoOutputFramesPerSecond();
+        } catch (Exception ignore) {
+        }
+        try {
+            decodeFps = player.getVideoDecodeFramesPerSecond();
+        } catch (Exception ignore) {
+        }
+        // 在线视频优先尝试一次极小位移的 accurate seek，强制真正往新 surface 推一帧。
+        // 若失败，再回退到 pause/start 的轻量 kick。
+        if (performBackgroundSurfaceRenderRefreshSeek(reason + ":renderRefresh", currentPosition)) {
+            Logu.w("surface", "background refresh render-seek(online) triggered: reason=" + reason
+                    + ", pos=" + currentPosition
+                    + ", decodeFps=" + decodeFps
+                    + ", outputFps=" + outputFps);
+            return true;
+        }
+
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+        try {
+            player.pause();
+        } catch (Exception ignore) {
+        }
+        try {
+            player.start();
+        } catch (Exception ignore) {
+        }
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+        try {
             backgroundSurfaceRefreshTriggered = true;
-            syncProgressUiFromPlayer(refreshTarget);
-            Logu.w("surface", "background refresh seek triggered: reason=" + reason
-                    + ", current=" + currentPosition + ", target=" + refreshTarget);
+            backgroundSurfaceRefreshTriggeredUptimeMs = android.os.SystemClock.uptimeMillis();
+            backgroundSurfaceRefreshTriggeredPosMs = currentPosition;
+            syncProgressUiFromPlayer(currentPosition);
+            Logu.w("surface", "background refresh kick(online no-seek) triggered: reason=" + reason
+                    + ", pos=" + currentPosition
+                    + ", decodeFps=" + decodeFps
+                    + ", outputFps=" + outputFps);
             return true;
         } catch (Exception e) {
-            Logu.w("surface", "background refresh seek failed: " + e.getMessage());
+            Logu.w("surface", "background refresh kick failed: " + e.getMessage());
             return false;
         }
     }
@@ -1778,13 +2346,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             performBackgroundSurfaceRefresh(reason);
         };
         mainHandler.postDelayed(backgroundSurfaceRefreshRunnable, BACKGROUND_SURFACE_REFRESH_TIMEOUT_MS);
-        Logu.d("surface", "schedule background refresh seek: reason=" + reason
+        Logu.d("surface", "schedule background refresh kick: reason=" + reason
                 + ", timeout=" + BACKGROUND_SURFACE_REFRESH_TIMEOUT_MS + "ms");
     }
 
     private void onFirstVideoFrameRendered(@NonNull String reason) {
+        long restoreElapsedMs = backgroundSurfaceRestoreStartUptimeMs > 0L
+                ? (android.os.SystemClock.uptimeMillis() - backgroundSurfaceRestoreStartUptimeMs)
+                : -1L;
+        boolean restoreFrameEventReceived = backgroundSurfaceRestoreFrameEventReceived;
+        boolean restoreOutputObserved = backgroundSurfaceRestoreOutputFpsObserved;
+        int restoreStep = backgroundSurfaceRestoreStep;
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
+        cancelOnlineRebuildFirstVideoFrameFallback();
         cancelFirstVideoFrameFallback();
         cancelBackgroundSurfaceRestore();
         if (firstVideoFrameRendered)
@@ -1792,10 +2367,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         firstVideoFrameRendered = true;
         waitingForFirstVideoFrame = false;
         waitingForFirstVideoFrameUptimeMs = 0L;
+        waitingForFirstVideoFrameStartPosMs = 0L;
         inBackgroundSurfaceRestore = false;
         backgroundSurfaceRestoreStartUptimeMs = 0L;
         hideFrameLoading(reason);
         Logu.d("render", "onFirstVideoFrameRendered: " + reason);
+        if (restoreElapsedMs >= 0L) {
+            Logu.w("surface", "bgRestore complete: reason=" + reason
+                    + ", elapsed=" + restoreElapsedMs + "ms"
+                    + ", frameEvent=" + restoreFrameEventReceived
+                    + ", outputObserved=" + restoreOutputObserved
+                    + ", step=" + restoreStep);
+        }
     }
 
     /**
@@ -1813,6 +2396,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         waitingForFirstVideoFrame = false;
         firstVideoFrameRendered = true;
         waitingForFirstVideoFrameUptimeMs = 0L;
+        waitingForFirstVideoFrameStartPosMs = 0L;
 
         hideFrameLoading(reason);
         Logu.d("render", "ensureLoadingHidden: " + reason);
@@ -1861,7 +2445,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
             if (outputFps > 0.01f) {
-                onFirstVideoFrameRendered("localBackgroundBlackRebuildSkip-outputFps=" + outputFps);
+                if (!inBackgroundSurfaceRestore) {
+                    onFirstVideoFrameRendered("localBackgroundBlackRebuildSkip-outputFps=" + outputFps);
+                } else {
+                    maybeCompleteBackgroundRestoreByHeuristic("localBackgroundBlackRebuild", outputFps);
+                }
                 return;
             }
 
@@ -1939,8 +2527,22 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
         backgroundSurfaceRestoreAutoHideRunnable = null;
 
+        if (mainHandler != null && backgroundSurfaceRestoreProbeRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(backgroundSurfaceRestoreProbeRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        backgroundSurfaceRestoreProbeRunnable = null;
+
+        cancelLocalBackgroundSurfaceFrameCorrection();
+
         backgroundSurfaceRestoreStep = 0;
         backgroundSurfaceRestoreBasePosMs = -1L;
+        backgroundSurfaceRestoreFrameEventReceived = false;
+        backgroundSurfaceRestoreOutputFpsObserved = false;
+        backgroundSurfaceRestoreOutputFpsObservedUptimeMs = 0L;
+        backgroundSurfaceRestoreLastObservedOutputFps = 0f;
     }
 
     /**
@@ -1950,7 +2552,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      */
     private void startBackgroundSurfaceRestore(long restorePositionMs, @NonNull String reason) {
         cancelBackgroundSurfaceRestore();
+        cancelLocalBackgroundSurfaceAudioRestore();
         cancelBackgroundSurfaceRefreshTimeout();
+        cancelBackgroundResumeRenderHealthCheck();
 
         if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode)
             return;
@@ -1964,6 +2568,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         backgroundSurfaceRestoreBasePosMs = Math.max(0L, restorePositionMs);
         backgroundSurfaceRestoreStep = 0;
         backgroundSurfaceRestoreStartPosMs = safeGetPlayerPositionMs();
+        backgroundSurfaceRestoreFrameEventReceived = false;
+        backgroundSurfaceRestoreOutputFpsObserved = false;
+        backgroundSurfaceRestoreOutputFpsObservedUptimeMs = 0L;
+        localBackgroundSurfaceFrameCorrectionPending = false;
+        localBackgroundSurfaceFrameCorrectionTriggered = false;
+        localBackgroundSurfaceFrameCorrectionTriggeredUptimeMs = 0L;
+        localBackgroundSurfaceFrameCorrectionBasePosMs = -1L;
+
+        Logu.w("surface", "startBackgroundSurfaceRestore: reason=" + reason
+                + ", online=" + isOnlineVideo
+                + ", pos=" + backgroundSurfaceRestoreBasePosMs
+                + ", startPos=" + backgroundSurfaceRestoreStartPosMs
+                + ", session=" + playerSessionId);
 
         // 显示 loading（避免纯黑），并提示“恢复画面”。
         beginWaitingForFirstVideoFrame("backgroundSurfaceRestore:" + reason);
@@ -1976,13 +2593,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         final int session = playerSessionId;
 
-        // 在线视频：保留原有的“+33ms 轻量 seek 催首帧”策略（450ms 超时触发一次）。
-        // 本地/缓存视频禁用该策略，避免 ijk 非精确 seek 对齐关键帧导致肉眼回退。
         if (isOnlineVideo) {
-            scheduleBackgroundSurfaceRefreshTimeout("bgRestore-online:" + reason);
+            scheduleBackgroundResumeRenderHealthCheck(backgroundSurfaceRestoreBasePosMs,
+                    "bgRestore-online:" + reason,
+                    BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_MS);
         } else {
             scheduleLocalBackgroundSurfaceBlackRebuild("bgRestore-local:" + reason);
         }
+        startBackgroundSurfaceRestoreProbe(reason);
 
         // UI 兜底：若一直没有 rendering_start 事件，但播放在继续推进，推断画面已恢复，自动关闭 loading。
         // 这样不会无限卡住（你反馈的“画面已出但提示不消失”）。
@@ -2005,28 +2623,16 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 } catch (Exception ignore) {
                 }
                 if (surfaceReady && outputFps > 0.01f) {
-                    onFirstVideoFrameRendered("bgRestore-autoHideOutputFps=" + outputFps);
+                    if (!maybeCompleteBackgroundRestoreByHeuristic("autoHide", outputFps)
+                            && mainHandler != null) {
+                        mainHandler.postDelayed(this, 220L);
+                    }
                     return;
                 }
 
-                if (!isOnlineVideo) {
-                    if (mainHandler != null)
-                        mainHandler.postDelayed(this, 450L);
-                    return;
-                }
-
-                // 尽量保守：至少执行过一次恢复动作后再判断。
                 if (backgroundSurfaceRestoreStep < 2) {
                     if (mainHandler != null)
-                        mainHandler.postDelayed(this, 400L);
-                    return;
-                }
-
-                // 在线视频：至少等一次主动 refresh（早触发或 450ms fallback）后，再允许用“进度在走”做 UI 兜底。
-                // 否则容易出现“画面其实还没真正刷新，只是旧/错帧继续在显示”，导致 loading 过早消失。
-                if (!backgroundSurfaceRefreshTriggered) {
-                    if (mainHandler != null)
-                        mainHandler.postDelayed(this, 350L);
+                        mainHandler.postDelayed(this, 300L);
                     return;
                 }
 
@@ -2066,105 +2672,66 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 try {
                     switch (backgroundSurfaceRestoreStep) {
                         case 0: {
-                            // Step0：轻 kick（不改变位置）
-                            try {
-                                p.pause();
-                            } catch (Exception ignore) {
-                            }
-                            try {
-                                p.start();
-                            } catch (Exception ignore) {
-                            }
+                            // Step0：仅重绑 surface，不触碰播放链，避免音频卡顿。
+                            Logu.d("surface", "bgRestore step0 reattach(passive): reason=" + reason
+                                    + ", online=" + isOnlineVideo + ", pos=" + basePos);
+                            attachSurfaceIfPossible();
                             backgroundSurfaceRestoreStep++;
                             mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_STEP1_DELAY_MS);
                             return;
                         }
                         case 1: {
-                            // Step1：先统一重绑 surface。
-                            // - 本地/缓存视频仍避免主动 seek，防止回退到关键帧
-                            // - 在线视频在这里提前做一次 +33ms refresh seek，减少等待到下一个关键帧才恢复正常画面的概率
+                            Logu.d("surface", "bgRestore step1 observe(passive): reason=" + reason
+                                    + ", online=" + isOnlineVideo + ", pos=" + basePos);
                             attachSurfaceIfPossible();
-                            if (!isOnlineVideo) {
-                                // 仅重绑，不额外 seek
-                            } else if (!backgroundSurfaceRefreshTriggered
-                                    && !performBackgroundSurfaceRefresh("bgRestore-early:" + reason)) {
-                                try {
-                                    p.pause();
-                                } catch (Exception ignore) {
-                                }
-                                try {
-                                    p.start();
-                                } catch (Exception ignore) {
-                                }
-                            }
                             backgroundSurfaceRestoreStep++;
                             mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_STEP2_DELAY_MS);
                             return;
                         }
                         case 2: {
-                            if (!isOnlineVideo) {
-                                try {
-                                    p.pause();
-                                } catch (Exception ignore) {
-                                }
-                                try {
-                                    p.start();
-                                } catch (Exception ignore) {
-                                }
-                            }
+                            Logu.d("surface", "bgRestore step2 reattach(passive): reason=" + reason
+                                    + ", online=" + isOnlineVideo + ", pos=" + basePos);
+                            attachSurfaceIfPossible();
                             backgroundSurfaceRestoreStep++;
                             mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_STEP3_DELAY_MS);
                             return;
                         }
                         case 3: {
-                            // Step3：继续重绑 surface，避免本地视频多次 seek 导致重复片段。
-                            attachSurfaceIfPossible();
-                            if (!isOnlineVideo) {
-                                try {
-                                    p.pause();
-                                } catch (Exception ignore) {
-                                }
-                                try {
-                                    p.start();
-                                } catch (Exception ignore) {
-                                }
-                            } else {
-                                try {
-                                    p.pause();
-                                } catch (Exception ignore) {
-                                }
-                                try {
-                                    p.start();
-                                } catch (Exception ignore) {
-                                }
-                            }
+                            Logu.d("surface", "bgRestore step3 observe(passive): reason=" + reason
+                                    + ", online=" + isOnlineVideo + ", pos=" + basePos);
                             backgroundSurfaceRestoreStep++;
                             mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_STEP4_DELAY_MS);
                             return;
                         }
                         case 4: {
-                            // Step4：最后再尝试一次重绑 + kick
+                            // Step4：最后再做一次纯 reattach，仍不触碰播放链。
+                            Logu.d("surface", "bgRestore step4 final reattach(passive): reason=" + reason
+                                    + ", online=" + isOnlineVideo + ", pos=" + basePos);
                             attachSurfaceIfPossible();
-                            try {
-                                p.pause();
-                            } catch (Exception ignore) {
-                            }
-                            try {
-                                p.start();
-                            } catch (Exception ignore) {
-                            }
                             backgroundSurfaceRestoreStep++;
                             mainHandler.postDelayed(this, BACKGROUND_SURFACE_RESTORE_GIVEUP_DELAY_MS);
                             return;
                         }
                         default: {
-                            // 仍未拿到首帧：本地视频会由 timeout rebuild 兜底；这里不再继续刷 seek/kick。
+                            // 仍未拿到首帧：
+                            // - 本地视频：由 timeout rebuild 兜底；这里结束 staged restore 状态即可。
+                            // - 在线视频：绝不能在这里退出 restore 状态，否则 progressTimer 会回落到
+                            //   posMovingFallback，把“音频在走”误判成“画面恢复”，进而取消后续 health check，
+                            //   造成“持续黑屏 + 只播音频”的严重问题。
+                            Logu.w("surface", "bgRestore active actions exhausted: reason=" + reason
+                                    + ", online=" + isOnlineVideo
+                                    + ", waiting=" + waitingForFirstVideoFrame
+                                    + ", firstFrame=" + firstVideoFrameRendered);
                             runOnUiThread(() -> {
                                 if (loading_text0 != null)
                                     loading_text0.setText("画面恢复较慢");
                                 if (loading_text1 != null)
-                                    loading_text1.setText("请稍候…");
+                                    loading_text1.setText(isOnlineVideo ? "正在切换渲染链…" : "请稍候…");
                             });
+                            if (isOnlineVideo) {
+                                backgroundSurfaceRestoreRunnable = null;
+                                return;
+                            }
                             cancelBackgroundSurfaceRestore();
                             return;
                         }
@@ -2538,6 +3105,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 return false;
 
             if (what == IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                if (inBackgroundSurfaceRestore) {
+                    backgroundSurfaceRestoreFrameEventReceived = true;
+                }
                 onFirstVideoFrameRendered("MEDIA_INFO_VIDEO_RENDERING_START");
                 return false;
             }
@@ -2561,7 +3131,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 runOnUiThread(() -> {
                     if (loadingTimer != null)
                         loadingTimer.cancel();
-                    if (backgroundSurfaceRefreshTriggered && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
+                    if (pendingOnlineRebuildFirstVideoFrameFallback
+                            && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
+                        pendingOnlineRebuildFirstVideoFrameFallback = false;
+                        onFirstVideoFrameRendered("MEDIA_INFO_BUFFERING_END-after-online-rebuild");
+                        return;
+                    }
+                    if (!isOnlineVideo && backgroundSurfaceRefreshTriggered
+                            && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
                         // 后台恢复时的轻量 refresh seek 未必还能再次收到 VIDEO_RENDERING_START。
                         // 若已经进入过这条恢复分支，则在 buffering 结束时直接结束 loading，
                         // 避免视频已恢复显示但 loading 一直悬浮不消失。
@@ -2747,8 +3324,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             anim_loading.stop();
             waitingForFirstVideoFrame = false;
             firstVideoFrameRendered = true;
+            waitingForFirstVideoFrameStartPosMs = 0L;
         } else {
             beginWaitingForFirstVideoFrame("onPrepared");
+            if (pendingOnlineRebuildFirstVideoFrameFallback) {
+                updateFrameLoadingText("恢复画面中", "(｀・ω・´)");
+                scheduleOnlineRebuildFirstVideoFrameFallback("onPrepared");
+            }
         }
         isPlaying = true;
         btn_control.setImageResource(R.drawable.btn_player_pause);
@@ -2906,15 +3488,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                             } catch (Exception ignore) {
                             }
                             if (outputFps > 0.01f) {
-                                onFirstVideoFrameRendered("progressTimer-outputFps=" + outputFps);
+                                maybeCompleteBackgroundRestoreByHeuristic("progressTimer", outputFps);
                             }
                         } else {
                             long nowUptime = android.os.SystemClock.uptimeMillis();
                             long waited = waitingForFirstVideoFrameUptimeMs > 0L
                                     ? (nowUptime - waitingForFirstVideoFrameUptimeMs)
                                     : 0L;
+                            if (isOnlineVideo && backgroundResumeRenderHealthCheckRunnable != null) {
+                                return;
+                            }
+                            long movedSinceWaitStart = Math.max(0L, video_now - waitingForFirstVideoFrameStartPosMs);
                             // 等待超过 800ms 且播放进度已明显前进（>300ms）时触发。
-                            if (waited >= 800L && video_now >= 300) {
+                            if (waited >= 800L && movedSinceWaitStart >= 300L) {
                                 onFirstVideoFrameRendered("posMovingFallback");
                             }
                         }
@@ -3791,9 +4377,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             long currentPosition = safeGetPlayerPositionMs();
             syncProgressUiFromPlayer(currentPosition);
             if (isOnlineVideo) {
-                scheduleBackgroundResumeRenderHealthCheck(currentPosition, "onResume-noSurfaceRecreate");
-                // 延迟消费标记：给 surfaceDestroyed/surfaceCreated 留出窗口，避免竞态导致错帧。
+                Logu.w("surface", "onResume: staged online restore without surface recreate, pos="
+                        + currentPosition + ", session=" + playerSessionId);
                 scheduleConsumeBackgroundPlaybackFlag("onResume-noSurfaceRecreate-online");
+                startBackgroundSurfaceRestore(currentPosition, "onResume-noSurfaceRecreate-online");
+                return;
             } else {
                 // 本地/缓存视频此前在“未发生 surface recreate”的回前台路径里几乎不做恢复动作，
                 // 容易出现恢复时长 1~5s 的长尾。
@@ -3805,7 +4393,6 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 startBackgroundSurfaceRestore(currentPosition, "onResume-noSurfaceRecreate-local");
                 return;
             }
-            Logu.d("surface", "onResume: schedule consume background-playback flag, pos=" + currentPosition);
         }
         if (isPrepared && (!isPlaying || finishWatching)) {
             ensureLoadingHidden("onResume-nonPlaying");
@@ -3945,9 +4532,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cancelConsumeBackgroundPlaybackFlag();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
+        cancelOnlineRebuildFirstVideoFrameFallback();
         cancelFirstVideoFrameFallback();
         cancelLocalSeekVerify();
         cancelBackgroundSurfaceRestore();
+        cancelLocalBackgroundSurfaceAudioRestore();
         cancelFrameLoadingMinShowGuard();
         clearDanmakuRecoveryState();
         try {
