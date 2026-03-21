@@ -414,14 +414,14 @@ public class SearchActivity extends InstanceActivity {
         // 统一取消延迟隐藏任务，避免快速上下滑时出现“显示了但又被旧任务 GONE”的问题
         handler.removeCallbacks(hideSearchBarRunnable);
 
-        float height = searchBar.getHeight() + ToolsUtil.dp2px(2f);
+        float hiddenTranslationY = getSearchBarHiddenTranslationY();
 
         if (System.currentTimeMillis() - animate_last > 200) {
             if (dy > 0 && searchBarVisible) {
                 animate_last = System.currentTimeMillis();
                 this.searchBarVisible = false;
                 @SuppressLint("ObjectAnimatorBinding")
-                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", searchBar.getTranslationY(), -height);
+                ObjectAnimator animator = ObjectAnimator.ofFloat(searchBar, "translationY", searchBar.getTranslationY(), hiddenTranslationY);
                 animator.setDuration(200);
                 animator.start();
                 // 延迟在动画结束后隐藏（并带状态判断）
@@ -437,6 +437,25 @@ public class SearchActivity extends InstanceActivity {
                 animator.start();
             }
         }
+    }
+
+    /**
+     * 计算搜索栏完全移出屏幕顶部所需的位移。
+     *
+     * 之前仅移动了搜索栏自身高度，忽略了它位于标题栏下方这一事实，
+     * 导致搜索栏只是在标题栏区域内上移，仍会残留一部分可见内容。
+     */
+    private float getSearchBarHiddenTranslationY() {
+        if (searchBar == null) return 0f;
+
+        int hideDistance = searchBar.getBottom();
+        if (hideDistance <= 0) {
+            hideDistance = searchBar.getTop() + searchBar.getHeight();
+        }
+        if (hideDistance <= 0) {
+            hideDistance = searchBar.getHeight() + ToolsUtil.dp2px(2f);
+        }
+        return -hideDistance;
     }
 
     /**
