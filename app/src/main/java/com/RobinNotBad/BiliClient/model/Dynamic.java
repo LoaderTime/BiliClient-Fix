@@ -6,6 +6,8 @@ public class Dynamic implements Serializable {
     public final static String DYNAMIC_TYPE_UGC_SEASON = "DYNAMIC_TYPE_UGC_SEASON";
     public long dynamicId;
     public String type;
+    public boolean isTop;
+    public String topTagText;
     public long comment_id;
     public int comment_type;
 

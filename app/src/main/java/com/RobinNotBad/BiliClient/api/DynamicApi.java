@@ -375,13 +375,7 @@ public class DynamicApi {
         return -1;
     }
 
-    public static long getDynamicList(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
-        if (mid != 0) {
-            Long legacyOffset = tryGetLegacySpaceDynamicList(dynamicList, offset, mid);
-            if (legacyOffset != null) return legacyOffset;
-            Logu.w("dynamic-space", "legacy space_history unavailable, fallback to web dynamic api");
-        }
-
+    private static long getDynamicListByWeb(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
         HttpUrl.Builder urlBuilder;
         if (mid == 0) {
             urlBuilder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")).newBuilder()
@@ -395,8 +389,9 @@ public class DynamicApi {
                     .addQueryParameter("timezone_offset", "-480")
                     .addQueryParameter("host_mid", String.valueOf(mid))
                     .addQueryParameter("x-bili-device-req-json", "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\"}");
+            urlBuilder.addQueryParameter("offset", offset == 0 ? "" : String.valueOf(offset));
         }
-        if (offset != 0) {
+        if (mid == 0 && offset != 0) {
             urlBuilder.addQueryParameter("offset", String.valueOf(offset));
         }
         urlBuilder.addQueryParameter("features", "itemOpusStyle,listOnlyfans");
@@ -430,12 +425,78 @@ public class DynamicApi {
             }
         }
 
-        JSONArray items = data.getJSONArray("items");
-        for (int i = 0; i < items.length(); i++) {
-            dynamicList.add(analyzeDynamic(items.getJSONObject(i)));
+        JSONArray items = data.optJSONArray("items");
+        int parsedCount = 0;
+        if (items != null) {
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                if (item == null) continue;
+                try {
+                    dynamicList.add(analyzeDynamic(item));
+                    parsedCount++;
+                } catch (Throwable e) {
+                    long dynamicId = 0;
+                    try {
+                        dynamicId = Long.parseLong(item.optString("id_str", "0"));
+                    } catch (Exception ignored) {
+                    }
+                    Logu.w("dynamic-item-parse", "id=" + item.optString("id_str")
+                            + ", type=" + item.optString("type")
+                            + ", err=" + String.valueOf(e.getMessage()));
+
+                    if (dynamicId > 0) {
+                        try {
+                            Dynamic repaired = tryGetDynamicDetail(dynamicId);
+                            if (repaired != null) {
+                                dynamicList.add(repaired);
+                                parsedCount++;
+                                Logu.w("dynamic-item-repair", "repaired by detail api, id=" + dynamicId);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+        }
+
+        if (items != null && items.length() > 0 && parsedCount == 0) {
+            throw new IOException("用户动态解析失败");
         }
 
         return offset_new;
+    }
+
+    public static long getDynamicList(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
+        if (mid != 0) {
+            IOException webIoException = null;
+            JSONException webJsonException = null;
+
+            ArrayList<Dynamic> webDynamicList = new ArrayList<>();
+            try {
+                long webOffset = getDynamicListByWeb(webDynamicList, offset, mid, type);
+                dynamicList.addAll(webDynamicList);
+                return webOffset;
+            } catch (IOException e) {
+                webIoException = e;
+                Logu.w("dynamic-space", "web dynamic api failed, fallback to legacy space_history: " + e.getMessage());
+            } catch (JSONException e) {
+                webJsonException = e;
+                Logu.w("dynamic-space", "web dynamic parse failed, fallback to legacy space_history: " + e.getMessage());
+            }
+
+            ArrayList<Dynamic> legacyDynamicList = new ArrayList<>();
+            Long legacyOffset = tryGetLegacySpaceDynamicList(legacyDynamicList, offset, mid);
+            if (legacyOffset != null) {
+                dynamicList.addAll(legacyDynamicList);
+                return legacyOffset;
+            }
+
+            if (webIoException != null) throw webIoException;
+            if (webJsonException != null) throw webJsonException;
+            throw new IOException("获取用户动态失败");
+        }
+
+        return getDynamicListByWeb(dynamicList, offset, mid, type);
     }
 
     private static Long tryGetLegacySpaceDynamicList(List<Dynamic> dynamicList, long offset, long mid) throws IOException {
@@ -523,6 +584,8 @@ public class DynamicApi {
         fillLegacyMajor(dynamic, desc, card);
         dynamic.stats = parseLegacyStats(desc);
         dynamic.canDelete = isSelfDynamic(desc);
+        dynamic.isTop = desc != null && (desc.optBoolean("is_top", false) || desc.optInt("is_top", 0) == 1);
+        if (dynamic.isTop) dynamic.topTagText = "置顶";
 
         Dynamic forward = parseLegacyForward(desc, card, depth + 1);
         if (forward != null) dynamic.dynamic_forward = forward;
@@ -767,8 +830,18 @@ public class DynamicApi {
     }
 
     public static Dynamic getDynamic(long id) throws IOException, JSONException {
-        String url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?id=" + id
-                + "&features=itemOpusStyle";
+        HttpUrl.Builder builder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail")).newBuilder()
+                .addQueryParameter("id", String.valueOf(id))
+                .addQueryParameter("timezone_offset", "-480")
+                .addQueryParameter("features", "itemOpusStyle")
+                .addQueryParameter("gaia_source", "Athena")
+                .addQueryParameter("web_location", "333.1330")
+                .addQueryParameter("x-bili-device-req-json", "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1330\"}");
+        String csrf = SharedPreferencesUtil.getString("csrf", "");
+        if (!TextUtils.isEmpty(csrf)) {
+            builder.addQueryParameter("csrf", csrf);
+        }
+        String url = builder.build().toString();
 
         JSONObject all = NetWorkUtil.getJson(url);
         
@@ -844,21 +917,27 @@ public class DynamicApi {
 
         //发布者
         UserInfo userInfo = new UserInfo();
+        boolean authorIsTop = false;
         if (!modules.isNull("module_author")) {
             JSONObject module_author = modules.getJSONObject("module_author");
-            userInfo.mid = module_author.getLong("mid");
-            userInfo.name = module_author.getString("name");
+            userInfo.mid = optLongCompat(module_author, "mid");
+            userInfo.name = module_author.optString("name", "");
             if (!module_author.isNull("following"))
                 userInfo.followed = module_author.getBoolean("following");
-            userInfo.avatar = module_author.getString("face");
+            userInfo.avatar = module_author.optString("face", "");
+            authorIsTop = module_author.optBoolean("is_top", false);
             JSONObject vipJson = module_author.optJSONObject("vip");
             if (vipJson != null) {
                 userInfo.vip_nickname_color = vipJson.optString("nickname_color", "");
             }
             Logu.v("sender", userInfo.name);
-            dynamic.pubTime = module_author.getString("pub_time");
+            dynamic.pubTime = module_author.optString("pub_time", "");
         }
         dynamic.userInfo = userInfo;
+
+        JSONObject moduleTag = modules.optJSONObject("module_tag");
+        dynamic.topTagText = moduleTag == null ? "" : moduleTag.optString("text", "");
+        dynamic.isTop = authorIsTop || "置顶".equals(dynamic.topTagText);
 
         if (dynamic.type.equals("DYNAMIC_TYPE_NONE")) {
             dynamic.content = "[动态不存在]";
@@ -986,8 +1065,7 @@ public class DynamicApi {
 
                             dynamic.major_object = opusPicList;
                         } else {
-                            // 纯文本动态，设置一个空列表避免后续处理出错
-                            dynamic.major_object = new ArrayList<String>();
+                            dynamic.major_object = null;
                         }
 
                         JSONObject summary = opusJson.optJSONObject("summary");

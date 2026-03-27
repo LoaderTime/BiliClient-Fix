@@ -225,8 +225,14 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
         } else {
             username.setTextColor(0xFFFFFFFF);
         }
-        if (pubdate != null)
-            pubdate.setText(dynamic.pubTime);
+        if (pubdate != null) {
+            if (dynamic.isTop) {
+                String topTag = TextUtils.isEmpty(dynamic.topTagText) ? "置顶" : dynamic.topTagText;
+                pubdate.setText(TextUtils.isEmpty(dynamic.pubTime) ? topTag : topTag + " · " + dynamic.pubTime);
+            } else {
+                pubdate.setText(dynamic.pubTime);
+            }
+        }
         if (dynamic.content != null && !TextUtils.isEmpty(dynamic.content)) {
             content.setVisibility(View.VISIBLE);
             content.setText(dynamic.content);
@@ -253,6 +259,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
         });
 
         boolean isPgc = false;
+        boolean shouldShowExtra = dynamic.dynamic_forward != null;
         for (View view1 : Arrays.asList(cell_dynamic_video, cell_dynamic_child, cell_dynamic_image,
                 cell_dynamic_article)) {
             if (view1 != null) {
@@ -274,6 +281,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                     cell_dynamic_video.setOnClickListener(view -> TerminalContext.getInstance()
                             .enterVideoDetailPage(context, childVideoCard.aid, "", finalIsPgc ? "media" : null));
                     cell_dynamic_video.setVisibility(View.VISIBLE);
+                    shouldShowExtra = true;
                     break;
 
                 case "MAJOR_TYPE_LIVE":
@@ -293,6 +301,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                     cell_dynamic_video.setOnClickListener(
                             view -> TerminalContext.getInstance().enterLiveDetailPage(context, liveRoom.roomid));
                     cell_dynamic_video.setVisibility(View.VISIBLE);
+                    shouldShowExtra = true;
                     break;
 
                 case "MAJOR_TYPE_ARTICLE":
@@ -304,6 +313,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                     cell_dynamic_article.setOnClickListener(
                             view -> TerminalContext.getInstance().enterArticleDetailPage(context, articleCard.id));
                     cell_dynamic_article.setVisibility(View.VISIBLE);
+                    shouldShowExtra = true;
                     break;
 
                 case "MAJOR_TYPE_COMMON":
@@ -318,6 +328,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                         }
                     });
                     cell_dynamic_article.setVisibility(View.VISIBLE);
+                    shouldShowExtra = true;
                     break;
 
                 case "MAJOR_TYPE_DRAW":
@@ -352,14 +363,12 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                             context.startActivity(intent);
                         });
                         cell_dynamic_image.setVisibility(View.VISIBLE);
+                        shouldShowExtra = true;
                     }
                     break;
             }
 
-        if (dynamic.major_object == null && dynamic.dynamic_forward == null)
-            extraCard.setVisibility(View.GONE); // 这部分在adapter里
-        else
-            extraCard.setVisibility(View.VISIBLE);
+        extraCard.setVisibility(shouldShowExtra ? View.VISIBLE : View.GONE);
 
         if (clickable) {
             content.setMaxLines(5);
@@ -408,6 +417,7 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
 
         if (likeCount != null) {
             if (dynamic.stats != null) {
+                likeCount.setVisibility(View.VISIBLE);
                 if (dynamic.stats.liked) { // 这里，还有下面，一定要加else！否则会导致错乱
                     likeCount.setTextColor(Color.rgb(0xfe, 0x67, 0x9a));
                     likeCount.setCompoundDrawablesWithIntrinsicBounds(
@@ -418,46 +428,47 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                             ContextCompat.getDrawable(context, R.drawable.icon_reply_like0), null, null, null);
                 }
                 likeCount.setText(toWan(dynamic.stats.like));
+                likeCount.setOnClickListener(view -> CenterThreadPool.run(() -> {
+                    if (!dynamic.stats.liked) {
+                        try {
+                            if (DynamicApi.likeDynamic(dynamic.dynamicId, true) == 0) {
+                                dynamic.stats.liked = true;
+                                ((Activity) context).runOnUiThread(() -> {
+                                    MsgUtil.showMsg("点赞成功");
+                                    likeCount.setText(toWan(++dynamic.stats.like));
+                                    likeCount.setTextColor(Color.rgb(0xfe, 0x67, 0x9a));
+                                    likeCount.setCompoundDrawablesWithIntrinsicBounds(
+                                            ContextCompat.getDrawable(context, R.drawable.icon_reply_like1), null, null,
+                                            null);
+                                });
+                            } else
+                                ((Activity) context).runOnUiThread(() -> MsgUtil.showMsg("点赞失败"));
+                        } catch (IOException e) {
+                            MsgUtil.err(e);
+                        }
+                    } else {
+                        try {
+                            if (DynamicApi.likeDynamic(dynamic.dynamicId, false) == 0) {
+                                dynamic.stats.liked = false;
+                                ((Activity) context).runOnUiThread(() -> {
+                                    MsgUtil.showMsg("取消成功");
+                                    likeCount.setText(toWan(--dynamic.stats.like));
+                                    likeCount.setTextColor(Color.rgb(0xff, 0xff, 0xff));
+                                    likeCount.setCompoundDrawablesWithIntrinsicBounds(
+                                            ContextCompat.getDrawable(context, R.drawable.icon_reply_like0), null, null,
+                                            null);
+                                });
+                            } else
+                                ((Activity) context).runOnUiThread(() -> MsgUtil.showMsg("取消失败"));
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }));
             } else {
                 likeCount.setVisibility(View.GONE);
+                likeCount.setOnClickListener(null);
             }
-            likeCount.setOnClickListener(view -> CenterThreadPool.run(() -> {
-                if (!dynamic.stats.liked) {
-                    try {
-                        if (DynamicApi.likeDynamic(dynamic.dynamicId, true) == 0) {
-                            dynamic.stats.liked = true;
-                            ((Activity) context).runOnUiThread(() -> {
-                                MsgUtil.showMsg("点赞成功");
-                                likeCount.setText(toWan(++dynamic.stats.like));
-                                likeCount.setTextColor(Color.rgb(0xfe, 0x67, 0x9a));
-                                likeCount.setCompoundDrawablesWithIntrinsicBounds(
-                                        ContextCompat.getDrawable(context, R.drawable.icon_reply_like1), null, null,
-                                        null);
-                            });
-                        } else
-                            ((Activity) context).runOnUiThread(() -> MsgUtil.showMsg("点赞失败"));
-                    } catch (IOException e) {
-                        MsgUtil.err(e);
-                    }
-                } else {
-                    try {
-                        if (DynamicApi.likeDynamic(dynamic.dynamicId, false) == 0) {
-                            dynamic.stats.liked = false;
-                            ((Activity) context).runOnUiThread(() -> {
-                                MsgUtil.showMsg("取消成功");
-                                likeCount.setText(toWan(--dynamic.stats.like));
-                                likeCount.setTextColor(Color.rgb(0xff, 0xff, 0xff));
-                                likeCount.setCompoundDrawablesWithIntrinsicBounds(
-                                        ContextCompat.getDrawable(context, R.drawable.icon_reply_like0), null, null,
-                                        null);
-                            });
-                        } else
-                            ((Activity) context).runOnUiThread(() -> MsgUtil.showMsg("取消失败"));
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                }
-            }));
         }
     }
 }
