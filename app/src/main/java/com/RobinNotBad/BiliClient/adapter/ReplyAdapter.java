@@ -38,6 +38,7 @@ import com.RobinNotBad.BiliClient.util.GlideUtil;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
+import com.RobinNotBad.BiliClient.util.ToolsUtil;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.load.DecodeFormat;
 import com.bumptech.glide.load.engine.DiskCacheStrategy;
@@ -54,6 +55,14 @@ import java.util.ArrayList;
 
 @SuppressLint("ClickableViewAccessibility")
 public class ReplyAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
+
+    private static final String UP_BADGE_TEXT = "UP";
+    private static final int UP_BADGE_BG_COLOR = Color.rgb(207, 75, 95);
+    private static final float UP_BADGE_TEXT_SCALE = 0.8f;
+    private static final float UP_BADGE_TEXT_SCALE_X = 1f;
+    private static final float UP_BADGE_HORIZONTAL_PADDING_DP = 2f;
+    private static final float UP_BADGE_VERTICAL_PADDING_DP = 1f;
+    private static final float UP_BADGE_MAX_HEIGHT_DP = 18f;
 
     public boolean isDetail = false;
     public boolean isManager = false;
@@ -160,13 +169,7 @@ public class ReplyAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> 
 
             // up主标识
             if (sender.mid == up_mid) {
-                name_str.append(" UP ");
-                name_str.append(reply.sender.name);
-                name_str.setSpan(
-                        new RadiusBackgroundSpan(2, (int) context.getResources().getDimension(R.dimen.round_small),
-                                Color.WHITE, Color.rgb(207, 75, 95)),
-                        0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                name_str.setSpan(new RelativeSizeSpan(0.8f), 0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                appendUpBadge(name_str, reply.sender.name);
             } else
                 name_str.append(sender.name);
             int last_length = name_str.length();
@@ -234,12 +237,7 @@ public class ReplyAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> 
 
                         SpannableStringBuilder childMsg = new SpannableStringBuilder();
                         if (child.sender.mid == up_mid) {
-                            childMsg.append(" UP ");
-                            childMsg.append(child.sender.name);
-                            childMsg.setSpan(new RadiusBackgroundSpan(2,
-                                    (int) context.getResources().getDimension(R.dimen.round_small), Color.WHITE,
-                                    Color.rgb(207, 75, 95)), 0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-                            childMsg.setSpan(new RelativeSizeSpan(0.8f), 0, 4, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                            appendUpBadge(childMsg, child.sender.name);
                         } else
                             childMsg.append(child.sender.name);
 
@@ -457,6 +455,21 @@ public class ReplyAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> 
         intent.putExtra("up_mid", up_mid);
         intent.putExtra("is_manager", isManager);
         context.startActivity(intent);
+    }
+
+    private void appendUpBadge(SpannableStringBuilder stringBuilder, String userName) {
+        int badgeStart = stringBuilder.length();
+        stringBuilder.append(UP_BADGE_TEXT);
+        int badgeEnd = stringBuilder.length();
+        stringBuilder.setSpan(
+                new RadiusBackgroundSpan(
+                        ToolsUtil.dp2px(UP_BADGE_HORIZONTAL_PADDING_DP),
+                        ToolsUtil.dp2px(UP_BADGE_VERTICAL_PADDING_DP),
+                        (int) context.getResources().getDimension(R.dimen.round_small),
+                        Color.WHITE, UP_BADGE_BG_COLOR, ToolsUtil.dp2px(UP_BADGE_MAX_HEIGHT_DP),
+                        UP_BADGE_TEXT_SCALE, UP_BADGE_TEXT_SCALE_X, false),
+                badgeStart, badgeEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        stringBuilder.append(" ").append(userName);
     }
 
     @Override
