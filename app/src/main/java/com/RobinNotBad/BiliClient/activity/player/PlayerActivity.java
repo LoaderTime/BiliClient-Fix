@@ -132,13 +132,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * <p>
      * 兼容 Android 4.4：仅用 Handler + postDelayed，不依赖高版本 API。
      */
-    private static final long DANMAKU_WATCHDOG_INTERVAL_MS = 850L;
-    /** 连续判定“弹幕时间轴不前进”的次数阈值（2 次=约 1.7 秒） */
+    private static final long DANMAKU_WATCHDOG_INTERVAL_MS = 650L;
+    /** 连续判定“弹幕时间轴不前进”的次数阈值（2 次=约 1.3 秒） */
     private static final int DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT = 2;
     /** 弹幕时间轴明显落后于视频位置时，直接视为异常并优先恢复 */
-    private static final long DANMAKU_WATCHDOG_STUCK_LAG_MS = 1400L;
+    private static final long DANMAKU_WATCHDOG_STUCK_LAG_MS = 1200L;
     /** soft recovery 后给弹幕线程的恢复宽限期，避免下一次轮询立刻升级为硬恢复 */
-    private static final long DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS = 2200L;
+    private static final long DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS = 1000L;
     /** watchdog 软恢复后，短时间内再次卡住则升级为硬恢复 */
     private static final long DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS = 8000L;
     private Runnable danmakuWatchdogRunnable;
@@ -439,6 +439,22 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private Runnable localSeekVerifyRunnable;
     private volatile long localSeekVerifyTargetMs = -1L;
     private volatile int localSeekVerifyRetry = 0;
+
+    /**
+     * 在线流 seek 完成后做一次轻量落点核对。
+     * <p>
+     * 某些设备/流在首次 seek 后，UI 会先跳到目标位置，但播放器真实落点仍停在更早关键帧/更早分片，
+     * 随后 progressTimer 会把进度条“拉回去”，表现为“卡一下再回退 2~3 秒”。
+     * 这里利用 seek-complete / seek-rendering 信号做一次受控纠偏，仅对在线视频启用。
+     */
+    private static final long ONLINE_SEEK_VERIFY_SIGNAL_DELAY_MS = 140L;
+    private static final long ONLINE_SEEK_VERIFY_SIGNAL_FALLBACK_MS = 520L;
+    private static final long ONLINE_SEEK_BACKWARD_TOLERANCE_MS = 1200L;
+    private static final int ONLINE_SEEK_VERIFY_MAX_RETRY = 1;
+    private Runnable onlineSeekVerifyRunnable;
+    private volatile long onlineSeekVerifyTargetMs = -1L;
+    private volatile long onlineSeekVerifyStartedUptimeMs = 0L;
+    private volatile int onlineSeekVerifyRetry = 0;
 
     /**
      * 后台连续播放返回前台后，若首帧迟迟不出，则延迟触发一次轻量渲染 kick 来催出画面。
@@ -3013,6 +3029,144 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         mainHandler.postDelayed(localSeekVerifyRunnable, LOCAL_SEEK_VERIFY_DELAY_MS);
     }
 
+    private void cancelOnlineSeekVerify() {
+        onlineSeekVerifyTargetMs = -1L;
+        onlineSeekVerifyStartedUptimeMs = 0L;
+        onlineSeekVerifyRetry = 0;
+        if (mainHandler != null && onlineSeekVerifyRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(onlineSeekVerifyRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        onlineSeekVerifyRunnable = null;
+    }
+
+    private void scheduleOnlineSeekVerify(long delayMs, int session, @NonNull String reason) {
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+        if (onlineSeekVerifyTargetMs < 0L)
+            return;
+
+        if (onlineSeekVerifyRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(onlineSeekVerifyRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+
+        onlineSeekVerifyRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (destroyed || resourcesReleased || session != playerSessionId) {
+                    cancelOnlineSeekVerify();
+                    return;
+                }
+                if (onlineSeekVerifyTargetMs < 0L) {
+                    onlineSeekVerifyRunnable = null;
+                    return;
+                }
+
+                IjkMediaPlayer player = ijkPlayer;
+                if (player == null || !isPrepared) {
+                    cancelOnlineSeekVerify();
+                    return;
+                }
+
+                long now = android.os.SystemClock.uptimeMillis();
+                long waited = onlineSeekVerifyStartedUptimeMs > 0L
+                        ? (now - onlineSeekVerifyStartedUptimeMs)
+                        : 0L;
+                long target = Math.max(0L, onlineSeekVerifyTargetMs);
+                long pos = safeGetPlayerPositionMs();
+                long backward = target - pos;
+
+                if (backward <= ONLINE_SEEK_BACKWARD_TOLERANCE_MS || pos >= target) {
+                    Logu.d("seek", "online seek verify ok: reason=" + reason
+                            + ", pos=" + pos + ", target=" + target
+                            + ", retry=" + onlineSeekVerifyRetry);
+                    cancelOnlineSeekVerify();
+                    return;
+                }
+
+                if (playerReportedBuffering && onlineSeekVerifyRetry == 0 && waited < 1200L) {
+                    if (mainHandler != null) {
+                        mainHandler.postDelayed(this, 180L);
+                    }
+                    return;
+                }
+
+                if (onlineSeekVerifyRetry >= ONLINE_SEEK_VERIFY_MAX_RETRY) {
+                    Logu.w("seek", "online seek verify give up: reason=" + reason
+                            + ", pos=" + pos + ", target=" + target
+                            + ", back=" + backward + ", waited=" + waited + "ms");
+                    cancelOnlineSeekVerify();
+                    return;
+                }
+
+                onlineSeekVerifyRetry++;
+                long correctionTarget = target;
+                if (video_all > 0) {
+                    correctionTarget = Math.min(correctionTarget, Math.max(0L, video_all - 1L));
+                }
+
+                try {
+                    player.seekTo(correctionTarget);
+                } catch (Exception e) {
+                    Logu.w("seek", "online seek verify retry failed: reason=" + reason
+                            + ", err=" + e.getMessage());
+                    cancelOnlineSeekVerify();
+                    return;
+                }
+
+                markExplicitSeek(correctionTarget);
+                if (hasDanmaku && mDanmakuView != null) {
+                    try {
+                        mDanmakuView.seekTo(correctionTarget);
+                    } catch (Exception ignore) {
+                    }
+                }
+                syncProgressUiFromPlayer(correctionTarget);
+                Logu.w("seek", "online seek verify retry=" + onlineSeekVerifyRetry
+                        + ", reason=" + reason
+                        + ", pos=" + pos + ", target=" + target
+                        + ", back=" + backward);
+
+                if (mainHandler != null) {
+                    mainHandler.postDelayed(this, ONLINE_SEEK_VERIFY_SIGNAL_FALLBACK_MS);
+                }
+            }
+        };
+        mainHandler.postDelayed(onlineSeekVerifyRunnable, delayMs);
+    }
+
+    private void armOnlineSeekVerify(long targetMs, @NonNull String reason) {
+        cancelOnlineSeekVerify();
+        if (destroyed || resourcesReleased)
+            return;
+        if (isLiveMode || !isOnlineVideo || isAudioOnlyMode)
+            return;
+        if (ijkPlayer == null || !isPrepared)
+            return;
+
+        onlineSeekVerifyTargetMs = Math.max(0L, targetMs);
+        onlineSeekVerifyStartedUptimeMs = android.os.SystemClock.uptimeMillis();
+        onlineSeekVerifyRetry = 0;
+        scheduleOnlineSeekVerify(ONLINE_SEEK_VERIFY_SIGNAL_FALLBACK_MS,
+                playerSessionId,
+                reason + "-fallback");
+    }
+
+    private void notifyOnlineSeekSignal(@NonNull String reason) {
+        if (destroyed || resourcesReleased)
+            return;
+        if (onlineSeekVerifyTargetMs < 0L)
+            return;
+        if (isLiveMode || !isOnlineVideo || isAudioOnlyMode)
+            return;
+        scheduleOnlineSeekVerify(ONLINE_SEEK_VERIFY_SIGNAL_DELAY_MS, playerSessionId, reason);
+    }
+
     /**
      * 安全停止并释放旧 ijkPlayer（避免 IllegalState / NPE）。
      * <p>
@@ -3051,6 +3205,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
         try {
             player.setOnErrorListener(null);
+        } catch (Exception ignore) {
+        }
+        try {
+            player.setOnSeekCompleteListener(null);
         } catch (Exception ignore) {
         }
         try {
@@ -3281,6 +3439,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             seekbar_progress.setSecondaryProgress(percent * video_all / 100);
         });
 
+        ijkPlayer.setOnSeekCompleteListener(mp -> {
+            if (destroyed || resourcesReleased || mp != ijkPlayer || sessionAtPrepare != playerSessionId)
+                return;
+            notifyOnlineSeekSignal("OnSeekComplete");
+        });
+
         // 重要：本地/缓存视频同样需要监听 MEDIA_INFO_VIDEO_RENDERING_START，
         // 否则 beginWaitingForFirstVideoFrame() 后 loading 永远无法消失。
         // buffering UI/网速显示仅对在线/直播启用。
@@ -3296,6 +3460,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 return false;
             }
 
+            if (what == IMediaPlayer.MEDIA_INFO_VIDEO_SEEK_RENDERING_START
+                    || what == IMediaPlayer.MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE) {
+                notifyOnlineSeekSignal("MEDIA_INFO_SEEK_" + what);
+            }
+
             // 本地点播一般不需要展示“正在缓冲/网速”，且部分版本可能不会触发 buffering 事件。
             if (!isOnlineVideo && !isLiveMode)
                 return false;
@@ -3308,6 +3477,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } else if (what == IMediaPlayer.MEDIA_INFO_BUFFERING_END) {
                 playerReportedBuffering = false;
                 runOnUiThread(() -> {
+                    notifyOnlineSeekSignal("MEDIA_INFO_BUFFERING_END");
                     if (pendingOnlineRebuildFirstVideoFrameFallback
                             && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
                         pendingOnlineRebuildFirstVideoFrameFallback = false;
@@ -4695,6 +4865,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         cancelOnlineRebuildFirstVideoFrameFallback();
         cancelFirstVideoFrameFallback();
         cancelLocalSeekVerify();
+        cancelOnlineSeekVerify();
         cancelBackgroundSurfaceRestore();
         cancelLocalBackgroundSurfaceAudioRestore();
         cancelFrameLoadingMinShowGuard();
@@ -5145,6 +5316,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             @Override
             public void onStartTrackingTouch(SeekBar seekBar) {
+                cancelLocalSeekVerify();
+                cancelOnlineSeekVerify();
                 isSeeking = true;
             }
 
@@ -5249,6 +5422,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             }
 
             cancelLocalSeekVerify();
+            cancelOnlineSeekVerify();
             try {
                 ijkPlayer.seekTo(target);
             } catch (Exception ignore) {
@@ -5268,6 +5442,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             // 仅对本地/缓存视频做 seek 落点校验，在线流不启用（避免多次 seek 触发额外缓冲）。
             if (!isLiveMode && !isOnlineVideo && !isAudioOnlyMode) {
                 scheduleLocalSeekVerify(target, "userSeek");
+            } else if (!isLiveMode && isOnlineVideo && !isAudioOnlyMode) {
+                armOnlineSeekVerify(target, "userSeek");
             }
         }
     }
@@ -5460,17 +5636,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 if (destroyed || resourcesReleased || isLiveMode) {
                     return;
                 }
-                if (playerReportedBuffering) {
+                long now = android.os.SystemClock.uptimeMillis();
+                if (playerReportedBuffering || frameLoadingActive || waitingForFirstVideoFrame) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
                     return;
                 }
-                // loading_info 可见时一般处于缓冲/切换状态，跳过避免误判。
-                try {
-                    if (loading_info != null && loading_info.getVisibility() == View.VISIBLE) {
-                        mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
-                        return;
-                    }
-                } catch (Exception ignore) {
+                if (now - lastExplicitSeekUptimeMs < DANMAKU_EXPLICIT_SEEK_GRACE_MS) {
+                    mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
+                    return;
                 }
 
                 if (!hasDanmaku || !isDanmakuVisible || !isPrepared || !isPlaying || mDanmakuView == null) {
@@ -5483,7 +5656,6 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
-                long now = android.os.SystemClock.uptimeMillis();
                 if (lastDanmakuWatchdogRecoverUptimeMs > 0L
                         && now - lastDanmakuWatchdogRecoverUptimeMs < DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
@@ -5517,16 +5689,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 } catch (Exception ignore) {
                 }
 
-                if (viewPaused || danmakuLagging
-                        || danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT) {
-                    boolean hardRecover = lastDanmakuWatchdogRecoverWasSoft
+                boolean shouldRecover = viewPaused || danmakuLagging
+                        || danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT;
+
+                if (shouldRecover) {
+                    boolean directHardRecover = viewPaused || danmakuLagging;
+                    boolean hardRecover = directHardRecover || (lastDanmakuWatchdogRecoverWasSoft
                             && now - lastDanmakuWatchdogRecoverUptimeMs >= DANMAKU_WATCHDOG_POST_RECOVERY_GRACE_MS
-                            && now - lastDanmakuWatchdogRecoverUptimeMs <= DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS;
+                            && now - lastDanmakuWatchdogRecoverUptimeMs <= DANMAKU_WATCHDOG_HARD_RECOVERY_WINDOW_MS);
 
                     Logu.w("danmaku", "watchdog recover: videoPos=" + videoPos + ", dmTime=" + dmTime
                             + ", lag=" + danmakuLag
                             + ", paused=" + viewPaused + ", stuckCount=" + danmakuWatchdogStuckCount
-                            + ", hard=" + hardRecover);
+                            + ", hard=" + hardRecover + ", directHard=" + directHardRecover);
 
                     if (hardRecover) {
                         requestDanmakuHardRecovery(videoPos, "watchdogHard");
