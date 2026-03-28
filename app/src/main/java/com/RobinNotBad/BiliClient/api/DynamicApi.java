@@ -49,6 +49,11 @@ import okhttp3.ResponseBody;
 
 public class DynamicApi {
 
+    private static final String TRACE_TAG = "user-dynamic-trace";
+
+    private static final String SPACE_DYNAMIC_FEATURES = "itemOpusStyle,listOnlyfans";
+    private static final String SPACE_DYNAMIC_DEVICE_REQ_JSON = "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\"}";
+
     private static boolean isRiskCode(int code) {
         return code == -352 || code == -412 || code == -403;
     }
@@ -58,6 +63,20 @@ public class DynamicApi {
             JSONObject all = mid == 0
                     ? NetWorkUtil.getJson(signedUrl)
                     : NetWorkUtil.getJson(signedUrl, getSpaceHeaders(mid));
+
+            if (all.optBoolean("retry_failed", false)) {
+                if (retry == 0) {
+                    Logu.w("dynamic-risk", "retry_failed, try reactivate cookies and retry once");
+                    try {
+                        CookiesApi.checkCookies();
+                        CookiesApi.ensureRiskActive(true);
+                    } catch (Exception e) {
+                        Logu.e("dynamic-risk-retry", String.valueOf(e.getMessage()));
+                    }
+                    continue;
+                }
+                return all;
+            }
 
             int code = all.optInt("code", -1);
             if (!isRiskCode(code) || retry > 0) {
@@ -74,6 +93,35 @@ public class DynamicApi {
         }
         // 理论上不会到达这里
         return new JSONObject();
+    }
+
+    private static boolean hasSessData() {
+        String cookies = SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, "");
+        return !TextUtils.isEmpty(NetWorkUtil.getInfoFromCookie("SESSDATA", cookies));
+    }
+
+    private static HttpUrl.Builder buildDynamicListUrl(String endpoint, long offset, long mid, String type) {
+        HttpUrl.Builder urlBuilder = Objects.requireNonNull(HttpUrl.parse(endpoint)).newBuilder();
+        if (mid == 0) {
+            urlBuilder.addQueryParameter("type", type)
+                    .addQueryParameter("timezone_offset", "-480")
+                    .addQueryParameter("web_location", "333.1365");
+            if (offset != 0) {
+                urlBuilder.addQueryParameter("offset", String.valueOf(offset));
+            }
+        } else {
+            urlBuilder.addQueryParameter("platform", "web")
+                    .addQueryParameter("web_location", "333.1387")
+                    .addQueryParameter("timezone_offset", "-480")
+                    .addQueryParameter("host_mid", String.valueOf(mid))
+                    .addQueryParameter("offset", offset == 0 ? "" : String.valueOf(offset))
+                    .addQueryParameter("x-bili-device-req-json", SPACE_DYNAMIC_DEVICE_REQ_JSON);
+            if (hasSessData()) {
+                urlBuilder.addQueryParameter("dm_img_switch", "0");
+            }
+        }
+        urlBuilder.addQueryParameter("features", SPACE_DYNAMIC_FEATURES);
+        return urlBuilder;
     }
 
     private static JSONObject getLegacySpaceHistoryJsonWithRetry(long mid, long offset) throws IOException {
@@ -376,27 +424,26 @@ public class DynamicApi {
     }
 
     private static long getDynamicListByWeb(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
-        HttpUrl.Builder urlBuilder;
-        if (mid == 0) {
-            urlBuilder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all")).newBuilder()
-                    .addQueryParameter("type", type)
-                    .addQueryParameter("timezone_offset", "-480")
-                    .addQueryParameter("web_location", "333.1365");
-        } else {
-            urlBuilder = Objects.requireNonNull(HttpUrl.parse("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space")).newBuilder()
-                    .addQueryParameter("platform", "web")
-                    .addQueryParameter("web_location", "333.1387")
-                    .addQueryParameter("timezone_offset", "-480")
-                    .addQueryParameter("host_mid", String.valueOf(mid))
-                    .addQueryParameter("x-bili-device-req-json", "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\"}");
-            urlBuilder.addQueryParameter("offset", offset == 0 ? "" : String.valueOf(offset));
-        }
-        if (mid == 0 && offset != 0) {
-            urlBuilder.addQueryParameter("offset", String.valueOf(offset));
-        }
-        urlBuilder.addQueryParameter("features", "itemOpusStyle,listOnlyfans");
+        String endpoint = mid == 0
+                ? "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+                : "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space";
+        return getDynamicListByEndpoint(dynamicList, offset, mid, type, endpoint);
+    }
 
-        String signedUrl = ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(urlBuilder.build().toString()));
+    private static long getDynamicListByDesktopWeb(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
+        String endpoint = mid == 0
+                ? "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+                : "https://api.bilibili.com/x/polymer/web-dynamic/desktop/v1/feed/space";
+        return getDynamicListByEndpoint(dynamicList, offset, mid, type, endpoint);
+    }
+
+    private static long getDynamicListByEndpoint(List<Dynamic> dynamicList, long offset, long mid, String type, String endpoint) throws IOException, JSONException {
+        long requestStart = System.currentTimeMillis();
+        HttpUrl.Builder urlBuilder = buildDynamicListUrl(endpoint, offset, mid, type);
+        String rawUrl = urlBuilder.build().toString();
+        Logu.w(TRACE_TAG, "request start, mid=" + mid + ", offset=" + offset + ", endpoint=" + endpoint);
+
+        String signedUrl = ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(rawUrl));
         JSONObject all = getDynamicListJsonWithRetry(signedUrl, mid);
         
         // 检查是否是网络错误返回的错误JSON
@@ -427,13 +474,16 @@ public class DynamicApi {
 
         JSONArray items = data.optJSONArray("items");
         int parsedCount = 0;
+        int topCount = 0;
         if (items != null) {
             for (int i = 0; i < items.length(); i++) {
                 JSONObject item = items.optJSONObject(i);
                 if (item == null) continue;
                 try {
-                    dynamicList.add(analyzeDynamic(item));
+                    Dynamic dynamic = analyzeDynamic(item);
+                    dynamicList.add(dynamic);
                     parsedCount++;
+                    if (dynamic != null && dynamic.isTop) topCount++;
                 } catch (Throwable e) {
                     long dynamicId = 0;
                     try {
@@ -450,6 +500,7 @@ public class DynamicApi {
                             if (repaired != null) {
                                 dynamicList.add(repaired);
                                 parsedCount++;
+                                if (repaired.isTop) topCount++;
                                 Logu.w("dynamic-item-repair", "repaired by detail api, id=" + dynamicId);
                             }
                         } catch (Throwable ignored) {
@@ -463,34 +514,89 @@ public class DynamicApi {
             throw new IOException("用户动态解析失败");
         }
 
+        Logu.w(TRACE_TAG, "request success, mid=" + mid
+                + ", offset=" + offset
+                + ", endpoint=" + endpoint
+                + ", itemCount=" + (items == null ? 0 : items.length())
+                + ", parsedCount=" + parsedCount
+                + ", topCount=" + topCount
+                + ", nextOffset=" + offset_new
+                + ", costMs=" + (System.currentTimeMillis() - requestStart));
+
         return offset_new;
     }
 
     public static long getDynamicList(List<Dynamic> dynamicList, long offset, long mid, String type) throws IOException, JSONException {
         if (mid != 0) {
+            Logu.w(TRACE_TAG, "load start, mid=" + mid + ", offset=" + offset + ", type=" + type + ", hasSess=" + hasSessData());
+            if (offset == 0) {
+                try {
+                    CookiesApi.checkCookies();
+                    CookiesApi.ensureRiskActiveDaily();
+                    Logu.w(TRACE_TAG, "first page cookie/risk check finished, mid=" + mid);
+                } catch (Throwable ignored) {
+                    Logu.w(TRACE_TAG, "first page cookie/risk check failed, mid=" + mid + ", err=" + ignored.getMessage());
+                }
+            }
+
             IOException webIoException = null;
             JSONException webJsonException = null;
+            IOException desktopIoException = null;
+            JSONException desktopJsonException = null;
 
             ArrayList<Dynamic> webDynamicList = new ArrayList<>();
             try {
                 long webOffset = getDynamicListByWeb(webDynamicList, offset, mid, type);
                 dynamicList.addAll(webDynamicList);
+                Logu.w(TRACE_TAG, "load finished by web endpoint, mid=" + mid + ", offset=" + offset + ", resultSize=" + webDynamicList.size() + ", topCount=" + countTopDynamics(webDynamicList) + ", nextOffset=" + webOffset);
                 return webOffset;
             } catch (IOException e) {
                 webIoException = e;
-                Logu.w("dynamic-space", "web dynamic api failed, fallback to legacy space_history: " + e.getMessage());
+                Logu.w(TRACE_TAG, "web endpoint failed, mid=" + mid + ", offset=" + offset + ", err=" + e.getMessage());
+                Logu.w("dynamic-space", "web dynamic api failed, try desktop endpoint: " + e.getMessage());
             } catch (JSONException e) {
                 webJsonException = e;
-                Logu.w("dynamic-space", "web dynamic parse failed, fallback to legacy space_history: " + e.getMessage());
+                Logu.w(TRACE_TAG, "web endpoint parse failed, mid=" + mid + ", offset=" + offset + ", err=" + e.getMessage());
+                Logu.w("dynamic-space", "web dynamic parse failed, try desktop endpoint: " + e.getMessage());
+            }
+
+            if (offset == 0) {
+                Logu.w(TRACE_TAG, "first page correctness-first mode, skip desktop/legacy fallback, mid=" + mid);
+                if (webIoException != null) throw webIoException;
+                if (webJsonException != null) throw webJsonException;
+                throw new IOException("获取用户动态失败");
+            }
+
+            ArrayList<Dynamic> desktopDynamicList = new ArrayList<>();
+            try {
+                long desktopOffset = getDynamicListByDesktopWeb(desktopDynamicList, offset, mid, type);
+                dynamicList.addAll(desktopDynamicList);
+                Logu.w(TRACE_TAG, "load finished by desktop endpoint, mid=" + mid + ", offset=" + offset + ", resultSize=" + desktopDynamicList.size() + ", topCount=" + countTopDynamics(desktopDynamicList) + ", nextOffset=" + desktopOffset);
+                return desktopOffset;
+            } catch (IOException e) {
+                desktopIoException = e;
+                Logu.w(TRACE_TAG, "desktop endpoint failed, mid=" + mid + ", offset=" + offset + ", err=" + e.getMessage());
+                Logu.w("dynamic-space", "desktop dynamic api failed, fallback to legacy space_history: " + e.getMessage());
+            } catch (JSONException e) {
+                desktopJsonException = e;
+                Logu.w(TRACE_TAG, "desktop endpoint parse failed, mid=" + mid + ", offset=" + offset + ", err=" + e.getMessage());
+                Logu.w("dynamic-space", "desktop dynamic parse failed, fallback to legacy space_history: " + e.getMessage());
             }
 
             ArrayList<Dynamic> legacyDynamicList = new ArrayList<>();
             Long legacyOffset = tryGetLegacySpaceDynamicList(legacyDynamicList, offset, mid);
             if (legacyOffset != null) {
                 dynamicList.addAll(legacyDynamicList);
+                int topCount = 0;
+                for (Dynamic dynamic : legacyDynamicList) {
+                    if (dynamic != null && dynamic.isTop) topCount++;
+                }
+                Logu.w(TRACE_TAG, "load finished by legacy endpoint, mid=" + mid + ", offset=" + offset + ", resultSize=" + legacyDynamicList.size() + ", topCount=" + topCount + ", nextOffset=" + legacyOffset);
                 return legacyOffset;
             }
 
+            if (desktopIoException != null) throw desktopIoException;
+            if (desktopJsonException != null) throw desktopJsonException;
             if (webIoException != null) throw webIoException;
             if (webJsonException != null) throw webJsonException;
             throw new IOException("获取用户动态失败");
@@ -500,6 +606,8 @@ public class DynamicApi {
     }
 
     private static Long tryGetLegacySpaceDynamicList(List<Dynamic> dynamicList, long offset, long mid) throws IOException {
+        long requestStart = System.currentTimeMillis();
+        Logu.w(TRACE_TAG, "legacy request start, mid=" + mid + ", offset=" + offset);
         JSONObject all = getLegacySpaceHistoryJsonWithRetry(mid, offset);
         if (all.optBoolean("retry_failed", false)) return null;
 
@@ -514,6 +622,8 @@ public class DynamicApi {
 
         JSONArray cards = data.optJSONArray("cards");
         if (cards == null) return null;
+
+        int topCount = 0;
 
         for (int i = 0; i < cards.length(); i++) {
             JSONObject cardWrap = cards.optJSONObject(i);
@@ -530,7 +640,10 @@ public class DynamicApi {
                     Dynamic repaired = tryGetDynamicDetail(dynamicId);
                     if (repaired != null) dynamic = repaired;
                 }
-                if (dynamic != null) dynamicList.add(dynamic);
+                if (dynamic != null) {
+                    dynamicList.add(dynamic);
+                    if (dynamic.isTop) topCount++;
+                }
             } catch (Throwable e) {
                 Logu.w("legacy-dynamic-parse", String.valueOf(e.getMessage()));
             }
@@ -539,6 +652,7 @@ public class DynamicApi {
         boolean hasMore = data.optBoolean("has_more", data.optInt("has_more", 0) == 1);
         long nextOffset = optLongCompat(data, "next_offset");
         if (nextOffset <= 0) nextOffset = optLongCompat(data, "offset");
+        Logu.w(TRACE_TAG, "legacy request success, mid=" + mid + ", offset=" + offset + ", cardCount=" + cards.length() + ", parsedCount=" + dynamicList.size() + ", topCount=" + topCount + ", nextOffset=" + (hasMore && nextOffset > 0 ? nextOffset : -1) + ", costMs=" + (System.currentTimeMillis() - requestStart));
         return hasMore && nextOffset > 0 ? nextOffset : -1;
     }
 
@@ -547,6 +661,15 @@ public class DynamicApi {
         boolean noMajor = dynamic.major_object == null && dynamic.dynamic_forward == null;
         boolean noContent = dynamic.content == null || TextUtils.isEmpty(dynamic.content.toString().trim());
         return noMajor && noContent;
+    }
+
+    private static int countTopDynamics(List<Dynamic> dynamicList) {
+        if (dynamicList == null) return 0;
+        int count = 0;
+        for (Dynamic dynamic : dynamicList) {
+            if (dynamic != null && dynamic.isTop) count++;
+        }
+        return count;
     }
 
     private static Dynamic tryGetDynamicDetail(long dynamicId) {

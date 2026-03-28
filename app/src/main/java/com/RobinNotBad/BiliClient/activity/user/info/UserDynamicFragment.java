@@ -2,7 +2,6 @@ package com.RobinNotBad.BiliClient.activity.user.info;
 
 import android.annotation.SuppressLint;
 import android.os.Bundle;
-import android.util.Log;
 import android.view.View;
 
 import androidx.annotation.NonNull;
@@ -15,10 +14,12 @@ import com.RobinNotBad.BiliClient.api.UserInfoApi;
 import com.RobinNotBad.BiliClient.model.Dynamic;
 import com.RobinNotBad.BiliClient.model.UserInfo;
 import com.RobinNotBad.BiliClient.util.CenterThreadPool;
+import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Future;
 
 //用户动态
 //2023-09-30
@@ -26,10 +27,22 @@ import java.util.List;
 
 public class UserDynamicFragment extends RefreshListFragment {
 
+    private static final String TRACE_TAG = "user-dynamic-trace";
+
     private long mid;
     private ArrayList<Dynamic> dynamicList;
     private UserDynamicAdapter adapter;
     private long offset = 0;
+
+    private static class FirstPageLoadResult {
+        final ArrayList<Dynamic> list;
+        final long nextOffset;
+
+        FirstPageLoadResult(ArrayList<Dynamic> list, long nextOffset) {
+            this.list = list;
+            this.nextOffset = nextOffset;
+        }
+    }
 
     public UserDynamicFragment() {
 
@@ -56,34 +69,73 @@ public class UserDynamicFragment extends RefreshListFragment {
         super.onViewCreated(view, savedInstanceState);
 
         dynamicList = new ArrayList<>();
+        offset = 0;
+        bottom = false;
         setOnLoadMoreListener(page -> continueLoading());
+
+        loadFirstPage();
+    }
+
+    private void loadFirstPage() {
+        final long totalStart = System.currentTimeMillis();
+        Logu.w(TRACE_TAG, "fragment first page start, mid=" + mid);
+
+        Future<UserInfo> userInfoFuture = CenterThreadPool.supplyAsyncWithFuture(() -> {
+            long start = System.currentTimeMillis();
+            UserInfo userInfo = UserInfoApi.getUserInfo(mid);
+            Logu.w(TRACE_TAG, "fragment user info finished, mid=" + mid
+                    + ", success=" + (userInfo != null)
+                    + ", costMs=" + (System.currentTimeMillis() - start));
+            return userInfo;
+        });
+
+        Future<FirstPageLoadResult> dynamicFuture = CenterThreadPool.supplyAsyncWithFuture(() -> {
+            long start = System.currentTimeMillis();
+            ArrayList<Dynamic> firstPageList = new ArrayList<>();
+            long nextOffset = DynamicApi.getDynamicList(firstPageList, 0, mid, null);
+            Logu.w(TRACE_TAG, "fragment dynamic first page finished, mid=" + mid
+                    + ", resultSize=" + firstPageList.size()
+                    + ", nextOffset=" + nextOffset
+                    + ", costMs=" + (System.currentTimeMillis() - start));
+            return new FirstPageLoadResult(firstPageList, nextOffset);
+        });
 
         CenterThreadPool.run(() -> {
             try {
-                UserInfo userInfo = UserInfoApi.getUserInfo(mid);
+                UserInfo userInfo = userInfoFuture.get();
                 if (userInfo == null) {
                     runOnUiThread(() -> {
+                        setRefreshing(false);
                         MsgUtil.showMsg("用户不存在");
                         requireActivity().finish();
                     });
                     return;
                 }
-                Log.e("debug", "获取到用户信息");
 
-                try {
-                    offset = DynamicApi.getDynamicList(dynamicList, offset, mid, null);
-                    bottom = (offset == -1);
-                    Log.e("debug", "获取到用户动态");
-                } catch (Exception e) {
-                    loadFail(e);
-                }
+                FirstPageLoadResult result = dynamicFuture.get();
 
                 if (isAdded()) {
-                    adapter = new UserDynamicAdapter(requireContext(), dynamicList, userInfo);
-                    setAdapter(adapter);
-                    setRefreshing(false);
+                    runOnUiThread(() -> {
+                        if (!isAdded()) return;
+                        dynamicList.clear();
+                        dynamicList.addAll(result.list);
+                        offset = result.nextOffset;
+                        bottom = (offset == -1);
+
+                        adapter = new UserDynamicAdapter(requireContext(), dynamicList, userInfo);
+                        setAdapter(adapter);
+                        setRefreshing(false);
+
+                        Logu.w(TRACE_TAG, "fragment first page bind finished, mid=" + mid
+                                + ", resultSize=" + dynamicList.size()
+                                + ", nextOffset=" + offset
+                                + ", totalCostMs=" + (System.currentTimeMillis() - totalStart));
+                    });
                 }
             } catch (Exception e) {
+                Logu.w(TRACE_TAG, "fragment first page failed, mid=" + mid
+                        + ", costMs=" + (System.currentTimeMillis() - totalStart)
+                        + ", err=" + e.getMessage());
                 loadFail(e);
             }
         });
@@ -93,6 +145,7 @@ public class UserDynamicFragment extends RefreshListFragment {
     private void continueLoading() {
         CenterThreadPool.run(() -> {
             try {
+                long start = System.currentTimeMillis();
                 List<Dynamic> list = new ArrayList<>();
                 offset = DynamicApi.getDynamicList(list, offset, mid, null);
                 runOnUiThread(() -> {
@@ -101,6 +154,10 @@ public class UserDynamicFragment extends RefreshListFragment {
                 });
                 bottom = (offset == -1);
                 setRefreshing(false);
+                Logu.w(TRACE_TAG, "fragment load more finished, mid=" + mid
+                        + ", appendSize=" + list.size()
+                        + ", nextOffset=" + offset
+                        + ", costMs=" + (System.currentTimeMillis() - start));
             } catch (Exception e) {
                 loadFail(e);
             }
