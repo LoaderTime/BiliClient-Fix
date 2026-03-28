@@ -57,7 +57,7 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
      * 版本号：用于让历史的“坏缓存”（例如 decoded=5x5）失效。
      * 每次修复缓存相关问题时递增。
      */
-    private static final String ARTICLE_IMAGE_SIGNATURE = "ArticleImageFix_v4";
+    private static final String ARTICLE_IMAGE_SIGNATURE = "ArticleImageFix_v5";
 
     /**
      * 记录普通图片请求的“刷新版本号”。
@@ -277,18 +277,22 @@ public class OpusContentAdapter extends RecyclerView.Adapter<OpusContentAdapter.
                                                             + ", baseFallbackVariant=" + baseFallbackVariant
                                                             + ", refreshRevision=" + refreshRevision);
 
-                                            // 普通图片若出现异常小图，改为“刷新签名重试”，而不是旧版 forceBase 黑名单。
                                             boolean looksTiny = w > 0 && h > 0 && w <= 64 && h <= 64;
                                             boolean expectedLarge = expectedWidth > 0 && expectedHeight > 0
                                                     && expectedWidth >= 256 && expectedHeight >= 256;
+                                            boolean normalLooksSuspicious = (looksTiny
+                                                    || (expectedWidth > 0 && w > 0
+                                                    && w < Math.max(64, Math.min(128, expectedWidth / 4)))
+                                                    || (expectedHeight > 0 && h > 0
+                                                    && h < Math.max(64, Math.min(128, expectedHeight / 4))))
+                                                    && (expectedLarge || expectedWidth <= 0 || expectedHeight <= 0);
                                             boolean canRetryMore = refreshRevision < MAX_REFRESH_RETRY;
                                             boolean shouldRefreshRetry = !lineImage && !baseFallbackVariant && canRetryMore
-                                                    && looksTiny
-                                                    && (expectedLarge || expectedWidth <= 0 || expectedHeight <= 0);
+                                                    && normalLooksSuspicious;
                                             boolean shouldFinalBaseFallback = !lineImage
                                                     && !baseFallbackVariant
                                                     && !canRetryMore
-                                                    && looksTiny
+                                                    && normalLooksSuspicious
                                                     && baseUrl != null && !baseUrl.isEmpty();
 
                                             if (shouldRefreshRetry) {

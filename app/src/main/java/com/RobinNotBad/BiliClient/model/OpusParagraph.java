@@ -361,6 +361,7 @@ public class OpusParagraph {
         String[] pics = new String[picsJson.length()];
         int firstWidth = 0;
         int firstHeight = 0;
+        String firstUrl = "";
         for (int i = 0; i < picsJson.length(); i++) {
             JSONObject picObj = picsJson.getJSONObject(i);
             String url = picObj.optString("url", "");
@@ -370,16 +371,55 @@ public class OpusParagraph {
                 pics[i] = url.startsWith("http") ? url : "http:" + url;
             }
             if (i == 0) {
+                firstUrl = pics[i];
                 firstWidth = picObj.optInt("width", 0);
                 firstHeight = picObj.optInt("height", 0);
             }
         }
+
+        if (isLikelyDividerPic(firstUrl, firstWidth, firstHeight, picsJson.length())) {
+            String lineKind = firstHeight > 0 && firstHeight <= 4
+                    ? "api-divider-thin"
+                    : "api-divider-decor";
+            return new ImageContent(pics, true, lineKind, firstWidth, firstHeight);
+        }
+
         return new ImageContent(pics, false, "", firstWidth, firstHeight);
+    }
+
+    private boolean isLikelyDividerPic(String url, int width, int height, int picCount) {
+        if (picCount != 1) return false;
+        if (width <= 0 || height <= 0) return false;
+
+        String lower = url == null ? "" : url.toLowerCase();
+        float ratio = width * 1f / Math.max(1, height);
+
+        // 用户实测的两种 B 站 divider 原始尺寸：520x2 / 428x32
+        boolean knownDividerSize = (width == 520 && height == 2)
+                || (width == 428 && height == 32);
+
+        // 接口返回的显示尺寸可能被缩放，例如日志中的 592x9；
+        // 这类图片通常仍保持：单张、png、超扁、且高度很小。
+        boolean dividerLikeShape = lower.endsWith(".png")
+                && width >= 350
+                && height <= 40
+                && ratio >= 10f;
+
+        // 目前观察到这类 divider 常落在 bfs/app 资源路径下，作为更强的辅助信号。
+        boolean bfsAppDivider = lower.contains("/bfs/app/")
+                && lower.endsWith(".png")
+                && height <= 40
+                && ratio >= 8f;
+
+        return knownDividerSize || dividerLikeShape || bfsAppDivider;
     }
 
     public ImageContent analyzeDivider(JSONObject allJson) throws JSONException {
         if (allJson == null) return new ImageContent(new String[0], true, "api-divider", 0, 0);
-        JSONObject pic = allJson.getJSONObject("pic");
+        JSONObject pic = allJson.optJSONObject("pic");
+        if (pic == null) {
+            return new ImageContent(new String[0], true, "api-divider", 0, 0);
+        }
         String url = pic.optString("url", "");
         int width = pic.optInt("width", 0);
         int height = pic.optInt("height", 0);
