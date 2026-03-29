@@ -1,12 +1,12 @@
 {
-    "tag_name": "release-22",
-    "name": "release-22",
+    "tag_name": "release-23",
+    "name": "release-23",
     "body": "",
     "published_at": "",
     "assets": [
         {
             "name": "app-debug.apk",
-            "browser_download_url": "https://github.com/LoaderTime/BiliClient-Fix/releases/download/release-22/app-debug.apk"
+            "browser_download_url": "https://github.com/LoaderTime/BiliClient-Fix/releases/download/release-23/app-debug.apk"
         }
     ]
 }
