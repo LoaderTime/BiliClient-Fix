@@ -162,6 +162,11 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
         this.handler = null;
         unlockCanvasAndPost();
         if (handler != null) {
+            try {
+                handler.removeCallbacks(mResumeRunnable);
+            } catch (Exception ignore) {
+            }
+            mResumeTryCount = 0;
             handler.quit();
         }
         if (mHandlerThread != null) {
