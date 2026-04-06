@@ -329,16 +329,8 @@ public class TerminalContext {
     }
 
     public LiveData<Result<Opus>> getOpusById(long id) {
-        // 根据ID类型确定缓存键
-        String key;
-        if (id > 0 && id < 100000000) {
-            // 专栏ID
-            key = ContentType.Article.getTypeCode() + "_" + id;
-        } else {
-            // 动态ID
-            key = ContentType.Dynamic.getTypeCode() + "_" + id;
-        }
-        
+        String key = ContentType.Opus.getTypeCode() + "_" + id;
+
         Object obj = contentLruCache.get(key);
         if (!(obj instanceof Opus)) {
             return CenterThreadPool.supplyAsyncWithLiveData(() -> fetchOpus(id, true).getOrThrow());
@@ -380,6 +372,8 @@ public class TerminalContext {
             return ContentType.Article.getTypeCode() + "_" + ((ArticleInfo) item).id;
         } else if (item instanceof Dynamic) {
             return ContentType.Dynamic.getTypeCode() + "_" + ((Dynamic) item).dynamicId;
+        } else if (item instanceof Opus) {
+            return ContentType.Opus.getTypeCode() + "_" + ((Opus) item).id;
         } else if (item instanceof LiveInfo) {
             return ContentType.Live.getTypeCode() + "_" + ((LiveInfo) item).getLiveRoom().roomid;
         } else if (item instanceof Reply) {

@@ -372,8 +372,17 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
 
         if (clickable) {
             content.setMaxLines(5);
-            if (dynamic.dynamicId != 0) {
-                (isChild ? itemView.findViewById(R.id.dynamic_child) : itemView).setOnClickListener(view -> {
+            View targetView = isChild ? itemView.findViewById(R.id.dynamic_child) : itemView;
+            if (targetView == null) {
+                targetView = itemView;
+            }
+            if (dynamic.articleCvid > 0 || dynamic.dynamicId != 0) {
+                View finalTargetView = targetView;
+                View.OnClickListener detailClickListener = view -> {
+                    if (dynamic.articleCvid > 0) {
+                        TerminalContext.getInstance().enterArticleDetailPage(context, dynamic.articleCvid);
+                        return;
+                    }
                     if (context instanceof Activity) {
                         TerminalContext.getInstance().enterDynamicDetailPageForResult((Activity) context,
                                 dynamic.dynamicId, getAdapterPosition(), GO_TO_INFO_REQUEST);
@@ -381,13 +390,13 @@ public class DynamicHolder extends RecyclerView.ViewHolder {
                         TerminalContext.getInstance().enterDynamicDetailPage(context, dynamic.dynamicId,
                                 getAdapterPosition());
                     }
-                });
+                };
+                finalTargetView.setOnClickListener(detailClickListener);
                 content.setOnClickListener(view -> {
-                    View targetView = (isChild ? itemView.findViewById(R.id.dynamic_child) : itemView);
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH_MR1) {
-                        targetView.callOnClick();
+                        finalTargetView.callOnClick();
                     } else {
-                        targetView.performClick();
+                        finalTargetView.performClick();
                     }
                 });
             }

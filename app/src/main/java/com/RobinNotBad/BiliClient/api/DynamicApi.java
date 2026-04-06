@@ -884,6 +884,7 @@ public class DynamicApi {
             String title = card.optString("title", "");
             String view = StringUtil.toWan(optLongCompat(desc, "view")) + "阅读";
             dynamic.major_type = "MAJOR_TYPE_ARTICLE";
+            dynamic.articleCvid = articleId;
             dynamic.major_object = new ArticleCard(title, articleId, cover, "投稿文章", view);
         }
     }
@@ -1030,6 +1031,9 @@ public class DynamicApi {
             dynamic.comment_id = 0;
 
         dynamic.comment_type = basic.optInt("comment_type");
+        if ("DYNAMIC_TYPE_ARTICLE".equals(dynamic.type) && dynamic.comment_id > 0) {
+            dynamic.articleCvid = dynamic.comment_id;
+        }
 
         Logu.v("id", String.valueOf(dynamic.dynamicId));
         Logu.v("oid", String.valueOf(dynamic.comment_id));
@@ -1108,6 +1112,7 @@ public class DynamicApi {
                         break;
                     case "MAJOR_TYPE_ARTICLE":
                         JSONObject article = major.getJSONObject("article");
+                        dynamic.articleCvid = article.optLong("id", dynamic.articleCvid);
                         dynamic.major_object = new ArticleCard(
                                 article.getString("title"),
                                 article.getLong("id"),
@@ -1175,6 +1180,11 @@ public class DynamicApi {
 
                     case "MAJOR_TYPE_OPUS":
                         JSONObject opusJson = major.getJSONObject("opus");
+                        if (dynamic.articleCvid <= 0
+                                && "DYNAMIC_TYPE_ARTICLE".equals(dynamic.type)
+                                && dynamic.comment_id > 0) {
+                            dynamic.articleCvid = dynamic.comment_id;
+                        }
 
                         String title = opusJson.optString("title");
                         if (!TextUtils.isEmpty(title) && !"null".equals(title))

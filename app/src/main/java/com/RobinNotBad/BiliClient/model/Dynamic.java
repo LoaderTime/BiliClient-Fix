@@ -19,6 +19,7 @@ public class Dynamic implements Serializable {
     public Stats stats;
 
     public String major_type;
+    public long articleCvid;
     public Object major_object;
     public Dynamic dynamic_forward;
     public boolean canDelete;

@@ -18,6 +18,8 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import okhttp3.Response;
 import okhttp3.ResponseBody;
@@ -189,6 +191,28 @@ public class OpusApi {
             if (code == 0 && result.has("data") && !result.isNull("data")) {
                 JSONObject data = result.getJSONObject("data");
                 JSONObject item = data.getJSONObject("item");
+
+                long articleCvid = resolveArticleCvidFromDynamicItem(item);
+                if (articleCvid > 0) {
+                    Logu.i("检测到专栏型 opus/dynamic，尝试改用专栏详情加载: id=" + id + ", cvid=" + articleCvid);
+                    try {
+                        return getArticleOpusDetail(articleCvid);
+                    } catch (Exception articleDetailError) {
+                        Logu.e("专栏型 opus detail 转换失败，回退 ArticleApi: " + articleDetailError.getMessage());
+                        try {
+                            ArticleInfo articleInfo = ArticleApi.getArticle(articleCvid);
+                            if (articleInfo != null) {
+                                Opus articleOpus = new Opus();
+                                articleOpus.id = articleCvid;
+                                articleOpus.type = Opus.TYPE_ARTICLE;
+                                convertArticleInfoToOpus(articleOpus, articleInfo);
+                                return articleOpus;
+                            }
+                        } catch (Exception articleFallbackError) {
+                            Logu.e("ArticleApi 回退也失败，继续按动态处理: " + articleFallbackError.getMessage());
+                        }
+                    }
+                }
                 
                 // 使用analyzeOldStyleDynamic方法解析动态数据为Opus格式
                 opus.type = Opus.TYPE_DYNAMIC_OLD_STYLE;
@@ -1614,6 +1638,56 @@ public class OpusApi {
                     return id;
                 }
             }
+        }
+        return 0;
+    }
+
+    private static long resolveArticleCvidFromDynamicItem(JSONObject item) {
+        if (item == null) {
+            return 0;
+        }
+
+        JSONObject basic = item.optJSONObject("basic");
+        String dynamicType = item.optString("type", "");
+        int commentType = basic == null ? 0 : basic.optInt("comment_type", 0);
+        if (commentType != 12 && !"DYNAMIC_TYPE_ARTICLE".equals(dynamicType)) {
+            return 0;
+        }
+
+        long cvid = 0;
+        if (basic != null) {
+            cvid = parseIdValue(basic.opt("comment_id_str"));
+            if (cvid <= 0) {
+                cvid = parseIdValue(basic.opt("rid_str"));
+            }
+            if (cvid <= 0) {
+                cvid = extractArticleCvidFromUrl(basic.optString("jump_url", ""));
+            }
+        }
+
+        JSONObject modules = item.optJSONObject("modules");
+        if (cvid <= 0 && modules != null) {
+            JSONObject moduleDynamic = modules.optJSONObject("module_dynamic");
+            if (moduleDynamic != null) {
+                JSONObject major = moduleDynamic.optJSONObject("major");
+                if (major != null && "MAJOR_TYPE_ARTICLE".equals(major.optString("type", ""))) {
+                    JSONObject article = major.optJSONObject("article");
+                    if (article != null) {
+                        cvid = parseIdValue(article.opt("id"));
+                    }
+                }
+            }
+        }
+        return cvid;
+    }
+
+    private static long extractArticleCvidFromUrl(String url) {
+        if (url == null || url.trim().isEmpty()) {
+            return 0;
+        }
+        Matcher matcher = Pattern.compile("(?:read/cv|/cv)(\\d+)").matcher(url);
+        if (matcher.find()) {
+            return parseIdValue(matcher.group(1));
         }
         return 0;
     }
