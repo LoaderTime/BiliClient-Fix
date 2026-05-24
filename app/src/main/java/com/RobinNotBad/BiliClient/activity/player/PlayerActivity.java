@@ -153,15 +153,93 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final int DANMAKU_WATCHDOG_RECENT_VISIBLE_COUNT = 24;
     /** 限制硬恢复频率，避免 repeated release/prepare 把 UI 和弹幕线程一并拖死 */
     private static final long DANMAKU_WATCHDOG_HARD_RECOVERY_COOLDOWN_MS = 12000L;
+
+    /** frozen-frame 判定：可见弹幕集合签名连续不变的阈值（约 2s），用于捕捉“残留旧弹幕定格不动” */
+    private static final int DANMAKU_WATCHDOG_FROZEN_SIGNATURE_THRESHOLD_COUNT = 3;
+    /** frozen-frame 签名采样节流：每隔 N 个 watchdog tick 才计算一次签名（650ms*ticks），降低弱设备开销 */
+    private static final int DANMAKU_WATCHDOG_FROZEN_SIGNATURE_SAMPLE_EVERY_TICKS = 2;
+    /** frozen-frame 软恢复冷却，避免在异常段高频 showAndResume 造成额外抖动 */
+    private static final long DANMAKU_WATCHDOG_FROZEN_SOFT_RECOVERY_COOLDOWN_MS = 1800L;
+    /** frozen-frame 软恢复后短时间内再次冻结则升级 hard（窗口） */
+    private static final long DANMAKU_WATCHDOG_FROZEN_HARD_RECOVERY_WINDOW_MS = 6500L;
+    /** frozen-frame 判定时要求视频位置确实在推进的最小幅度，避免暂停/近似静止时误判 */
+    private static final long DANMAKU_WATCHDOG_FROZEN_VIDEO_MOVED_MS = 500L;
     private Runnable danmakuWatchdogRunnable;
     private long lastWatchdogVideoPos = -1L;
     private long lastWatchdogDanmakuTime = -1L;
+
+    /** 用于检测“弹幕残留定格”——可见弹幕集合签名的连续不变计数 */
+    private long lastWatchdogVisibleSignature = 0L;
+    private int danmakuWatchdogFrozenSigCount = 0;
+    /** frozen-frame 签名上次采样时刻/节流用 tick */
+    private int danmakuWatchdogTickCounter = 0;
+    private long lastDanmakuFrozenSoftRecoveryUptimeMs = 0L;
     private int danmakuWatchdogStuckCount = 0;
     private long lastDanmakuWatchdogRecoverUptimeMs = 0L;
     private boolean lastDanmakuWatchdogRecoverWasSoft = false;
     private long lastDanmakuHardRecoveryUptimeMs = 0L;
     /** 来自 updateTimer/watchdog 的软恢复时间戳；只用于给 watchdog 增加宽限期，不参与 soft->hard 升级链。 */
     private long lastDanmakuSoftResyncUptimeMs = 0L;
+
+    /**
+     * 生成“可见弹幕集合”轻量签名，用于识别 frozen-frame。
+     * <p>
+     * 规则：
+     * - 只取 size + 头尾弹幕的 time/text(hash) 作为代表值，避免全量遍历造成开销。
+     * - time 优先；time 不可用时 fallback 到 text.hashCode。
+     */
+    private long computeVisibleDanmakuSignature(IDanmakus danmakus) {
+        if (danmakus == null)
+            return 0L;
+        int size;
+        try {
+            size = Math.max(0, danmakus.size());
+        } catch (Exception e) {
+            return 0L;
+        }
+        if (size <= 0)
+            return 0L;
+
+        long firstVal = 0L;
+        long lastVal = 0L;
+        try {
+            BaseDanmaku first = danmakus.first();
+            BaseDanmaku last = danmakus.last();
+            firstVal = computeDanmakuValue(first);
+            lastVal = computeDanmakuValue(last);
+        } catch (Exception ignore) {
+        }
+
+        long sig = 1469598103934665603L; // FNV-1a 64bit offset basis
+        sig ^= size;
+        sig *= 1099511628211L;
+        sig ^= firstVal;
+        sig *= 1099511628211L;
+        sig ^= lastVal;
+        sig *= 1099511628211L;
+        return sig;
+    }
+
+    private long computeDanmakuValue(BaseDanmaku danmaku) {
+        if (danmaku == null)
+            return 0L;
+        // time 优先
+        try {
+            long t = (long) danmaku.time;
+            if (t > 0L)
+                return t;
+        } catch (Exception ignore) {
+        }
+        // fallback：text hash
+        try {
+            CharSequence text = danmaku.text;
+            if (text != null) {
+                return (long) text.toString().hashCode();
+            }
+        } catch (Exception ignore) {
+        }
+        return 0L;
+    }
 
     /**
      * 由播放器侧维护的“最新播放位置”缓存。
@@ -239,6 +317,84 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private void markExplicitSeek(long targetMs) {
         lastExplicitSeekUptimeMs = android.os.SystemClock.uptimeMillis();
         lastExplicitSeekTargetMs = targetMs;
+    }
+
+    /**
+     * 弹幕 seek 去抖（debounce）：
+     * <p>
+     * 目的：避免用户拖动进度条/连续方向键时，频繁触发 DFM 的 SEEK_POS -> quitUpdateThread().join()，
+     * 在弱设备上容易放大为“弹幕线程进入 paused/等待态并长尾恢复”。
+     */
+    private static final long DANMAKU_SEEK_DEBOUNCE_DELAY_MS = 160L;
+    private Runnable pendingDanmakuSeekRunnable;
+    private volatile long pendingDanmakuSeekTargetMs = -1L;
+    private volatile long pendingDanmakuSeekScheduledUptimeMs = 0L;
+
+    private void cancelPendingDanmakuSeek(@NonNull String reason) {
+        if (mainHandler != null && pendingDanmakuSeekRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuSeekRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        pendingDanmakuSeekRunnable = null;
+        pendingDanmakuSeekTargetMs = -1L;
+        pendingDanmakuSeekScheduledUptimeMs = 0L;
+        Logu.d("danmaku", "cancel pending danmaku seek: " + reason);
+    }
+
+    private void scheduleDanmakuSeek(long targetMs, @NonNull String reason) {
+        if (destroyed || resourcesReleased || isLiveMode)
+            return;
+        if (!hasDanmaku || mDanmakuView == null)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        pendingDanmakuSeekTargetMs = Math.max(0L, targetMs);
+        pendingDanmakuSeekScheduledUptimeMs = android.os.SystemClock.uptimeMillis();
+
+        if (pendingDanmakuSeekRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuSeekRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+
+        final int session = playerSessionId;
+        pendingDanmakuSeekRunnable = () -> {
+            if (destroyed || resourcesReleased || session != playerSessionId) {
+                pendingDanmakuSeekRunnable = null;
+                return;
+            }
+            long target = Math.max(0L, pendingDanmakuSeekTargetMs);
+            pendingDanmakuSeekRunnable = null;
+            pendingDanmakuSeekTargetMs = -1L;
+            pendingDanmakuSeekScheduledUptimeMs = 0L;
+
+            if (mDanmakuView == null || !hasDanmaku)
+                return;
+            try {
+                // seek 末端更偏向 “强对齐”：优先用 hide->showAndResume 强制走 SHOW/RESUME/UPDATE，
+                // 避免仅靠 seekTo() 触发 SEEK_POS 时序不稳导致卡死长尾。
+                if (isDanmakuVisible) {
+                    hideDanmakuAndPauseWithoutQuit("debouncedSeek:" + reason);
+                    mDanmakuView.showAndResumeDrawTask(target);
+                } else if (mDanmakuView.isPrepared()) {
+                    mDanmakuView.seekTo(target);
+                }
+                Logu.d("danmaku", "debounced danmaku seek applied: reason=" + reason + ", pos=" + target
+                        + ", visible=" + isDanmakuVisible);
+            } catch (Exception e) {
+                Logu.w("danmaku", "debounced danmaku seek failed: reason=" + reason + ", pos=" + target
+                        + ", err=" + e.getMessage());
+            }
+        };
+
+        mainHandler.postDelayed(pendingDanmakuSeekRunnable, DANMAKU_SEEK_DEBOUNCE_DELAY_MS);
+        Logu.d("danmaku", "schedule danmaku seek(debounce): reason=" + reason
+                + ", pos=" + pendingDanmakuSeekTargetMs
+                + ", delay=" + DANMAKU_SEEK_DEBOUNCE_DELAY_MS + "ms");
     }
 
     /**
@@ -796,6 +952,44 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         return reason.contains("EmptyVisible");
     }
 
+    private boolean shouldUseShowAndResumeForSoftRecovery(@NonNull String reason) {
+        // frozen-frame（残留定格）优先走 showAndResumeDrawTask：它会触发 DrawHandler 的 SHOW_DANMAKUS(position)
+        // 分支，从而走到 RESUME->UPDATE，能更可靠地“拉起渲染链”。
+        // 而单纯 seekTo 只会发 SEEK_POS，可能会更新 timer 但不一定恢复 UPDATE 循环。
+        if (reason.contains("FrozenFrame"))
+            return true;
+
+        // seek 风暴后常见坏态：DFM 自己进入 paused/等待态，visible 可能为 0（逻辑上空屏），
+        // 但屏幕仍残留“上一帧定格”。该场景下使用 showAndResume 更能确定拉起 UPDATE。
+        if (reason.contains("watchdogSoft"))
+            return true;
+        if (reason.contains("watchdogEmptyVisible"))
+            return true;
+        return false;
+    }
+
+    private boolean shouldUseHideShowResumeSoftStrategy(@NonNull String reason,
+                                                       boolean viewPaused,
+                                                       int visibleDanmakuCount) {
+        // 仅在“明显坏态”才走 hide->showAndResume：
+        // - viewPaused=true：DrawHandler 可能 remove UPDATE
+        // - visible==0：逻辑空屏/残影定格
+        // 其余场景仍优先 seekTo，避免频繁清屏造成闪烁。
+        if (reason.contains("FrozenFrame"))
+            return true;
+        if (viewPaused)
+            return true;
+        // updateTimer 的 forceCatchUp* 也是典型“坏态”来源：
+        // - 线程暂停/等待态（updateTimer 里观测到 paused=true，但到主线程执行 soft recovery 时可能瞬时变回 false）
+        // - 空屏（逻辑 visible==0，但屏幕可能残留定格帧）
+        // 这些场景只靠 seekTo() 发送 SEEK_POS 可能无法可靠拉起 UPDATE 循环。
+        if (reason.contains("forceCatchUpPaused") || reason.contains("forceCatchUpEmptyVisible"))
+            return true;
+        if (visibleDanmakuCount == 0 && (reason.contains("watchdog") || reason.contains("forceCatchUp")))
+            return true;
+        return false;
+    }
+
     private void markDanmakuSoftResync(@NonNull String reason, long positionMs, boolean clearOnScreen) {
         lastDanmakuSoftResyncUptimeMs = android.os.SystemClock.uptimeMillis();
         Logu.d("danmaku", "mark soft resync grace: reason=" + reason
@@ -831,6 +1025,83 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         boolean resynced = false;
         boolean recoveryIssued = false;
         boolean clearOnScreen = shouldClearDanmakusOnSoftRecovery(reason);
+
+        boolean viewPaused = false;
+        try {
+            viewPaused = mDanmakuView.isPaused();
+        } catch (Exception ignore) {
+        }
+        int visibleCount = 0;
+        try {
+            visibleCount = getCurrentVisibleDanmakuCount();
+        } catch (Exception ignore) {
+            visibleCount = 0;
+        }
+
+        boolean useHideShowResume = shouldUseHideShowResumeSoftStrategy(reason, viewPaused, visibleCount);
+        String strategy = useHideShowResume ? "HIDE_SHOW_RESUME" : "SEEK_ONLY";
+
+        // paused/空屏坏态：先 hide(不quit) 让 DrawHandler 的 mDanmakusVisible=false，避免 showDanmakus(position) 被短路。
+        if (useHideShowResume) {
+            try {
+                hideDanmakuAndPauseWithoutQuit("softRecoveryStrategy:" + reason);
+                mDanmakuView.showAndResumeDrawTask(target);
+                resynced = true;
+                recoveryIssued = true;
+                if (recoveryIssued) {
+                    markDanmakuSoftResync(reason + ":" + strategy, target, false);
+                }
+                // 播放/暂停状态对齐
+                if (!isPlaying) {
+                    try {
+                        mDanmakuView.pause();
+                    } catch (Exception ignore) {
+                    }
+                }
+                Logu.w("danmaku", "soft resync(" + strategy + "): reason=" + reason
+                        + ", pos=" + target
+                        + ", paused=" + viewPaused
+                        + ", visible=" + visibleCount
+                        + ", playing=" + isPlaying);
+                return;
+            } catch (Exception e) {
+                Logu.w("danmaku", "soft resync(" + strategy + ") failed, fallback: reason=" + reason
+                        + ", pos=" + target + ", err=" + e.getMessage());
+                // fallthrough 到旧逻辑
+                resynced = false;
+                recoveryIssued = false;
+            }
+        }
+
+        // frozen-frame 等场景：优先走 showAndResumeDrawTask（不清屏），它能显式触发 RESUME/UPDATE。
+        if (shouldUseShowAndResumeForSoftRecovery(reason)) {
+            try {
+                mDanmakuView.showAndResumeDrawTask(target);
+                resynced = true;
+                recoveryIssued = true;
+            } catch (Exception e) {
+                Logu.w("danmaku", "frozen soft recovery showAndResume failed: reason=" + reason
+                        + ", pos=" + target + ", err=" + e.getMessage());
+            }
+        }
+
+        if (resynced) {
+            if (recoveryIssued) {
+                markDanmakuSoftResync(reason, target, false);
+            }
+            // 播放/暂停状态对齐
+            if (!isPlaying) {
+                try {
+                    mDanmakuView.pause();
+                } catch (Exception ignore) {
+                }
+            }
+            Logu.w("danmaku", "soft resync(" + strategy + "): reason=" + reason + ", pos=" + target
+                    + ", inPlace=" + true + ", clear=" + false
+                    + ", paused=" + viewPaused + ", visible=" + visibleCount
+                    + ", playing=" + isPlaying);
+            return;
+        }
         try {
             // 核心思路：不要再用 hide/show 去“重开”弹幕层。
             // 当前问题是 timer 已经被 catch-up 到最新位置，但 drawTask 的窗口/屏幕态没恢复，
@@ -860,7 +1131,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         if (recoveryIssued) {
-            markDanmakuSoftResync(reason, target, clearOnScreen);
+            markDanmakuSoftResync(reason + ":" + strategy, target, clearOnScreen);
         }
 
         if (!resynced && isPlaying) {
@@ -874,8 +1145,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
         }
-        Logu.w("danmaku", "soft resync: reason=" + reason + ", pos=" + target
-                + ", inPlace=" + resynced + ", clear=" + clearOnScreen + ", playing=" + isPlaying);
+        Logu.w("danmaku", "soft resync(" + strategy + "): reason=" + reason + ", pos=" + target
+                + ", inPlace=" + resynced
+                + ", clear=" + clearOnScreen
+                + ", paused=" + viewPaused
+                + ", visible=" + visibleCount
+                + ", playing=" + isPlaying);
     }
 
     private void requestDanmakuHardRecovery(long positionMs, @NonNull String reason) {
@@ -5958,12 +6233,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
                 return;
             }
-            if (hasDanmaku && mDanmakuView != null) {
-                try {
-                    mDanmakuView.seekTo(target);
-                } catch (Exception ignore) {
-                }
-            }
+            // Danmaku seek 走去抖：连续拖动时只对 DFM 执行最后一次 seek，避免频繁 quitUpdateThread/join。
+            scheduleDanmakuSeek(target, "userSeek");
             // 同步标记：允许弹幕时间轴在短窗口内回退，防止“回跳钳制”影响正常 seek。
             markExplicitSeek(target);
             updateLatestPlayerPosition(target);
@@ -6166,12 +6437,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastDanmakuWatchdogRecoverWasSoft = false;
         lastDanmakuHardRecoveryUptimeMs = 0L;
 
+        lastWatchdogVisibleSignature = 0L;
+        danmakuWatchdogFrozenSigCount = 0;
+        danmakuWatchdogTickCounter = 0;
+        lastDanmakuFrozenSoftRecoveryUptimeMs = 0L;
+
         danmakuWatchdogRunnable = new Runnable() {
             @Override
             public void run() {
                 if (destroyed || resourcesReleased || isLiveMode) {
                     return;
                 }
+                danmakuWatchdogTickCounter++;
                 long now = android.os.SystemClock.uptimeMillis();
                 if (playerReportedBuffering || frameLoadingActive || waitingForFirstVideoFrame) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
@@ -6218,6 +6495,40 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 long danmakuLag = Math.max(0L, videoPos - dmTime);
                 boolean danmakuLagging = videoMoving && danmakuLag >= DANMAKU_WATCHDOG_STUCK_LAG_MS;
                 int visibleDanmakuCount = getCurrentVisibleDanmakuCount();
+
+                // --- frozen-frame 检测：可见弹幕残留但画面定格（视频仍在走） ---
+                // 该场景常见于：DrawHandler.UPDATE/updateThread 进入 waiting/异常状态，timer 可能仍推进，
+                // 导致传统 “dmTime 不动/lag 超阈值” 的判据无法命中。
+                boolean frozenFrame = false;
+                long visibleSig = 0L;
+                if (videoMoving && visibleDanmakuCount > 0) {
+                    // 节流：每隔 N 个 tick 才采样一次签名；未采样的 tick 不推进 frozenSigCount，避免误增。
+                    boolean sampled = (danmakuWatchdogTickCounter % DANMAKU_WATCHDOG_FROZEN_SIGNATURE_SAMPLE_EVERY_TICKS) == 0;
+                    if (sampled) {
+                        try {
+                            IDanmakus visible = mDanmakuView.getCurrentVisibleDanmakus();
+                            visibleSig = computeVisibleDanmakuSignature(visible);
+                        } catch (Exception ignore) {
+                            visibleSig = 0L;
+                        }
+
+                        if (visibleSig != 0L && visibleSig == lastWatchdogVisibleSignature) {
+                            danmakuWatchdogFrozenSigCount++;
+                        } else {
+                            danmakuWatchdogFrozenSigCount = 0;
+                        }
+                    }
+
+                    // 额外要求：视频推进幅度明显，避免边界抖动误判。
+                    boolean movedEnough = lastWatchdogVideoPos >= 0L
+                            && videoPos > lastWatchdogVideoPos + DANMAKU_WATCHDOG_FROZEN_VIDEO_MOVED_MS;
+                    if (movedEnough
+                            && danmakuWatchdogFrozenSigCount >= DANMAKU_WATCHDOG_FROZEN_SIGNATURE_THRESHOLD_COUNT) {
+                        frozenFrame = true;
+                    }
+                } else {
+                    danmakuWatchdogFrozenSigCount = 0;
+                }
                 boolean denseVisibleDanmaku = visibleDanmakuCount >= DANMAKU_WATCHDOG_DENSE_VISIBLE_COUNT;
                 boolean recentNonEmptyVisible = lastNonEmptyVisibleDanmakuUptimeMs > 0L
                         && now - lastNonEmptyVisibleDanmakuUptimeMs <= DANMAKU_WATCHDOG_RECENT_VISIBLE_MS;
@@ -6251,6 +6562,42 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         || abnormalLargeLag
                         || (danmakuWatchdogStuckCount >= DANMAKU_WATCHDOG_STUCK_THRESHOLD_COUNT
                         && likelyUnexpectedEmptyVisible);
+
+                // frozen-frame 作为独立恢复入口：优先做轻量 soft recovery（showAndResumeDrawTask），必要时升级 hard。
+                if (!shouldRecover && frozenFrame) {
+                    long nowUptime = now;
+                    boolean softCooldownOk = lastDanmakuFrozenSoftRecoveryUptimeMs <= 0L
+                            || nowUptime - lastDanmakuFrozenSoftRecoveryUptimeMs >= DANMAKU_WATCHDOG_FROZEN_SOFT_RECOVERY_COOLDOWN_MS;
+                    if (softCooldownOk) {
+                        boolean escalateHard = lastDanmakuFrozenSoftRecoveryUptimeMs > 0L
+                                && nowUptime - lastDanmakuFrozenSoftRecoveryUptimeMs <= DANMAKU_WATCHDOG_FROZEN_HARD_RECOVERY_WINDOW_MS;
+                        Logu.w("danmaku", "watchdog frozen-frame: videoPos=" + videoPos
+                                + ", dmTime=" + dmTime
+                                + ", lag=" + danmakuLag
+                                + ", visible=" + visibleDanmakuCount
+                                + ", sig=" + visibleSig
+                                + ", frozenCount=" + danmakuWatchdogFrozenSigCount
+                                + ", hard=" + escalateHard);
+
+                        lastDanmakuFrozenSoftRecoveryUptimeMs = nowUptime;
+                        danmakuWatchdogFrozenSigCount = 0;
+
+                        if (escalateHard) {
+                            if (lastDanmakuHardRecoveryUptimeMs <= 0L
+                                    || nowUptime - lastDanmakuHardRecoveryUptimeMs >= DANMAKU_WATCHDOG_HARD_RECOVERY_COOLDOWN_MS) {
+                                lastDanmakuHardRecoveryUptimeMs = nowUptime;
+                                requestDanmakuHardRecovery(videoPos, "watchdogFrozenFrameHard");
+                            } else {
+                                // 仍在 hard cooldown：退回 soft，避免疯狂重建。
+                                performDanmakuSoftRecovery(videoPos, "watchdogFrozenFrame");
+                            }
+                        } else {
+                            performDanmakuSoftRecovery(videoPos, "watchdogFrozenFrame");
+                        }
+                        lastDanmakuWatchdogRecoverUptimeMs = nowUptime;
+                        lastDanmakuWatchdogRecoverWasSoft = !escalateHard;
+                    }
+                }
 
                 if (shouldRecover) {
                     boolean directHardRecover = likelyUnexpectedEmptyVisible
@@ -6295,6 +6642,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
                 lastWatchdogVideoPos = videoPos;
                 lastWatchdogDanmakuTime = dmTime;
+                // 只有在本 tick 实际采样到了有效签名时才更新，否则保持上一次值。
+                if (visibleSig != 0L) {
+                    lastWatchdogVisibleSignature = visibleSig;
+                }
 
                 mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
             }
@@ -6317,6 +6668,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastDanmakuWatchdogRecoverWasSoft = false;
         lastDanmakuHardRecoveryUptimeMs = 0L;
         lastDanmakuSoftResyncUptimeMs = 0L;
+
+        lastWatchdogVisibleSignature = 0L;
+        danmakuWatchdogFrozenSigCount = 0;
+        danmakuWatchdogTickCounter = 0;
+        lastDanmakuFrozenSoftRecoveryUptimeMs = 0L;
     }
 
     private void toggleAudioOnlyMode() {
