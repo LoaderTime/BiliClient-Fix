@@ -1857,6 +1857,43 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         return false;
     }
 
+    private boolean isWaitingForBackgroundSurfaceFirstFrame() {
+        return inBackgroundSurfaceRestore && waitingForFirstVideoFrame && !firstVideoFrameRendered;
+    }
+
+    /**
+     * 同一次“后台连续播放 -> 回前台首帧恢复”期间，surface/onResume 可能重复打到这里。
+     * <p>
+     * 若此时已经有一条恢复链在跑，则尽量复用它，避免 cancel + restart 把 timeout 窗口一再重置，
+     * 最终放大成 2~5s 的恢复长尾。
+     */
+    private boolean tryCoalesceBackgroundSurfaceRestore(long restorePositionMs, @NonNull String reason) {
+        if (!isWaitingForBackgroundSurfaceFirstFrame())
+            return false;
+
+        long normalizedPosition = Math.max(0L, restorePositionMs);
+        if (backgroundSurfaceRestoreBasePosMs < 0L) {
+            backgroundSurfaceRestoreBasePosMs = normalizedPosition;
+        } else {
+            backgroundSurfaceRestoreBasePosMs = Math.max(backgroundSurfaceRestoreBasePosMs, normalizedPosition);
+        }
+
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+
+        if (!backgroundSurfaceRefreshPending && !backgroundSurfaceRefreshTriggered) {
+            scheduleBackgroundSurfaceRefreshTimeout("coalesce:" + reason);
+        }
+
+        Logu.w("surface", "reuse in-flight background restore: reason=" + reason
+                + ", pos=" + normalizedPosition
+                + ", step=" + backgroundSurfaceRestoreStep
+                + ", session=" + playerSessionId);
+        return true;
+    }
+
     private boolean hasHealthyVideoRenderOutput(@NonNull String reason, boolean allowDecodeFallback) {
         if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode)
             return false;
@@ -1878,7 +1915,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         long pos = getLatestPlayerPositionForDanmaku();
         boolean healthy = surfaceReady && outputFps > 0.01f;
-        if (!healthy && allowDecodeFallback && !isOnlineVideo) {
+        if (!healthy && allowDecodeFallback && !isOnlineVideo
+                && !skipSeekOnNextSurfaceCreatedFromBackgroundPlayback
+                && !finishWatching
+                && !isWaitingForBackgroundSurfaceFirstFrame()) {
             healthy = surfaceReady && decodeFps > 0.01f && pos > 0L;
         }
 
@@ -3477,15 +3517,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * - 分级触发渲染（kick / 微小准确 seek / 重绑 surface），尽快拿到 MEDIA_INFO_VIDEO_RENDERING_START。
      */
     private void startBackgroundSurfaceRestore(long restorePositionMs, @NonNull String reason) {
-        cancelBackgroundSurfaceRestore();
-        cancelLocalBackgroundSurfaceAudioRestore();
-        cancelBackgroundSurfaceRefreshTimeout();
-        cancelBackgroundResumeRenderHealthCheck();
-
         if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode)
             return;
         if (ijkPlayer == null || !isPrepared)
             return;
+
+        if (tryCoalesceBackgroundSurfaceRestore(restorePositionMs, reason))
+            return;
+
+        cancelBackgroundSurfaceRestore();
+        cancelLocalBackgroundSurfaceAudioRestore();
+        cancelBackgroundSurfaceRefreshTimeout();
+        cancelBackgroundResumeRenderHealthCheck();
         if (mainHandler == null)
             mainHandler = new Handler(Looper.getMainLooper());
 
@@ -3527,6 +3570,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             scheduleLocalBackgroundSurfaceBlackRebuild("bgRestore-local:" + reason);
         }
         startBackgroundSurfaceRestoreProbe(reason);
+        scheduleBackgroundSurfaceRefreshTimeout("bgRestore:" + reason);
 
         // UI 兜底：若一直没有 rendering_start 事件，但播放在继续推进，推断画面已恢复，自动关闭 loading。
         // 这样不会无限卡住（你反馈的“画面已出但提示不消失”）。
