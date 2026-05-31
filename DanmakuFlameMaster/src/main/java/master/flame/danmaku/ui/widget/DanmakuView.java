@@ -47,6 +47,12 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
 
     public static final String TAG = "DanmakuView";
 
+    /**
+     * DFM 的更新线程会等待 UI onDraw 完成本帧绘制；这里必须有上限，避免 UI 繁忙或 View 状态竞态时
+     * 更新线程长期阻塞，进而拖死 seek / soft recovery / hard recovery。
+     */
+    private static final long MAX_DRAW_WAIT_MS = 80L;
+
     private Callback mCallback;
 
     private HandlerThread mHandlerThread;
@@ -74,6 +80,17 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
     private boolean mRequestRender = false;
 
     private long mUiThreadId;
+
+    /** 最近一次真正执行 handler.draw(canvas) 的时间，用于播放器侧判断弹幕渲染链路是否还活着。 */
+    private volatile long mLastDrawUptimeMs = 0L;
+
+    /** 成功绘制帧序号。只要真实 onDraw -> handler.draw 发生，就递增。 */
+    private volatile long mDrawFrameSeq = 0L;
+
+    /** 因等待 UI 绘制超时而跳过的帧数，用于诊断弱设备/高倍速下的压力。 */
+    private volatile long mDroppedDrawFrameCount = 0L;
+
+    private volatile long mLastDrawCostMs = 0L;
 
     public DanmakuView(Context context) {
         super(context);
@@ -132,6 +149,25 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
         }
 
         return null;
+    }
+
+    @Override
+    public long getLastDrawUptimeMs() {
+        return mLastDrawUptimeMs;
+    }
+
+    @Override
+    public long getDrawFrameSeq() {
+        return mDrawFrameSeq;
+    }
+
+    @Override
+    public long getDroppedDrawFrameCount() {
+        return mDroppedDrawFrameCount;
+    }
+
+    public long getLastDrawCostMs() {
+        return mLastDrawCostMs;
     }
 
     public void setCallback(Callback callback) {
@@ -305,19 +341,26 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
             return;
         }
         postInvalidateCompat();
+        boolean finished;
         synchronized (mDrawMonitor) {
-            while ((!mDrawFinished) && (handler != null)) {
+            long deadline = SystemClock.uptimeMillis() + MAX_DRAW_WAIT_MS;
+            while ((!mDrawFinished) && (handler != null) && mDanmakuVisible && !handler.isStop()) {
+                long waitMs = deadline - SystemClock.uptimeMillis();
+                if (waitMs <= 0L) {
+                    break;
+                }
                 try {
-                    mDrawMonitor.wait(200);
+                    mDrawMonitor.wait(waitMs);
                 } catch (InterruptedException e) {
-                    if (mDanmakuVisible == false || handler == null || handler.isStop()) {
-                        break;
-                    } else {
-                        Thread.currentThread().interrupt();
-                    }
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
+            finished = mDrawFinished;
             mDrawFinished = false;
+        }
+        if (!finished && handler != null && mDanmakuVisible) {
+            mDroppedDrawFrameCount++;
         }
     }
 
@@ -344,7 +387,12 @@ public class DanmakuView extends View implements IDanmakuView, IDanmakuViewContr
             mClearFlag = false;
         } else {
             if (handler != null) {
+                long drawStart = SystemClock.uptimeMillis();
                 RenderingState rs = handler.draw(canvas);
+                long drawEnd = SystemClock.uptimeMillis();
+                mLastDrawCostMs = drawEnd - drawStart;
+                mLastDrawUptimeMs = drawEnd;
+                mDrawFrameSeq++;
                 if (mShowFps) {
                     if (mDrawTimes == null)
                         mDrawTimes = new LinkedList<>();

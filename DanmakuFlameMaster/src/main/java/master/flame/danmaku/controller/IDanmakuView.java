@@ -47,6 +47,12 @@ public interface IDanmakuView {
     public void removeAllLiveDanmakus();
 
     public IDanmakus getCurrentVisibleDanmakus();
+
+    public long getLastDrawUptimeMs();
+
+    public long getDrawFrameSeq();
+
+    public long getDroppedDrawFrameCount();
     
     public void setCallback(Callback callback);
     
@@ -100,6 +106,8 @@ public interface IDanmakuView {
     public void show();
     
     public void hide();
+
+    public void clear();
     
     /**
      * show the danmakuview again if you called hideAndPauseDrawTask()

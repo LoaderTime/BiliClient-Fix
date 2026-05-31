@@ -324,14 +324,28 @@ public class DrawHandler extends Handler {
         if (mThread != null) {
             final UpdateThread thread = mThread;
             mThread = null;
-            synchronized (drawTask) {
-                drawTask.notifyAll();
+            if (drawTask != null) {
+                synchronized (drawTask) {
+                    drawTask.notifyAll();
+                }
             }
             thread.quit();
+            thread.interrupt();
             try {
-                thread.join();
+                thread.join(300L);
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                Thread.currentThread().interrupt();
+            }
+            if (thread.isAlive()) {
+                Thread cleanupThread = new Thread(() -> {
+                    try {
+                        thread.join(1500L);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }, "DFM-UpdateThread-Cleanup");
+                cleanupThread.setDaemon(true);
+                cleanupThread.start();
             }
         }
     }
@@ -603,7 +617,7 @@ public class DrawHandler extends Handler {
     }
 
     public void showDanmakus(Long position) {
-        if (mDanmakusVisible)
+        if (mDanmakusVisible && position == null)
             return;
         mDanmakusVisible = true;
         removeMessages(SHOW_DANMAKUS);
