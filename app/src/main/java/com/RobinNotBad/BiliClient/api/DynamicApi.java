@@ -53,46 +53,99 @@ public class DynamicApi {
 
     private static final String SPACE_DYNAMIC_FEATURES = "itemOpusStyle,listOnlyfans";
     private static final String SPACE_DYNAMIC_DEVICE_REQ_JSON = "{\"platform\":\"web\",\"device\":\"pc\",\"spmid\":\"333.1387\"}";
+    public static final String SPACE_DYNAMIC_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.2 Safari/605.1.15";
+    private static final int SPACE_DYNAMIC_RISK_MAX_ATTEMPTS = 6;
 
     private static boolean isRiskCode(int code) {
-        return code == -352 || code == -412 || code == -403;
+        return code == -352 || code == -412 || code == -403 || code == 421;
     }
 
-    private static JSONObject getDynamicListJsonWithRetry(String signedUrl, long mid) throws IOException {
-        for (int retry = 0; retry < 2; retry++) {
+    private static JSONObject getDynamicListJsonWithRetry(String rawUrl, long mid) throws IOException, JSONException {
+        int maxAttempts = mid == 0 ? 2 : SPACE_DYNAMIC_RISK_MAX_ATTEMPTS;
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            String signedUrl = signDynamicListUrl(rawUrl, mid);
+            Logu.w("dynamic-risk", "request attempt=" + (attempt + 1)
+                    + "/" + maxAttempts
+                    + ", mid=" + mid
+                    + ", " + summarizeDynamicSignedUrl(signedUrl));
             JSONObject all = mid == 0
                     ? NetWorkUtil.getJson(signedUrl)
                     : NetWorkUtil.getJson(signedUrl, getSpaceHeaders(mid));
 
             if (all.optBoolean("retry_failed", false)) {
-                if (retry == 0) {
-                    Logu.w("dynamic-risk", "retry_failed, try reactivate cookies and retry once");
-                    try {
-                        CookiesApi.checkCookies();
-                        CookiesApi.ensureRiskActive(true);
-                    } catch (Exception e) {
-                        Logu.e("dynamic-risk-retry", String.valueOf(e.getMessage()));
-                    }
+                if (attempt < maxAttempts - 1) {
+                    Logu.w("dynamic-risk", "retry_failed, attempt=" + (attempt + 1)
+                            + "/" + maxAttempts
+                            + ", httpCode=" + all.optInt("http_code", -1)
+                            + ", bodyKind=" + all.optString("body_kind", "")
+                            + ", try reactivate cookies and retry");
+                    boolean activated = reactivateDynamicRisk(mid);
+                    Logu.w("dynamic-risk", "reactivate finished, attempt=" + (attempt + 1)
+                            + "/" + maxAttempts
+                            + ", mid=" + mid
+                            + ", activated=" + activated);
+                    sleepBeforeRiskRetry(attempt);
                     continue;
                 }
+                Logu.w("dynamic-risk", "exhausted by retry_failed, mid=" + mid
+                        + ", attempts=" + maxAttempts
+                        + ", httpCode=" + all.optInt("http_code", -1)
+                        + ", bodyKind=" + all.optString("body_kind", ""));
                 return all;
             }
 
             int code = all.optInt("code", -1);
-            if (!isRiskCode(code) || retry > 0) {
+            if (!isRiskCode(code) || attempt >= maxAttempts - 1) {
+                if (isRiskCode(code)) {
+                    Logu.w("dynamic-risk", "exhausted by api code, mid=" + mid
+                            + ", attempts=" + maxAttempts
+                            + ", code=" + code);
+                }
                 return all;
             }
 
-            Logu.w("dynamic-risk", "code=" + code + ", try reactivate cookies and retry once");
-            try {
-                CookiesApi.checkCookies();
-                CookiesApi.ensureRiskActive(true);
-            } catch (Exception e) {
-                Logu.e("dynamic-risk-retry", String.valueOf(e.getMessage()));
-            }
+            Logu.w("dynamic-risk", "code=" + code + ", attempt=" + (attempt + 1)
+                    + "/" + maxAttempts + ", try reactivate cookies and retry");
+            boolean activated = reactivateDynamicRisk(mid);
+            Logu.w("dynamic-risk", "reactivate finished, attempt=" + (attempt + 1)
+                    + "/" + maxAttempts
+                    + ", mid=" + mid
+                    + ", activated=" + activated);
+            sleepBeforeRiskRetry(attempt);
         }
         // 理论上不会到达这里
         return new JSONObject();
+    }
+
+    private static boolean reactivateDynamicRisk(long mid) {
+        try {
+            if (mid == 0) {
+                CookiesApi.checkCookies();
+                return CookiesApi.ensureRiskActive(true);
+            } else {
+                CookiesApi.ensurePiliPlusBaseCookies();
+                return CookiesApi.ensureSpaceDynamicRiskActive(mid, true);
+            }
+        } catch (Exception e) {
+            Logu.e("dynamic-risk-retry", String.valueOf(e.getMessage()));
+            return false;
+        }
+    }
+
+    private static void sleepBeforeRiskRetry(int attempt) throws IOException {
+        try {
+            Thread.sleep(Math.min(1600L, 350L * (attempt + 1)));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("线程被中断", e);
+        }
+    }
+
+    private static String signDynamicListUrl(String rawUrl, long mid) throws IOException, JSONException {
+        String withDmParams = mid == 0
+                ? DmImgParamUtil.getDmImgParamsUrl(rawUrl)
+                : DmImgParamUtil.getSimpleDmImgParamsUrl(rawUrl);
+        return ConfInfoApi.signWBI(withDmParams);
     }
 
     private static boolean hasSessData() {
@@ -109,18 +162,16 @@ public class DynamicApi {
             if (offset != 0) {
                 urlBuilder.addQueryParameter("offset", String.valueOf(offset));
             }
+            urlBuilder.addQueryParameter("features", SPACE_DYNAMIC_FEATURES);
         } else {
-            urlBuilder.addQueryParameter("platform", "web")
-                    .addQueryParameter("web_location", "333.1387")
-                    .addQueryParameter("timezone_offset", "-480")
+            urlBuilder.addQueryParameter("offset", offset == 0 ? "" : String.valueOf(offset))
                     .addQueryParameter("host_mid", String.valueOf(mid))
-                    .addQueryParameter("offset", offset == 0 ? "" : String.valueOf(offset))
+                    .addQueryParameter("timezone_offset", "-480")
+                    .addQueryParameter("features", SPACE_DYNAMIC_FEATURES)
+                    .addQueryParameter("platform", "web")
+                    .addQueryParameter("web_location", "333.1387")
                     .addQueryParameter("x-bili-device-req-json", SPACE_DYNAMIC_DEVICE_REQ_JSON);
-            if (hasSessData()) {
-                urlBuilder.addQueryParameter("dm_img_switch", "0");
-            }
         }
-        urlBuilder.addQueryParameter("features", SPACE_DYNAMIC_FEATURES);
         return urlBuilder;
     }
 
@@ -140,8 +191,8 @@ public class DynamicApi {
 
             Logu.w("dynamic-risk-legacy", "code=" + code + ", try reactivate cookies and retry once");
             try {
-                CookiesApi.checkCookies();
-                CookiesApi.ensureRiskActive(true);
+                CookiesApi.ensurePiliPlusBaseCookies();
+                CookiesApi.ensureSpaceDynamicRiskActive(mid, true);
             } catch (Exception e) {
                 Logu.e("dynamic-risk-legacy-retry", String.valueOf(e.getMessage()));
             }
@@ -151,9 +202,48 @@ public class DynamicApi {
 
     private static ArrayList<String> getSpaceHeaders(long mid) {
         ArrayList<String> headers = NetWorkUtil.getWebHeadersSnapshot();
+        removeHeader(headers, "Sec-Ch-Ua");
+        removeHeader(headers, "Sec-Ch-Ua-Platform");
+        removeHeader(headers, "Sec-Ch-Ua-Mobile");
+        setHeader(headers, "User-Agent", SPACE_DYNAMIC_USER_AGENT);
         setHeader(headers, "Origin", "https://space.bilibili.com");
         setHeader(headers, "Referer", "https://space.bilibili.com/" + mid + "/dynamic");
+        CookiesApi.applyPiliPlusAccountHeaders(headers);
         return headers;
+    }
+
+    private static String summarizeDynamicSignedUrl(String signedUrl) {
+        try {
+            HttpUrl url = Objects.requireNonNull(HttpUrl.parse(signedUrl));
+            StringBuilder names = new StringBuilder();
+            for (int i = 0; i < url.querySize(); i++) {
+                if (i > 0) names.append(",");
+                names.append(url.queryParameterName(i));
+            }
+            return "paramNames=[" + names + "]"
+                    + ", offsetEmpty=" + TextUtils.isEmpty(url.queryParameter("offset"))
+                    + ", webLocation=" + url.queryParameter("web_location")
+                    + ", platform=" + url.queryParameter("platform")
+                    + ", dmImgStrLen=" + lengthOf(url.queryParameter("dm_img_str"))
+                    + ", dmCoverLen=" + lengthOf(url.queryParameter("dm_cover_img_str"))
+                    + ", wts=" + url.queryParameter("wts")
+                    + ", wRidLen=" + lengthOf(url.queryParameter("w_rid"));
+        } catch (Throwable ignored) {
+            return "urlSummaryFailed";
+        }
+    }
+
+    private static int lengthOf(String value) {
+        return value == null ? 0 : value.length();
+    }
+
+    private static void removeHeader(List<String> headers, String key) {
+        for (int i = headers.size() - 2; i >= 0; i -= 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.remove(i + 1);
+                headers.remove(i);
+            }
+        }
     }
 
     private static void setHeader(List<String> headers, String key, String value) {
@@ -443,8 +533,7 @@ public class DynamicApi {
         String rawUrl = urlBuilder.build().toString();
         Logu.w(TRACE_TAG, "request start, mid=" + mid + ", offset=" + offset + ", endpoint=" + endpoint);
 
-        String signedUrl = ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(rawUrl));
-        JSONObject all = getDynamicListJsonWithRetry(signedUrl, mid);
+        JSONObject all = getDynamicListJsonWithRetry(rawUrl, mid);
         
         // 检查是否是网络错误返回的错误JSON
         if (all.optBoolean("retry_failed", false)) {
@@ -531,8 +620,8 @@ public class DynamicApi {
             Logu.w(TRACE_TAG, "load start, mid=" + mid + ", offset=" + offset + ", type=" + type + ", hasSess=" + hasSessData());
             if (offset == 0) {
                 try {
-                    CookiesApi.checkCookies();
-                    CookiesApi.ensureRiskActiveDaily();
+                    CookiesApi.ensurePiliPlusBaseCookies();
+                    CookiesApi.ensureSpaceDynamicRiskActive(mid, false);
                     Logu.w(TRACE_TAG, "first page cookie/risk check finished, mid=" + mid);
                 } catch (Throwable ignored) {
                     Logu.w(TRACE_TAG, "first page cookie/risk check failed, mid=" + mid + ", err=" + ignored.getMessage());
@@ -744,6 +833,19 @@ public class DynamicApi {
             }
         }
         return 0;
+    }
+
+    private static boolean optBooleanCompat(JSONObject json, String key, boolean defaultValue) {
+        if (json == null || TextUtils.isEmpty(key) || json.isNull(key)) return defaultValue;
+        Object v = json.opt(key);
+        if (v instanceof Boolean) return (Boolean) v;
+        if (v instanceof Number) return ((Number) v).intValue() == 1;
+        if (v instanceof String) {
+            String value = ((String) v).trim();
+            if ("true".equalsIgnoreCase(value) || "1".equals(value)) return true;
+            if ("false".equalsIgnoreCase(value) || "0".equals(value) || "2".equals(value)) return false;
+        }
+        return defaultValue;
     }
 
     private static String mapLegacyDynamicType(int type) {
@@ -1050,7 +1152,7 @@ public class DynamicApi {
             userInfo.mid = optLongCompat(module_author, "mid");
             userInfo.name = module_author.optString("name", "");
             if (!module_author.isNull("following"))
-                userInfo.followed = module_author.getBoolean("following");
+                userInfo.followed = optBooleanCompat(module_author, "following", false);
             userInfo.avatar = module_author.optString("face", "");
             authorIsTop = module_author.optBoolean("is_top", false);
             JSONObject vipJson = module_author.optJSONObject("vip");

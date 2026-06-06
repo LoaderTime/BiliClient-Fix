@@ -2,12 +2,14 @@ package com.RobinNotBad.BiliClient.api;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.util.Base64;
 import android.util.DisplayMetrics;
 import android.util.Pair;
 import android.view.WindowManager;
 
 import com.RobinNotBad.BiliClient.BiliTerminal;
 import com.RobinNotBad.BiliClient.util.Cookies;
+import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.NetWorkUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 
@@ -20,14 +22,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.UUID;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -38,6 +44,12 @@ import okhttp3.Response;
  * Cookies相关API
  */
 public class CookiesApi {
+    private static final String RISK_TRACE_TAG = "cookie-risk-active";
+    private static final String RISK_SCENE_DEFAULT = "333.1007.fp.risk";
+    private static final String RISK_SCENE_SPACE_DYNAMIC = "333.1387.fp.risk";
+    private static final String PILIPLUS_RISK_USER_AGENT = "Dart/3.6 (dart:io)";
+    private static final Object PROCESS_RISK_ACTIVE_LOCK = new Object();
+    private static final Map<String, Boolean> PROCESS_RISK_ACTIVE = new HashMap<>();
 
     public static ArrayList<String> genWebHeaders() {
         return new ArrayList<>() {{
@@ -61,27 +73,123 @@ public class CookiesApi {
      * @return 返回码
      */
     public static int activeCookieInfo() throws JSONException, IOException {
+        return activeCookieInfo(RISK_SCENE_DEFAULT);
+    }
+
+    public static int activeCookieInfo(String riskScene) throws JSONException, IOException {
+        return activeCookieInfo(riskScene, 0);
+    }
+
+    public static int activeCookieInfo(String riskScene, long mid) throws JSONException, IOException {
         String url = "https://api.bilibili.com/x/internal/gaia-gateway/ExClimbWuzhi";
         //NetWorkUtil.postJson(url, genCookiePayload().toString(), genWebHeaders());    //b站自己请求两次，所以我也请求两次（？）
-        return new JSONObject(Objects.requireNonNull(NetWorkUtil.postJson(url, genCookiePayload(), genWebHeaders()).body()).string()).getInt("code");
+        try (Response response = NetWorkUtil.postJson(url, genCookiePayload(riskScene), genRiskActiveHeaders(riskScene, mid))) {
+            String body = Objects.requireNonNull(response.body()).string();
+            int code = new JSONObject(body).getInt("code");
+            Logu.w(RISK_TRACE_TAG, "active response, scene=" + riskScene
+                    + ", mid=" + mid
+                    + ", httpCode=" + response.code()
+                    + ", code=" + code
+                    + ", bodyLen=" + body.length());
+            return code;
+        }
+    }
+
+    private static ArrayList<String> genRiskActiveHeaders(String riskScene, long mid) {
+        ArrayList<String> headers = RISK_SCENE_SPACE_DYNAMIC.equals(riskScene)
+                ? genPiliPlusRiskActiveHeaders()
+                : genWebHeaders();
+        applyPiliPlusAccountHeaders(headers);
+        return headers;
+    }
+
+    private static ArrayList<String> genPiliPlusRiskActiveHeaders() {
+        ArrayList<String> headers = new ArrayList<>();
+        headers.add("Cookie");
+        headers.add(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
+        headers.add("Referer");
+        headers.add("https://www.bilibili.com/");
+        headers.add("User-Agent");
+        headers.add(PILIPLUS_RISK_USER_AGENT);
+        return headers;
+    }
+
+    static void applyPiliPlusAccountHeaders(List<String> headers) {
+        setHeader(headers, "env", "prod");
+        setHeader(headers, "app-key", "android64");
+        setHeader(headers, "x-bili-aurora-zone", "sh001");
+
+        String selfMid = NetWorkUtil.getInfoFromCookie("DedeUserID", SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
+        if (selfMid != null && !selfMid.isEmpty()) {
+            setHeader(headers, "x-bili-mid", selfMid);
+            setHeader(headers, "x-bili-aurora-eid", genAuroraEid(selfMid));
+        }
+    }
+
+    private static void removeHeader(List<String> headers, String key) {
+        for (int i = headers.size() - 2; i >= 0; i -= 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.remove(i + 1);
+                headers.remove(i);
+            }
+        }
+    }
+
+    private static void setHeader(List<String> headers, String key, String value) {
+        for (int i = 0; i + 1 < headers.size(); i += 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.set(i + 1, value);
+                return;
+            }
+        }
+        headers.add(key);
+        headers.add(value);
+    }
+
+    private static String genAuroraEid(String uid) {
+        if (uid == null || uid.isEmpty()) return "";
+        byte[] bytes = uid.getBytes(StandardCharsets.US_ASCII);
+        byte[] key = "ad1va46a7lza".getBytes(StandardCharsets.US_ASCII);
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) (bytes[i] ^ key[i % key.length]);
+        }
+        return Base64.encodeToString(bytes, Base64.NO_WRAP).replace("=", "");
     }
 
     /*
      * from https://s1.hdslb.com/bfs/seed/log/report/log-reporter.js
      */
     public static String genCookiePayload() throws JSONException {
-        Pair<Integer, Integer> resolution = gen_browser_resolution();
-        JSONArray resolutionArray = new JSONArray();
-        resolutionArray.put(resolution.second);
-        resolutionArray.put(resolution.first);
+        return genCookiePayload(RISK_SCENE_DEFAULT);
+    }
 
-        String payload = "{\"payload\": \"{\\\"5062\\\":TIME_HERE,\\\"39c8\\\":\\\"333.1007.fp.risk\\\",\\\"920b\\\":\\\"0\\\",\\\"df35\\\":\\\"UUID_HERE\\\",\\\"03bf\\\":\\\"https://www.bilibili.com/\\\",\\\"6e7c\\\":\\\"RESOLUTION_HERE\\\",\\\"3c43\\\":{\\\"2673\\\":0,\\\"5766\\\":24,\\\"6527\\\":0,\\\"7003\\\":1,\\\"807e\\\":1,\\\"b8ce\\\":\\\"UA_HERE\\\",\\\"641c\\\":0,\\\"07a4\\\":\\\"zh-CN\\\",\\\"1c57\\\":8,\\\"0bd0\\\":4,\\\"748e\\\":PAIR_HERE,\\\"d61f\\\":PAIR_HERE,\\\"fc9d\\\":-480,\\\"6aa9\\\":\\\"Asia/Shanghai\\\",\\\"75b8\\\":1,\\\"3b21\\\":1,\\\"8a1c\\\":0,\\\"d52f\\\":\\\"not available\\\",\\\"adca\\\":\\\"Win32\\\",\\\"80c9\\\":[[\\\"360SoftMgrPlugin\\\",\\\"360SoftMgrPlugin\\\",[[\\\"application/360softmgrplugin\\\",\\\"dll\\\"]]],[\\\"Alipay Security Control 3\\\",\\\"Alipay Security Control\\\",[[\\\"application/x-alisecctrl-plugin\\\",\\\"*\\\"]]],[\\\"Alipay security control\\\",\\\"npaliedit\\\",[[\\\"application/aliedit\\\",\\\"\\\"]]],[\\\"BaiduYunGuanjia Application\\\",\\\"YunWebDetect\\\",[[\\\"application/bd-npyunwebdetect-plugin\\\",\\\"\\\"]]],[\\\"Chromium PDF Plugin\\\",\\\"Portable Document Format\\\",[[\\\"application/x-google-chrome-pdf\\\",\\\"pdf\\\"]]],[\\\"Chromium PDF Viewer\\\",\\\"\\\",[[\\\"application/pdf\\\",\\\"pdf\\\"]]],[\\\"Java Deployment Toolkit 8.0.2910.10\\\",\\\"NPRuntime Script Plug-in Library for Java(TM) Deploy\\\",[[\\\"application/java-deployment-toolkit\\\",\\\"\\\"]]],[\\\"Java(TM) Platform SE 8 U291\\\",\\\"Next Generation Java Plug-in 11.291.2 for Mozilla browsers\\\",[[\\\"application/x-java-applet\\\",\\\"\\\"],[\\\"application/x-java-bean\\\",\\\"\\\"],[\\\"application/x-java-vm\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.1.1\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.1.1\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.1\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.1\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.2\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.2\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.1.3\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.1.3\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.1.2\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.1.2\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.3\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.3\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.2.2\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.2.2\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.2.1\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.2.1\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.3.1\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.3.1\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.4\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.4\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.4.1\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.4.1\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.4.2\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.4.2\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.5\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.5\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.6\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.6\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.7\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.7\\\",\\\"\\\"],[\\\"application/x-java-applet;version=1.8\\\",\\\"\\\"],[\\\"application/x-java-bean;version=1.8\\\",\\\"\\\"],[\\\"application/x-java-applet;jpi-version=1.8.0_291\\\",\\\"\\\"],[\\\"application/x-java-bean;jpi-version=1.8.0_291\\\",\\\"\\\"],[\\\"application/x-java-vm-npruntime\\\",\\\"\\\"],[\\\"application/x-java-applet;deploy=11.291.2\\\",\\\"\\\"],[\\\"application/x-java-applet;javafx=8.0.291\\\",\\\"\\\"]]],[\\\"Microsoft® Windows Media Player Firefox Plugin\\\",\\\"np-mswmp\\\",[[\\\"application/x-ms-wmp\\\",\\\"*\\\"],[\\\"application/asx\\\",\\\"*\\\"],[\\\"video/x-ms-asf-plugin\\\",\\\"*\\\"],[\\\"application/x-mplayer2\\\",\\\"*\\\"],[\\\"video/x-ms-asf\\\",\\\"asf,asx,*\\\"],[\\\"video/x-ms-wm\\\",\\\"wm,*\\\"],[\\\"audio/x-ms-wma\\\",\\\"wma,*\\\"],[\\\"audio/x-ms-wax\\\",\\\"wax,*\\\"],[\\\"video/x-ms-wmv\\\",\\\"wmv,*\\\"],[\\\"video/x-ms-wvx\\\",\\\"wvx,*\\\"]]],[\\\"QQÒôÀÖ²¥·Å¿Ø¼þ\\\",\\\"QQÒôÀÖ²¥·Å¿Ø¼þ\\\",[[\\\"application/tecent-qzonemusic-plugin\\\",\\\"rts\\\"]]],[\\\"Shockwave Flash\\\",\\\"Shockwave Flash 34.0 r0\\\",[[\\\"application/x-shockwave-flash\\\",\\\"swf\\\"],[\\\"application/futuresplash\\\",\\\"spl\\\"]]],[\\\"XunLei User Plugin\\\",\\\"Xunlei User scriptability Plugin,version= 2.0.2.3\\\",[[\\\"application/npxluser_plugin\\\",\\\"\\\"]]],[\\\"iTrusChina iTrusPTA,XEnroll,iEnroll,hwPTA,UKeyInstalls Firefox Plugin\\\",\\\"iTrusPTA&XEnroll hwPTA,IEnroll,UKeyInstalls for FireFox,version=1.0.0.2\\\",[[\\\"application/pta.itruspta.version.1\\\",\\\"*\\\"],[\\\"application/cenroll.cenroll.version.1\\\",\\\"\\\"],[\\\"application/itrusenroll.certenroll.version.1\\\",\\\"\\\"],[\\\"application/hwpta.itrushwpta\\\",\\\"\\\"],[\\\"application/hwwdkey.installwdkey\\\",\\\"\\\"],[\\\"application/hwepass2001.installepass2001\\\",\\\"\\\"]]],[\\\"npQQPhotoDrawEx\\\",\\\"npQQPhotoDrawEx Module\\\",[[\\\"application/tencent-qqphotodrawex2-plugin\\\",\\\"rts\\\"]]]],\\\"13ab\\\":\\\"hwAAAABJRU5ErkJggg==\\\",\\\"bfe9\\\":\\\"SAAskoALCSsZpEUcC+Av8DxpQVtSPLlMwAAAAASUVORK5CYII=\\\",\\\"a3c1\\\":[\\\"extensions:ANGLE_instanced_arrays;EXT_blend_minmax;EXT_clip_control;EXT_color_buffer_half_float;EXT_depth_clamp;EXT_disjoint_timer_query;EXT_float_blend;EXT_frag_depth;EXT_polygon_offset_clamp;EXT_shader_texture_lod;EXT_texture_compression_bptc;EXT_texture_compression_rgtc;EXT_texture_filter_anisotropic;EXT_sRGB;KHR_parallel_shader_compile;OES_element_index_uint;OES_fbo_render_mipmap;OES_standard_derivatives;OES_texture_float;OES_texture_float_linear;OES_texture_half_float;OES_texture_half_float_linear;OES_vertex_array_object;WEBGL_blend_func_extended;WEBGL_color_buffer_float;WEBGL_compressed_texture_s3tc;WEBGL_compressed_texture_s3tc_srgb;WEBGL_debug_renderer_info;WEBGL_debug_shaders;WEBGL_depth_texture;WEBGL_draw_buffers;WEBGL_lose_context;WEBGL_multi_draw;WEBGL_polygon_mode\\\",\\\"webgl aliased line width range:[1, 1]\\\",\\\"webgl aliased point size range:[1, 1024]\\\",\\\"webgl alpha bits:8\\\",\\\"webgl antialiasing:yes\\\",\\\"webgl blue bits:8\\\",\\\"webgl depth bits:24\\\",\\\"webgl green bits:8\\\",\\\"webgl max anisotropy:16\\\",\\\"webgl max combined texture image units:32\\\",\\\"webgl max cube map texture size:16384\\\",\\\"webgl max fragment uniform vectors:1024\\\",\\\"webgl max render buffer size:16384\\\",\\\"webgl max texture image units:16\\\",\\\"webgl max texture size:16384\\\",\\\"webgl max varying vectors:30\\\",\\\"webgl max vertex attribs:16\\\",\\\"webgl max vertex texture image units:16\\\",\\\"webgl max vertex uniform vectors:4096\\\",\\\"webgl max viewport dims:[32767, 32767]\\\",\\\"webgl red bits:8\\\",\\\"webgl renderer:WebKit WebGL\\\",\\\"webgl shading language version:WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)\\\",\\\"webgl stencil bits:0\\\",\\\"webgl vendor:WebKit\\\",\\\"webgl version:WebGL 1.0 (OpenGL ES 2.0 Chromium)\\\",\\\"webgl unmasked vendor:Google Inc. (Intel)\\\",\\\"webgl unmasked renderer:ANGLE (Intel, Intel(R) HD Graphics 4000 (0x00000166) Direct3D11 vs_5_0 ps_5_0, D3D11)\\\",\\\"webgl vertex shader high float precision:23\\\",\\\"webgl vertex shader high float precision rangeMin:127\\\",\\\"webgl vertex shader high float precision rangeMax:127\\\",\\\"webgl vertex shader medium float precision:23\\\",\\\"webgl vertex shader medium float precision rangeMin:127\\\",\\\"webgl vertex shader medium float precision rangeMax:127\\\",\\\"webgl vertex shader low float precision:23\\\",\\\"webgl vertex shader low float precision rangeMin:127\\\",\\\"webgl vertex shader low float precision rangeMax:127\\\",\\\"webgl fragment shader high float precision:23\\\",\\\"webgl fragment shader high float precision rangeMin:127\\\",\\\"webgl fragment shader high float precision rangeMax:127\\\",\\\"webgl fragment shader medium float precision:23\\\",\\\"webgl fragment shader medium float precision rangeMin:127\\\",\\\"webgl fragment shader medium float precision rangeMax:127\\\",\\\"webgl fragment shader low float precision:23\\\",\\\"webgl fragment shader low float precision rangeMin:127\\\",\\\"webgl fragment shader low float precision rangeMax:127\\\",\\\"webgl vertex shader high int precision:0\\\",\\\"webgl vertex shader high int precision rangeMin:31\\\",\\\"webgl vertex shader high int precision rangeMax:30\\\",\\\"webgl vertex shader medium int precision:0\\\",\\\"webgl vertex shader medium int precision rangeMin:31\\\",\\\"webgl vertex shader medium int precision rangeMax:30\\\",\\\"webgl vertex shader low int precision:0\\\",\\\"webgl vertex shader low int precision rangeMin:31\\\",\\\"webgl vertex shader low int precision rangeMax:30\\\",\\\"webgl fragment shader high int precision:0\\\",\\\"webgl fragment shader high int precision rangeMin:31\\\",\\\"webgl fragment shader high int precision rangeMax:30\\\",\\\"webgl fragment shader medium int precision:0\\\",\\\"webgl fragment shader medium int precision rangeMin:31\\\",\\\"webgl fragment shader medium int precision rangeMax:30\\\",\\\"webgl fragment shader low int precision:0\\\",\\\"webgl fragment shader low int precision rangeMin:31\\\",\\\"webgl fragment shader low int precision rangeMax:30\\\"],\\\"6bc5\\\":\\\"Google Inc. (Intel)~ANGLE (Intel, Intel(R) HD Graphics 4000 (0x00000166) Direct3D11 vs_5_0 ps_5_0, D3D11)\\\",\\\"ed31\\\":0,\\\"72bd\\\":0,\\\"097b\\\":0,\\\"52cd\\\":[0,0,0],\\\"a658\\\":[\\\"Arial\\\",\\\"Arial Black\\\",\\\"Arial Narrow\\\",\\\"Arial Unicode MS\\\",\\\"Book Antiqua\\\",\\\"Bookman Old Style\\\",\\\"Calibri\\\",\\\"Cambria\\\",\\\"Cambria Math\\\",\\\"Century\\\",\\\"Century Gothic\\\",\\\"Century Schoolbook\\\",\\\"Comic Sans MS\\\",\\\"Consolas\\\",\\\"Courier\\\",\\\"Courier New\\\",\\\"Georgia\\\",\\\"Helvetica\\\",\\\"Impact\\\",\\\"Lucida Bright\\\",\\\"Lucida Calligraphy\\\",\\\"Lucida Console\\\",\\\"Lucida Fax\\\",\\\"Lucida Handwriting\\\",\\\"Lucida Sans\\\",\\\"Lucida Sans Typewriter\\\",\\\"Lucida Sans Unicode\\\",\\\"Microsoft Sans Serif\\\",\\\"Monotype Corsiva\\\",\\\"MS Gothic\\\",\\\"MS PGothic\\\",\\\"MS Reference Sans Serif\\\",\\\"MS Sans Serif\\\",\\\"MS Serif\\\",\\\"MYRIAD PRO\\\",\\\"Palatino Linotype\\\",\\\"Segoe Print\\\",\\\"Segoe Script\\\",\\\"Segoe UI\\\",\\\"Segoe UI Light\\\",\\\"Segoe UI Semibold\\\",\\\"Segoe UI Symbol\\\",\\\"Tahoma\\\",\\\"Times\\\",\\\"Times New Roman\\\",\\\"Trebuchet MS\\\",\\\"Verdana\\\",\\\"Wingdings\\\",\\\"Wingdings 2\\\",\\\"Wingdings 3\\\"],\\\"d02f\\\":\\\"124.04347527516074\\\"}}\"}";
+    public static String genCookiePayload(String riskScene) throws JSONException {
+        JSONObject fp = new JSONObject()
+                .put("adca", "Linux")
+                .put("bfe9", genRandomPngTail());
+        JSONObject payload = new JSONObject()
+                .put("3064", 1)
+                .put("39c8", riskScene)
+                .put("3c43", fp);
+        return new JSONObject()
+                .put("payload", payload.toString())
+                .toString();
+    }
 
-        return payload.replaceAll("TIME_HERE", String.valueOf(System.currentTimeMillis()))
-                .replaceAll("RESOLUTION_HERE", resolution.first + "x" + resolution.second)
-                .replaceAll("UUID_HERE", NetWorkUtil.getCookies().getOrDefault("_uuid", ""))
-                .replaceAll("UA_HERE", NetWorkUtil.USER_AGENT_WEB)
-                .replaceAll("PAIR_HERE", resolutionArray.toString());
+    private static String genRandomPngTail() {
+        byte[] bytes = new byte[44];
+        SecureRandom random = new SecureRandom();
+        random.nextBytes(bytes);
+        bytes[32] = 0;
+        bytes[33] = 0;
+        bytes[34] = 0;
+        bytes[35] = 0;
+        bytes[36] = 73;
+        bytes[37] = 69;
+        bytes[38] = 78;
+        bytes[39] = 68;
+        String encoded = Base64.encodeToString(bytes, Base64.NO_WRAP);
+        return encoded.length() > 50 ? encoded.substring(encoded.length() - 50) : encoded;
     }
 
     /**
@@ -233,22 +341,137 @@ public class CookiesApi {
         //activeCookieInfo();
     }
 
+    public static void ensurePiliPlusBaseCookies() {
+        Cookies cookies = NetWorkUtil.getCookies();
+        if (!cookies.containsKey("buvid3")) {
+            NetWorkUtil.putCookie("buvid3", genPiliPlusBuvid3());
+        }
+    }
+
     public static boolean ensureRiskActive(boolean force) {
+        return ensureRiskActive(RISK_SCENE_DEFAULT, force);
+    }
+
+    public static boolean ensureSpaceDynamicRiskActive(boolean force) {
+        return ensureSpaceDynamicRiskActive(0, force);
+    }
+
+    public static boolean ensureSpaceDynamicRiskActive(long mid, boolean force) {
+        return ensureRiskActive(RISK_SCENE_SPACE_DYNAMIC, mid, force);
+    }
+
+    public static boolean ensureRiskActive(String riskScene, boolean force) {
+        return ensureRiskActive(riskScene, 0, force);
+    }
+
+    public static boolean ensureRiskActive(String riskScene, long mid, boolean force) {
+        if (RISK_SCENE_SPACE_DYNAMIC.equals(riskScene)) {
+            return ensureProcessRiskActive(riskScene, mid, force);
+        }
         int today = ConfInfoApi.getDateCurr();
-        if (!force && SharedPreferencesUtil.getInt(SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY, 0) >= today) {
+        String cacheKey = SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY + "_" + riskScene.replace('.', '_');
+        if (!force && SharedPreferencesUtil.getInt(cacheKey, 0) >= today) {
+            Logu.w(RISK_TRACE_TAG, "skip active by daily cache, scene=" + riskScene + ", mid=" + mid);
             return false;
         }
         try {
-            int code = activeCookieInfo();
-            SharedPreferencesUtil.putInt(SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY, today);
-            return code == 0;
-        } catch (Exception e) {
+            int code = activeCookieInfo(riskScene, mid);
+            if (code == 0) {
+                SharedPreferencesUtil.putInt(cacheKey, today);
+                Logu.w(RISK_TRACE_TAG, "active ok, scene=" + riskScene + ", mid=" + mid + ", force=" + force);
+                return true;
+            }
+            SharedPreferencesUtil.removeValue(cacheKey);
+            Logu.w(RISK_TRACE_TAG, "active rejected, scene=" + riskScene + ", mid=" + mid + ", code=" + code + ", force=" + force);
             return false;
+        } catch (Exception e) {
+            SharedPreferencesUtil.removeValue(cacheKey);
+            Logu.w(RISK_TRACE_TAG, "active failed, scene=" + riskScene + ", mid=" + mid + ", force=" + force + ", err=" + e.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean ensureProcessRiskActive(String riskScene, long targetMid, boolean force) {
+        ensurePiliPlusBaseCookies();
+        String activeKey = riskScene + "_" + currentRiskAccountKey();
+        synchronized (PROCESS_RISK_ACTIVE_LOCK) {
+            if (!force && Boolean.TRUE.equals(PROCESS_RISK_ACTIVE.get(activeKey))) {
+                Logu.w(RISK_TRACE_TAG, "skip active by process cache, scene=" + riskScene
+                        + ", targetMid=" + targetMid
+                        + ", account=" + activeKey);
+                return false;
+            }
+
+            String staleDailyKey = SharedPreferencesUtil.COOKIE_RISK_ACTIVE_DAY + "_" + riskScene.replace('.', '_');
+            SharedPreferencesUtil.removeValue(staleDailyKey);
+            try {
+                int code = activeCookieInfo(riskScene, 0);
+                if (code == 0) {
+                    PROCESS_RISK_ACTIVE.put(activeKey, true);
+                    Logu.w(RISK_TRACE_TAG, "active ok, scene=" + riskScene
+                            + ", targetMid=" + targetMid
+                            + ", account=" + activeKey
+                            + ", force=" + force);
+                    return true;
+                }
+                PROCESS_RISK_ACTIVE.remove(activeKey);
+                Logu.w(RISK_TRACE_TAG, "active rejected, scene=" + riskScene
+                        + ", targetMid=" + targetMid
+                        + ", account=" + activeKey
+                        + ", code=" + code
+                        + ", force=" + force);
+                return false;
+            } catch (Exception e) {
+                PROCESS_RISK_ACTIVE.remove(activeKey);
+                Logu.w(RISK_TRACE_TAG, "active failed, scene=" + riskScene
+                        + ", targetMid=" + targetMid
+                        + ", account=" + activeKey
+                        + ", force=" + force
+                        + ", err=" + e.getMessage());
+                return false;
+            }
+        }
+    }
+
+    private static String currentRiskAccountKey() {
+        Cookies cookies = NetWorkUtil.getCookies();
+        String mid = cookies.get("DedeUserID");
+        if (mid != null && !mid.isEmpty()) {
+            return "mid=" + mid;
+        }
+        String buvid3 = cookies.get("buvid3");
+        if (buvid3 != null && !buvid3.isEmpty()) {
+            return "buvid3=" + buvid3;
+        }
+        return "anonymous";
+    }
+
+    private static String genPiliPlusBuvid3() {
+        int tail = new SecureRandom().nextInt(100000);
+        return UUID.randomUUID().toString().toUpperCase(Locale.US)
+                + String.format(Locale.US, "%05d", tail)
+                + "infoc";
+    }
+
+    public static void clearProcessRiskActiveCache(String reason) {
+        synchronized (PROCESS_RISK_ACTIVE_LOCK) {
+            if (!PROCESS_RISK_ACTIVE.isEmpty()) {
+                PROCESS_RISK_ACTIVE.clear();
+                Logu.w(RISK_TRACE_TAG, "clear process risk cache, reason=" + reason);
+            }
         }
     }
 
     public static boolean ensureRiskActiveDaily() {
         return ensureRiskActive(false);
+    }
+
+    public static boolean ensureSpaceDynamicRiskActiveDaily() {
+        return ensureSpaceDynamicRiskActive(false);
+    }
+
+    public static boolean ensureSpaceDynamicRiskActiveDaily(long mid) {
+        return ensureSpaceDynamicRiskActive(mid, false);
     }
 
     private static Integer parseInt(String string) {

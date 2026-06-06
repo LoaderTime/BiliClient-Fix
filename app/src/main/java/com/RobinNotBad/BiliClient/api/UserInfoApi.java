@@ -5,6 +5,7 @@ import com.RobinNotBad.BiliClient.model.LiveRoom;
 import com.RobinNotBad.BiliClient.model.UserInfo;
 import com.RobinNotBad.BiliClient.model.VideoCard;
 import com.RobinNotBad.BiliClient.util.DmImgParamUtil;
+import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.NetWorkUtil;
 import com.RobinNotBad.BiliClient.util.SharedPreferencesUtil;
 import com.RobinNotBad.BiliClient.util.StringUtil;
@@ -22,11 +23,27 @@ import java.util.Objects;
 
 public class UserInfoApi {
 
+    private static final String TRACE_TAG = "user-info-risk";
+
     private static ArrayList<String> getSpaceHeaders(long mid, boolean dynamicReferer) {
         ArrayList<String> headers = NetWorkUtil.getWebHeadersSnapshot();
+        removeHeader(headers, "Sec-Ch-Ua");
+        removeHeader(headers, "Sec-Ch-Ua-Platform");
+        removeHeader(headers, "Sec-Ch-Ua-Mobile");
+        setHeader(headers, "User-Agent", DynamicApi.SPACE_DYNAMIC_USER_AGENT);
         setHeader(headers, "Origin", "https://space.bilibili.com");
         setHeader(headers, "Referer", "https://space.bilibili.com/" + mid + (dynamicReferer ? "/dynamic" : ""));
+        CookiesApi.applyPiliPlusAccountHeaders(headers);
         return headers;
+    }
+
+    private static void removeHeader(List<String> headers, String key) {
+        for (int i = headers.size() - 2; i >= 0; i -= 2) {
+            if (key.equalsIgnoreCase(headers.get(i))) {
+                headers.remove(i + 1);
+                headers.remove(i);
+            }
+        }
     }
 
     private static void setHeader(List<String> headers, String key, String value) {
@@ -40,15 +57,68 @@ public class UserInfoApi {
         headers.add(value);
     }
 
+    private static boolean isRiskCode(int code) {
+        return code == -352 || code == -412 || code == -403 || code == 421;
+    }
+
+    private static boolean shouldRetryForRisk(JSONObject all) {
+        return all.optBoolean("retry_failed", false) || isRiskCode(all.optInt("code", -1));
+    }
+
+    private static JSONObject getSpaceJsonWithRiskRetry(String url, long mid, boolean dynamicReferer, String label) throws IOException {
+        JSONObject all = NetWorkUtil.getJson(url, getSpaceHeaders(mid, dynamicReferer));
+        if (!shouldRetryForRisk(all)) return all;
+
+        Logu.w(TRACE_TAG, label + " risk response, code=" + all.optInt("code", Integer.MIN_VALUE)
+                + ", httpCode=" + all.optInt("http_code", -1)
+                + ", bodyKind=" + all.optString("body_kind", "")
+                + ", try activate space dynamic risk, mid=" + mid);
+        try {
+            CookiesApi.ensurePiliPlusBaseCookies();
+            CookiesApi.ensureSpaceDynamicRiskActive(mid, true);
+        } catch (Exception e) {
+            Logu.w(TRACE_TAG, label + " risk activate failed, mid=" + mid + ", err=" + e.getMessage());
+        }
+        return NetWorkUtil.getJson(url, getSpaceHeaders(mid, dynamicReferer));
+    }
+
+    private static void throwIfRequestFailed(JSONObject all, String label) throws IOException {
+        if (all.optBoolean("retry_failed", false)) {
+            throw new IOException(label + "失败: " + describeFailure(all));
+        }
+        int code = all.optInt("code", 0);
+        if (code != 0 && !all.has("data")) {
+            throw new IOException(label + "失败: API错误 (code=" + code + "): " + all.optString("message", "未知错误"));
+        }
+    }
+
+    private static String describeFailure(JSONObject all) {
+        StringBuilder builder = new StringBuilder(all.optString("message", "网络请求失败"));
+        int code = all.optInt("code", Integer.MIN_VALUE);
+        int httpCode = all.optInt("http_code", -1);
+        String bodyKind = all.optString("body_kind", "");
+        if (code != Integer.MIN_VALUE) builder.append(" code=").append(code);
+        if (httpCode > 0) builder.append(" http=").append(httpCode);
+        if (!bodyKind.isEmpty()) builder.append(" body=").append(bodyKind);
+        return builder.toString();
+    }
+
     public static UserInfo getUserInfo(long mid) throws IOException, JSONException {
         String url = "https://api.bilibili.com/x/web-interface/card?mid=" + mid;
-        JSONObject all = NetWorkUtil.getJson(url);
+        JSONObject all = getSpaceJsonWithRiskRetry(url, mid, true, "user-card");
+        throwIfRequestFailed(all, "用户信息");
         if (all.has("data") && !all.isNull("data")) {
-            JSONObject notice_all = NetWorkUtil.getJson("https://api.bilibili.com/x/space/notice?mid=" + mid);
-            String notice;
-            if (notice_all.has("data") && !notice_all.isNull("data"))
-                notice = notice_all.getString("data");
-            else notice = "";
+            String notice = "";
+            try {
+                JSONObject notice_all = getSpaceJsonWithRiskRetry("https://api.bilibili.com/x/space/notice?mid=" + mid, mid, true, "user-notice");
+                if (notice_all.has("data") && !notice_all.isNull("data")) {
+                    notice = notice_all.getString("data");
+                } else if (notice_all.optBoolean("retry_failed", false) || notice_all.optInt("code", 0) != 0) {
+                    Logu.w(TRACE_TAG, "notice fallback empty, mid=" + mid + ", reason=" + describeFailure(notice_all));
+                }
+            } catch (Exception e) {
+                Logu.w(TRACE_TAG, "notice fallback empty, mid=" + mid + ", err=" + e.getMessage());
+            }
             JSONObject data = all.getJSONObject("data");
             boolean followed = data.getBoolean("following");
             int fans = data.getInt("follower");
@@ -110,10 +180,13 @@ public class UserInfoApi {
     public static JSONObject getUserSpaceInfo(long mid) throws JSONException, IOException {
         String url = "https://api.bilibili.com/x/space/wbi/acc/info?";
         url += "mid=" + mid + "&token=&platform=web&web_location=1550101";
-        JSONObject all = NetWorkUtil.getJson(
+        JSONObject all = getSpaceJsonWithRiskRetry(
                 ConfInfoApi.signWBI(DmImgParamUtil.getDmImgParamsUrl(url)),
-                getSpaceHeaders(mid, true)
+                mid,
+                true,
+                "space-info"
         );
+        throwIfRequestFailed(all, "空间信息");
         if (all.has("data") && !all.isNull("data")) {
             return all.getJSONObject("data");
         }

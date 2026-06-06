@@ -5,6 +5,8 @@ import android.os.Build;
 
 import androidx.annotation.NonNull;
 
+import com.RobinNotBad.BiliClient.api.CookiesApi;
+
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -48,16 +50,23 @@ import okhttp3.ResponseBody;
 
 public class NetWorkUtil {
     private static final AtomicReference<OkHttpClient> INSTANCE = new AtomicReference<>();
+    private static final String PERF_TAG = "network-perf";
+    private static final String BILI_412_TAG = "bili-412-diagnostic";
 
     public static class Inet4Selector implements Dns {
         @NonNull
         @Override
         public List<InetAddress> lookup(@NonNull String hostname) throws UnknownHostException {
+            long start = System.currentTimeMillis();
             List<InetAddress> hosts = Dns.SYSTEM.lookup(hostname);
             List<InetAddress> inet4Hosts = new ArrayList<>();
             for (InetAddress host : hosts) {
                 if (host.getAddress().length == 4) inet4Hosts.add(host);
             }
+            Logu.w(PERF_TAG, "dns host=" + hostname
+                    + ", allCount=" + hosts.size()
+                    + ", ipv4Count=" + inet4Hosts.size()
+                    + ", costMs=" + (System.currentTimeMillis() - start));
             return inet4Hosts;    //筛选IPV4地址，IPV6请求有异常
         }
     }
@@ -111,11 +120,34 @@ public class NetWorkUtil {
         // 添加重试机制
         int retryCount = 0;
         final int maxRetries = 3;
+        long totalStart = System.currentTimeMillis();
         
         while (retryCount < maxRetries) {
-            try (ResponseBody body = get(url, headers).body()) {
+            int attempt = retryCount + 1;
+            long attemptStart = System.currentTimeMillis();
+            int httpCode = -1;
+            String responseText = null;
+            try (Response response = get(url, headers)) {
+                httpCode = response.code();
+                ResponseBody body = response.body();
                 if (body != null) {
-                    String responseText = body.string();
+                    long readStart = System.currentTimeMillis();
+                    responseText = body.string();
+                    Logu.w(PERF_TAG, "getJson body attempt=" + attempt
+                            + "/" + maxRetries
+                            + ", httpCode=" + httpCode
+                            + ", len=" + responseText.length()
+                            + ", readCostMs=" + (System.currentTimeMillis() - readStart)
+                            + ", attemptCostMs=" + (System.currentTimeMillis() - attemptStart)
+                            + ", totalCostMs=" + (System.currentTimeMillis() - totalStart)
+                            + ", url=" + summarizeUrl(url));
+                    if (httpCode == 412 || httpCode == 421) {
+                        Logu.w(BILI_412_TAG, "headers=" + summarizeHeaders(response)
+                                + ", setCookieNames=" + summarizeSetCookieNames(response.headers("Set-Cookie"))
+                                + ", body=" + summarizeRiskBody(responseText)
+                                + ", url=" + summarizeUrl(url));
+                        return buildErrorJson(-1000, "网络请求失败，请检查网络连接后重试", url, httpCode, "risk_html", null);
+                    }
                     
                     // 检查是否是HTML页面
                     if (responseText.trim().startsWith("<!DOCTYPE") || responseText.trim().startsWith("<html")) {
@@ -127,15 +159,7 @@ public class NetWorkUtil {
                         } else {
                             // 所有重试都失败，返回一个包含错误信息的JSONObject
                             // 而不是抛出异常，这样上层可以统一处理
-                            JSONObject errorJson = new JSONObject();
-                            try {
-                                errorJson.put("code", -1000); // 自定义错误码
-                                errorJson.put("message", "网络请求失败，请检查网络连接后重试");
-                                errorJson.put("data", new JSONObject());
-                                errorJson.put("retry_failed", true);
-                                errorJson.put("original_url", url);
-                            } catch (JSONException ignored) {}
-                            return errorJson;
+                            return buildErrorJson(-1000, "网络请求失败，请检查网络连接后重试", url, httpCode, "html", null);
                         }
                     }
                     
@@ -148,20 +172,19 @@ public class NetWorkUtil {
                             continue;
                         } else {
                             // 所有重试都失败，返回错误JSON
-                            JSONObject errorJson = new JSONObject();
-                            try {
-                                errorJson.put("code", -1001);
-                                errorJson.put("message", "服务器响应异常，请稍后重试");
-                                errorJson.put("data", new JSONObject());
-                                errorJson.put("retry_failed", true);
-                                errorJson.put("original_url", url);
-                            } catch (JSONException ignored) {}
-                            return errorJson;
+                            return buildErrorJson(-1001, "服务器响应异常，请稍后重试", url, httpCode, "too_short", null);
                         }
                     }
                     
                     // 尝试解析JSON
+                    long parseStart = System.currentTimeMillis();
                     JSONObject json = new JSONObject(responseText);
+                    Logu.w(PERF_TAG, "getJson parsed attempt=" + attempt
+                            + "/" + maxRetries
+                            + ", parseCostMs=" + (System.currentTimeMillis() - parseStart)
+                            + ", totalCostMs=" + (System.currentTimeMillis() - totalStart)
+                            + ", code=" + json.optInt("code", Integer.MIN_VALUE)
+                            + ", url=" + summarizeUrl(url));
                     
                     // 检查是否是B站API的标准响应格式
                     if (json.has("code")) {
@@ -180,20 +203,20 @@ public class NetWorkUtil {
                     return json;
                 } else {
                     // 响应体为空
-                    JSONObject errorJson = new JSONObject();
-                    try {
-                        errorJson.put("code", -1002);
-                        errorJson.put("message", "服务器无响应，请检查网络连接");
-                        errorJson.put("data", new JSONObject());
-                        errorJson.put("retry_failed", true);
-                        errorJson.put("original_url", url);
-                    } catch (JSONException ignored) {}
-                    return errorJson;
+                    return buildErrorJson(-1002, "服务器无响应，请检查网络连接", url, httpCode, "empty_body", null);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("线程被中断", e);
             } catch (JSONException e) {
+                if (responseText != null) {
+                    Logu.w(PERF_TAG, "getJson parse failed attempt=" + attempt
+                            + "/" + maxRetries
+                            + ", httpCode=" + httpCode
+                            + ", err=" + e.getMessage()
+                            + ", body=" + summarizeBody(responseText)
+                            + ", url=" + summarizeUrl(url));
+                }
                 // JSON解析异常，检查是否需要重试
                 if (retryCount < maxRetries - 1) {
                     Logu.e("JSON解析失败，重试 " + (retryCount + 1) + "/" + maxRetries + ": " + e.getMessage() + " - " + url);
@@ -207,16 +230,7 @@ public class NetWorkUtil {
                     continue;
                 } else {
                     // 所有重试都失败，返回错误JSON
-                    JSONObject errorJson = new JSONObject();
-                    try {
-                        errorJson.put("code", -1003);
-                        errorJson.put("message", "数据解析失败，请稍后重试");
-                        errorJson.put("data", new JSONObject());
-                        errorJson.put("retry_failed", true);
-                        errorJson.put("original_url", url);
-                        errorJson.put("json_error", e.getMessage());
-                    } catch (JSONException ignored) {}
-                    return errorJson;
+                    return buildErrorJson(-1003, "数据解析失败，请稍后重试", url, httpCode, "parse_failed", e.getMessage());
                 }
             } catch (Exception e) {
                 // 其他异常，检查是否需要重试
@@ -232,28 +246,29 @@ public class NetWorkUtil {
                     continue;
                 } else {
                     // 所有重试都失败，返回错误JSON
-                    JSONObject errorJson = new JSONObject();
-                    try {
-                        errorJson.put("code", -1004);
-                        errorJson.put("message", "网络请求异常: " + e.getMessage());
-                        errorJson.put("data", new JSONObject());
-                        errorJson.put("retry_failed", true);
-                        errorJson.put("original_url", url);
-                    } catch (JSONException ignored) {}
-                    return errorJson;
+                    return buildErrorJson(-1004, "网络请求异常: " + e.getMessage(), url, httpCode, "exception", e.getMessage());
                 }
             }
         }
         
         // 理论上不会执行到这里，因为所有路径都有返回
+        return buildErrorJson(-9999, "未知错误", url, -1, "unknown", null);
+    }
+
+    private static JSONObject buildErrorJson(int code, String message, String url, int httpCode, String bodyKind, String detail) {
         JSONObject errorJson = new JSONObject();
         try {
-            errorJson.put("code", -9999);
-            errorJson.put("message", "未知错误");
+            errorJson.put("code", code);
+            errorJson.put("message", message);
             errorJson.put("data", new JSONObject());
             errorJson.put("retry_failed", true);
             errorJson.put("original_url", url);
-        } catch (JSONException ignored) {}
+            errorJson.put("url_host_path", summarizeUrl(url));
+            errorJson.put("http_code", httpCode);
+            errorJson.put("body_kind", bodyKind);
+            if (detail != null) errorJson.put("detail", detail);
+        } catch (JSONException ignored) {
+        }
         return errorJson;
     }
 
@@ -272,7 +287,77 @@ public class NetWorkUtil {
         addHeaders(requestBuilder, headers);
         if (redirectHandler != null) requestBuilder.tag(RedirectHandler.class, redirectHandler);
         Request request = requestBuilder.build();
-        return client.newCall(request).execute();
+        long start = System.currentTimeMillis();
+        try {
+            Response response = client.newCall(request).execute();
+            Logu.w(PERF_TAG, "get response code=" + response.code()
+                    + ", costMs=" + (System.currentTimeMillis() - start)
+                    + ", url=" + summarizeUrl(url));
+            return response;
+        } catch (IOException e) {
+            Logu.w(PERF_TAG, "get failed costMs=" + (System.currentTimeMillis() - start)
+                    + ", err=" + e.getMessage()
+                    + ", url=" + summarizeUrl(url));
+            throw e;
+        }
+    }
+
+    private static String summarizeUrl(String url) {
+        try {
+            URI uri = new URI(url);
+            String path = uri.getRawPath();
+            if (path == null || path.isEmpty()) path = "/";
+            return uri.getHost() + path;
+        } catch (Throwable ignored) {
+            return url;
+        }
+    }
+
+    private static String summarizeRiskBody(String body) {
+        if (body == null) return "null";
+        String trimmed = body.trim();
+        String kind;
+        if (trimmed.isEmpty()) {
+            kind = "empty";
+        } else if (trimmed.startsWith("<!DOCTYPE") || trimmed.startsWith("<html")) {
+            kind = "html";
+        } else if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            kind = "json_like";
+        } else {
+            kind = "text";
+        }
+        return "kind=" + kind + ", len=" + body.length();
+    }
+
+    private static String summarizeBody(String body) {
+        if (body == null) return "";
+        String summary = body.replace("\r", "\\r").replace("\n", "\\n");
+        if (summary.length() > 240) {
+            return summary.substring(0, 240) + "...";
+        }
+        return summary;
+    }
+
+    private static String summarizeHeaders(Response response) {
+        if (response == null) return "";
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < response.headers().size(); i++) {
+            String name = response.headers().name(i);
+            if (!names.contains(name)) names.add(name);
+        }
+        return names.toString();
+    }
+
+    private static String summarizeSetCookieNames(List<String> setCookies) {
+        if (setCookies == null || setCookies.isEmpty()) return "[]";
+        List<String> names = new ArrayList<>();
+        for (String setCookie : setCookies) {
+            if (setCookie == null) continue;
+            String firstPart = setCookie.split(";", 2)[0].trim();
+            int index = firstPart.indexOf('=');
+            if (index > 0) names.add(firstPart.substring(0, index));
+        }
+        return names.toString();
     }
 
     public static Response post(String url, String data, List<String> headers, String contentType) throws IOException {
@@ -289,7 +374,19 @@ public class NetWorkUtil {
             requestBuilder.addHeader(key, val);
         }
         Request request = requestBuilder.build();
-        return client.newCall(request).execute();
+        long start = System.currentTimeMillis();
+        try {
+            Response response = client.newCall(request).execute();
+            Logu.w(PERF_TAG, "post response code=" + response.code()
+                    + ", costMs=" + (System.currentTimeMillis() - start)
+                    + ", url=" + summarizeUrl(url));
+            return response;
+        } catch (IOException e) {
+            Logu.w(PERF_TAG, "post failed costMs=" + (System.currentTimeMillis() - start)
+                    + ", err=" + e.getMessage()
+                    + ", url=" + summarizeUrl(url));
+            throw e;
+        }
     }
 
     public static Response post(String url, String data, List<String> headers) throws IOException {
@@ -354,6 +451,7 @@ public class NetWorkUtil {
         //如果没有新cookies，直接返回
         if (newCookies.isEmpty()) return;
         String cookiesStr = SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, "");
+        Cookies oldCookieSnapshot = new Cookies(cookiesStr);
         ArrayList<String> oldCookies = (cookiesStr.equals("") ? new ArrayList<>() : new ArrayList<>(Arrays.asList(cookiesStr.split("; "))));  //转list
 
         for (String newCookie : newCookies) {  //对每一条新cookie遍历
@@ -391,8 +489,10 @@ public class NetWorkUtil {
         }
         //如果一次setCookies都没有，就不要存了， 因为是个空字符串
         if (setCookies.length() >= 2) {
-            Logu.d("save-result", setCookies.substring(0, setCookies.length() - 2));
-            SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, setCookies.substring(0, setCookies.length() - 2));
+            String updatedCookies = setCookies.substring(0, setCookies.length() - 2);
+            Logu.d("save-result", updatedCookies);
+            SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, updatedCookies);
+            clearRiskCacheIfCookieIdentityChanged(oldCookieSnapshot, new Cookies(updatedCookies), "set-cookie");
             refreshHeaders();
         }
     }
@@ -405,9 +505,11 @@ public class NetWorkUtil {
      */
     public static void putCookie(String key, String val) {
         synchronized (NetWorkUtil.class) {
+            Cookies oldCookieSnapshot = new Cookies(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
             Cookies cookies = new Cookies(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
             cookies.set(key, val);
             SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, cookies.toString());
+            clearRiskCacheIfCookieIdentityChanged(oldCookieSnapshot, cookies, "put-cookie:" + key);
             refreshHeaders();
         }
     }
@@ -419,7 +521,9 @@ public class NetWorkUtil {
      */
     public static void setCookies(Cookies cookies) {
         synchronized (NetWorkUtil.class) {
+            Cookies oldCookieSnapshot = new Cookies(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
             SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, cookies.toString());
+            clearRiskCacheIfCookieIdentityChanged(oldCookieSnapshot, cookies, "set-cookies");
             refreshHeaders();
         }
     }
@@ -461,6 +565,31 @@ public class NetWorkUtil {
 
     public static void refreshHeaders() {
         webHeaders.set(1, SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
+    }
+
+    private static void clearRiskCacheIfCookieIdentityChanged(Cookies oldCookies, Cookies newCookies, String reason) {
+        if (isRiskIdentityCookieChanged(oldCookies, newCookies)) {
+            CookiesApi.clearProcessRiskActiveCache(reason);
+        }
+    }
+
+    private static boolean isRiskIdentityCookieChanged(Cookies oldCookies, Cookies newCookies) {
+        String[] keys = {
+                "SESSDATA",
+                "DedeUserID",
+                "DedeUserID__ckMd5",
+                "bili_jct",
+                "buvid3",
+                "buvid4"
+        };
+        for (String key : keys) {
+            String oldValue = oldCookies == null ? null : oldCookies.get(key);
+            String newValue = newCookies == null ? null : newCookies.get(key);
+            if (oldValue == null ? newValue != null : !oldValue.equals(newValue)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static ArrayList<String> getWebHeadersSnapshot() {

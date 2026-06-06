@@ -93,6 +93,8 @@ public class CookieRefreshApi {
             if (confirmCode != 0) { //必须要等确认更新Cookie成功，不然就无法完成Cookie的刷新
                 Logu.e("Cookie刷新失败", "确认刷新时返回:" + confirmCode);
                 SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, cookies_old);
+                CookiesApi.clearProcessRiskActiveCache("cookie-refresh-rollback");
+                NetWorkUtil.refreshHeaders();
                 return false;
             }
             SharedPreferencesUtil.putString(SharedPreferencesUtil.refresh_token, refreshToken_new);

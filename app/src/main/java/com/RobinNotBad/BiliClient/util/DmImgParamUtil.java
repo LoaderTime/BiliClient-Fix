@@ -7,6 +7,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -29,6 +30,15 @@ public class DmImgParamUtil {
         return map;
     }
 
+    public static Map<String, String> getSimpleDmImgParams() {
+        LinkedHashMap<String, String> map = new LinkedHashMap<>();
+        map.put("dm_img_list", "[]");
+        map.put("dm_img_str", base64EncodeRandomString(16, 64));
+        map.put("dm_cover_img_str", base64EncodeRandomString(32, 128));
+        map.put("dm_img_inter", "{\"ds\":[],\"wh\":[0,0,0],\"of\":[0,0,0]}");
+        return map;
+    }
+
     public static String getDmImgParamsUrl(String orig_url) {
         HttpUrl.Builder builder = Objects.requireNonNull(HttpUrl.parse(orig_url)).newBuilder();
         Map<String, String> params = getDmImgParams();
@@ -36,6 +46,26 @@ public class DmImgParamUtil {
             builder.addQueryParameter(entry.getKey(), entry.getValue());
         }
         return builder.build().toString();
+    }
+
+    public static String getSimpleDmImgParamsUrl(String origUrl) {
+        HttpUrl.Builder builder = Objects.requireNonNull(HttpUrl.parse(origUrl)).newBuilder();
+        Map<String, String> params = getSimpleDmImgParams();
+        for (Map.Entry<String, String> entry : params.entrySet()) {
+            builder.addQueryParameter(entry.getKey(), entry.getValue());
+        }
+        return builder.build().toString();
+    }
+
+    private static String base64EncodeRandomString(int minLength, int maxLength) {
+        Random random = new Random();
+        int length = minLength + random.nextInt(maxLength - minLength + 1);
+        byte[] bytes = new byte[length];
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) (0x26 + random.nextInt(0x59));
+        }
+        String encoded = Base64.encodeToString(bytes, Base64.NO_WRAP);
+        return encoded.length() > 2 ? encoded.substring(0, encoded.length() - 2) : encoded;
     }
 
     public static int[] f114i(int a, int b, int i) {

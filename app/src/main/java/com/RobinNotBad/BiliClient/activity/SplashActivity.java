@@ -184,6 +184,7 @@ public class SplashActivity extends Activity {
         SharedPreferencesUtil.putString(SharedPreferencesUtil.csrf, "");
         SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, "");
         SharedPreferencesUtil.putString(SharedPreferencesUtil.refresh_token, "");
+        CookiesApi.clearProcessRiskActiveCache("reset-login");
         NetWorkUtil.refreshHeaders();
     }
 

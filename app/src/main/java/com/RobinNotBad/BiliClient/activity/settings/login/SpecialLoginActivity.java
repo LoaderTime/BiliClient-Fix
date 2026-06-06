@@ -14,6 +14,7 @@ import com.RobinNotBad.BiliClient.BiliTerminal;
 import com.RobinNotBad.BiliClient.R;
 import com.RobinNotBad.BiliClient.activity.SplashActivity;
 import com.RobinNotBad.BiliClient.activity.base.BaseActivity;
+import com.RobinNotBad.BiliClient.api.CookiesApi;
 import com.RobinNotBad.BiliClient.util.Logu;
 import com.RobinNotBad.BiliClient.util.MsgUtil;
 import com.RobinNotBad.BiliClient.util.NetWorkUtil;
@@ -57,6 +58,7 @@ public class SpecialLoginActivity extends BaseActivity {
                     SharedPreferencesUtil.putLong(SharedPreferencesUtil.mid, Long.parseLong(NetWorkUtil.getInfoFromCookie("DedeUserID", cookies)));
                     SharedPreferencesUtil.putString(SharedPreferencesUtil.csrf, NetWorkUtil.getInfoFromCookie("bili_jct", cookies));
                     SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, cookies);
+                    CookiesApi.clearProcessRiskActiveCache("special-login");
                     SharedPreferencesUtil.putString(SharedPreferencesUtil.refresh_token, jsonObject.getString("refresh_token"));
                     runOnUiThread(() -> MsgUtil.showMsg("登录成功！"));
                     SharedPreferencesUtil.putBoolean(SharedPreferencesUtil.setup, true);
@@ -91,6 +93,7 @@ public class SpecialLoginActivity extends BaseActivity {
                         JSONObject input = new JSONObject(textInput.getText().toString());
                         String cookies = input.getString("cookies");
                         SharedPreferencesUtil.putString(SharedPreferencesUtil.cookies, cookies);
+                        CookiesApi.clearProcessRiskActiveCache("debug-import-cookies");
                         runOnUiThread(() -> MsgUtil.showMsg("导入cookies成功"));
 
                         NetWorkUtil.refreshHeaders();

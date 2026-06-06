@@ -13,7 +13,8 @@ import org.json.JSONObject;
 
 import java.io.IOException;
 import java.util.Calendar;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -57,30 +58,75 @@ public class ConfInfoApi {
     }
 
     public static String signWBI(String url_query) throws JSONException, IOException {
-        String mixin_key;
+        String mixin_key = SharedPreferencesUtil.getString("wbi_mixin_key", "");
         int curr = getDateCurr();
-        if (SharedPreferencesUtil.getInt("last_wbi", 0) < curr) {    //限制一天一次
+        if (SharedPreferencesUtil.getInt("last_wbi", 0) < curr || mixin_key.isEmpty()) {    //限制一天一次
             Logu.d("检查WBI");
-            SharedPreferencesUtil.putInt("last_wbi", curr);
 
             mixin_key = ConfInfoApi.getWBIMixinKey(ConfInfoApi.getWBIRawKey());
             SharedPreferencesUtil.putString("wbi_mixin_key", mixin_key);
-        } else mixin_key = SharedPreferencesUtil.getString("wbi_mixin_key", "");
+            SharedPreferencesUtil.putInt("last_wbi", curr);
+        }
 
         String wts = String.valueOf(System.currentTimeMillis() / 1000);
-        String calc_str = sortUrlParams(Uri.encode(url_query, "@#&=*+-_.,:!?()/~'%") + "&wts=" + wts) + mixin_key;
+        HttpUrl originalUrl = Objects.requireNonNull(HttpUrl.parse(url_query));
+        String query = buildWbiQuery(originalUrl, wts);
+        String calc_str = query + mixin_key;
         Logu.d(calc_str);
 
         String w_rid = ToolsUtil.md5(calc_str);
 
-        return Objects.requireNonNull(HttpUrl.parse(url_query)).newBuilder().addQueryParameter("w_rid", w_rid).addQueryParameter("wts", wts).build().toString();
+        return originalUrl.newBuilder()
+                .removeAllQueryParameters("w_rid")
+                .removeAllQueryParameters("wts")
+                .addQueryParameter("w_rid", w_rid)
+                .addQueryParameter("wts", wts)
+                .build()
+                .toString();
+    }
+
+    private static String buildWbiQuery(HttpUrl url, String wts) {
+        Map<String, List<String>> sortedParams = new TreeMap<>();
+        for (String name : url.queryParameterNames()) {
+            if ("w_rid".equals(name) || "wts".equals(name)) continue;
+            sortedParams.put(name, new ArrayList<>(url.queryParameterValues(name)));
+        }
+        sortedParams.put("wts", new ArrayList<>() {{
+            add(wts);
+        }});
+
+        StringBuilder query = new StringBuilder();
+        boolean first = true;
+        for (Map.Entry<String, List<String>> entry : sortedParams.entrySet()) {
+            String encodedName = Uri.encode(entry.getKey());
+            List<String> values = entry.getValue();
+            if (values == null || values.isEmpty()) {
+                if (!first) query.append("&");
+                first = false;
+                query.append(encodedName).append("=");
+                continue;
+            }
+            for (String value : values) {
+                if (!first) query.append("&");
+                first = false;
+                query.append(encodedName)
+                        .append("=")
+                        .append(Uri.encode(filterWbiValue(value == null ? "" : value)));
+            }
+        }
+
+        return query.toString();
+    }
+
+    private static String filterWbiValue(String value) {
+        return value.replaceAll("[!'()*]", "");
     }
 
     public static String sortUrlParams(String url) {
         String encodedParam = Objects.requireNonNull(HttpUrl.parse(url)).encodedQuery();
         if (encodedParam == null) encodedParam = "";
         // 解析URL参数
-        Map<String, String> paramMap = new HashMap<>();
+        Map<String, String> paramMap = new TreeMap<>();
         String[] params = encodedParam.split("&");
         for (String param : params) {
             String[] keyValue = param.split("=");
