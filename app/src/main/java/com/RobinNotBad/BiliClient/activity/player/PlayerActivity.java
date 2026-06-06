@@ -127,6 +127,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private IjkMediaPlayer ijkPlayer;
     private IDanmakuView mDanmakuView;
     private DanmakuContext mContext;
+    private final PlayerRuntimeCoordinator runtimeCoordinator = new PlayerRuntimeCoordinator();
 
     /**
      * 弹幕卡死自愈 watchdog（低频轮询）。
@@ -303,6 +304,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final long DANMAKU_TIMER_FORCE_CATCH_UP_SOFT_RECOVERY_COOLDOWN_MS = 1500L;
     /** 仍有较多弹幕在屏时，优先渐进追赶，不做 soft resync，避免主动制造整屏消失。 */
     private static final int DANMAKU_TIMER_FORCE_CATCH_UP_SOFT_RECOVERY_VISIBLE_LIMIT = 16;
+    /** 长按倍速切换期只允许平滑追赶，不做弹幕恢复重启，避免“卡一下后突然跳出几条”。 */
+    private static final long DANMAKU_TIMER_SPEED_TRANSIENT_FORCE_CATCH_UP_LAG_MS = 1800L;
+    private static final long DANMAKU_TIMER_SPEED_TRANSIENT_HARD_SNAP_LAG_MS = 12000L;
+    private static final long DANMAKU_TIMER_SPEED_TRANSIENT_CATCH_UP_STEP_MS = 180L;
+    private static final long DANMAKU_TIMER_SPEED_STUCK_RECOVERY_LAG_MS = 3200L;
     /** soft resync 后短时间内会经历 seek / clear / drawTask 重启的过渡态，watchdog 不应立即把它误判成再次卡死。 */
     private static final long DANMAKU_SOFT_RESYNC_WATCHDOG_GRACE_MS = 2600L;
     private static final int DANMAKU_TIMER_EMPTY_VISIBLE_RECOVERY_TRIGGER_COUNT = 1;
@@ -310,12 +316,6 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final long DANMAKU_TIMER_EMPTY_VISIBLE_RECENT_MS = 6000L;
     private static final long DANMAKU_TIMER_EMPTY_VISIBLE_RECOVERY_COOLDOWN_MS = 1200L;
     private static final long DANMAKU_TIMER_EMPTY_VISIBLE_HARD_RECOVERY_WINDOW_MS = 5000L;
-
-    /** 高倍速/高密度时允许临时少显示或跳过弹幕，优先保证弹幕流可恢复、可关闭。 */
-    private static final float DANMAKU_LOAD_SHEDDING_SPEED_THRESHOLD = 2.5f;
-    private static final int DANMAKU_LOAD_SHEDDING_MAX_LINES = 6;
-    private static final int DANMAKU_LOAD_SHEDDING_MAX_VISIBLE_IN_SCREEN = 80;
-    private volatile boolean danmakuLoadSheddingEnabled = false;
 
     /**
      * 记录最近一次“显式 seek”（用户拖动进度条/方向键快进快退/重播等），用于让弹幕时间轴允许回退。
@@ -338,7 +338,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * 在弱设备上容易放大为“弹幕线程进入 paused/等待态并长尾恢复”。
      */
     private static final long DANMAKU_SEEK_DEBOUNCE_DELAY_MS = 160L;
+    private static final long DANMAKU_SEEK_HEALTHCHECK_DELAY_MS = 320L;
+    private static final long DANMAKU_SEEK_HEALTHCHECK_LAG_MS = 900L;
+    private static final long DANMAKU_SEEK_HEALTHCHECK_STALE_DRAW_MS = 420L;
+    private static final long DANMAKU_FOREGROUND_RESTORE_STALE_DRAW_MS = 220L;
     private Runnable pendingDanmakuSeekRunnable;
+    private Runnable pendingDanmakuSeekHealthCheckRunnable;
     private volatile long pendingDanmakuSeekTargetMs = -1L;
     private volatile long pendingDanmakuSeekScheduledUptimeMs = 0L;
 
@@ -349,13 +354,112 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             } catch (Exception ignore) {
             }
         }
+        if (mainHandler != null && pendingDanmakuSeekHealthCheckRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuSeekHealthCheckRunnable);
+            } catch (Exception ignore) {
+            }
+        }
         pendingDanmakuSeekRunnable = null;
+        pendingDanmakuSeekHealthCheckRunnable = null;
         pendingDanmakuSeekTargetMs = -1L;
         pendingDanmakuSeekScheduledUptimeMs = 0L;
         Logu.d("danmaku", "cancel pending danmaku seek: " + reason);
     }
 
-    private void scheduleDanmakuSeek(long targetMs, @NonNull String reason) {
+    private void scheduleDanmakuSeekHealthCheck(long targetMs,
+                                                long seekToken,
+                                                long issuedUptimeMs,
+                                                long drawFrameSeqBefore,
+                                                @NonNull String reason) {
+        if (destroyed || resourcesReleased || isLiveMode)
+            return;
+        if (!hasDanmaku || mDanmakuView == null || !isDanmakuVisible)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        if (pendingDanmakuSeekHealthCheckRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuSeekHealthCheckRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+
+        final int session = playerSessionId;
+        final long checkTarget = Math.max(0L, targetMs);
+        final long checkToken = seekToken;
+        final long checkIssuedAt = issuedUptimeMs;
+        final long checkDrawSeqBefore = drawFrameSeqBefore;
+        pendingDanmakuSeekHealthCheckRunnable = () -> {
+            pendingDanmakuSeekHealthCheckRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            if (!hasDanmaku || mDanmakuView == null || !isDanmakuVisible || !isCurrentDanmakuPrepared())
+                return;
+            if (!runtimeCoordinator.isCurrentSeekTokenActive(checkToken)
+                    && checkToken != runtimeCoordinator.currentSeekToken()) {
+                return;
+            }
+
+            long now = android.os.SystemClock.uptimeMillis();
+            long drawSeq = getDanmakuDrawFrameSeq();
+            long lastDrawUptimeMs = getDanmakuLastDrawUptimeMs();
+            long playerPos = Math.max(checkTarget, getLatestPlayerPositionForDanmaku());
+            long danmakuTime;
+            boolean viewPaused = false;
+            try {
+                danmakuTime = Math.max(0L, mDanmakuView.getCurrentTime());
+            } catch (Exception e) {
+                return;
+            }
+            try {
+                viewPaused = mDanmakuView.isPaused();
+            } catch (Exception ignore) {
+            }
+
+            boolean noNewDraw = drawSeq <= checkDrawSeqBefore;
+            boolean staleDraw = lastDrawUptimeMs <= 0L
+                    || lastDrawUptimeMs < checkIssuedAt
+                    || now - lastDrawUptimeMs >= DANMAKU_SEEK_HEALTHCHECK_STALE_DRAW_MS;
+            long lag = Math.max(0L, playerPos - danmakuTime);
+            boolean lagging = lag >= DANMAKU_SEEK_HEALTHCHECK_LAG_MS;
+
+            if (!viewPaused && !noNewDraw && !staleDraw && !lagging) {
+                maybeFinishRuntimeSeek(checkToken, "danmakuSeekHealthCheckOk:" + reason);
+                return;
+            }
+
+            Logu.w("danmaku", "seek health check recover: reason=" + reason
+                    + ", target=" + checkTarget
+                    + ", pos=" + playerPos
+                    + ", dm=" + danmakuTime
+                    + ", lag=" + lag
+                    + ", paused=" + viewPaused
+                    + ", noNewDraw=" + noNewDraw
+                    + ", staleDraw=" + staleDraw);
+
+            try {
+                if (viewPaused && isPlaying) {
+                    mDanmakuView.resume();
+                }
+                if (lagging) {
+                    mDanmakuView.seekTo(playerPos);
+                }
+                mDanmakuView.adjust();
+            } catch (Exception ignore) {
+            }
+
+            if (noNewDraw || staleDraw) {
+                performDanmakuSoftRecovery(playerPos, "userSeekRenderStale");
+            } else if (lagging) {
+                markDanmakuSoftResync("userSeekLag", playerPos, false);
+            }
+        };
+        mainHandler.postDelayed(pendingDanmakuSeekHealthCheckRunnable, DANMAKU_SEEK_HEALTHCHECK_DELAY_MS);
+    }
+
+    private void scheduleDanmakuSeek(long targetMs, long seekToken, @NonNull String reason) {
         if (destroyed || resourcesReleased || isLiveMode)
             return;
         if (!hasDanmaku || mDanmakuView == null)
@@ -374,6 +478,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         final int session = playerSessionId;
+        final long scheduledSeekToken = seekToken;
         pendingDanmakuSeekRunnable = () -> {
             if (destroyed || resourcesReleased || session != playerSessionId) {
                 pendingDanmakuSeekRunnable = null;
@@ -386,12 +491,22 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             if (mDanmakuView == null || !hasDanmaku)
                 return;
+            boolean controlsActiveSeek = runtimeCoordinator.isCurrentSeekTokenActive(scheduledSeekToken);
+            if (controlsActiveSeek) {
+                runtimeCoordinator.markSeekWaitingRender(scheduledSeekToken,
+                        android.os.SystemClock.uptimeMillis(), "danmakuSeekDebounce:" + reason);
+            }
             try {
-                // seek 末端更偏向 “强对齐”：优先用 hide->showAndResume 强制走 SHOW/RESUME/UPDATE，
-                // 避免仅靠 seekTo() 触发 SEEK_POS 时序不稳导致卡死长尾。
+                long drawSeqBefore = getDanmakuDrawFrameSeq();
+                long issuedAt = android.os.SystemClock.uptimeMillis();
                 if (isDanmakuVisible) {
-                    hideDanmakuAndPauseWithoutQuit("debouncedSeek:" + reason);
-                    mDanmakuView.showAndResumeDrawTask(target);
+                    if (mDanmakuView.isPrepared()) {
+                        mDanmakuView.seekTo(target);
+                        mDanmakuView.adjust();
+                    } else {
+                        mDanmakuView.showAndResumeDrawTask(target);
+                    }
+                    scheduleDanmakuSeekHealthCheck(target, scheduledSeekToken, issuedAt, drawSeqBefore, reason);
                 } else if (mDanmakuView.isPrepared()) {
                     mDanmakuView.seekTo(target);
                 }
@@ -406,6 +521,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         mainHandler.postDelayed(pendingDanmakuSeekRunnable, DANMAKU_SEEK_DEBOUNCE_DELAY_MS);
         Logu.d("danmaku", "schedule danmaku seek(debounce): reason=" + reason
                 + ", pos=" + pendingDanmakuSeekTargetMs
+                + ", token=" + scheduledSeekToken
                 + ", delay=" + DANMAKU_SEEK_DEBOUNCE_DELAY_MS + "ms");
     }
 
@@ -565,9 +681,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private volatile boolean frameLoadingActive = false;
     /** 在线后台恢复触发 rebuild 后，给新 session 一个更快的首帧 loading 收敛兜底。 */
     private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_FALLBACK_MS = 420L;
-    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS = 120L;
+    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS = 300L;
+    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_RECOVERY_KICK_MS = 900L;
+    private static final long ONLINE_REBUILD_FIRST_VIDEO_FRAME_SLOW_NOTICE_MS = 1800L;
     private Runnable onlineRebuildFirstVideoFrameFallbackRunnable;
     private volatile boolean pendingOnlineRebuildFirstVideoFrameFallback = false;
+    private volatile boolean onlineRebuildFirstVideoFrameRecoveryKickTriggered = false;
+    private volatile boolean onlineRebuildFirstVideoFrameSlowNoticeShown = false;
 
     /** buffering 事件在部分流上会短促抖动，需做延迟展示去闪烁。 */
     private static final long BUFFERING_UI_SHOW_DELAY_MS = 260L;
@@ -576,6 +696,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final float BUFFERING_UI_IGNORE_OUTPUT_FPS = 8.0f;
     private volatile boolean playerReportedBuffering = false;
     private volatile boolean bufferingUiVisible = false;
+    private volatile boolean bufferingPausedDanmaku = false;
     private volatile long bufferingUiVisibleSinceUptimeMs = 0L;
     private volatile long bufferingStartPositionMs = 0L;
     private volatile long bufferingStartUptimeMs = 0L;
@@ -667,6 +788,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final long ONLINE_SEEK_VERIFY_SIGNAL_FALLBACK_MS = 520L;
     private static final long ONLINE_SEEK_BACKWARD_TOLERANCE_MS = 1200L;
     private static final int ONLINE_SEEK_VERIFY_MAX_RETRY = 1;
+    private static final long SEEK_RUNTIME_TIMEOUT_MS = 1900L;
     private Runnable onlineSeekVerifyRunnable;
     private volatile long onlineSeekVerifyTargetMs = -1L;
     private volatile long onlineSeekVerifyStartedUptimeMs = 0L;
@@ -701,6 +823,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private static final long BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MOVED_MS = 120L;
     private Runnable backgroundResumeRenderHealthCheckRunnable;
     private volatile long backgroundResumeRenderHealthCheckStartPosMs = -1L;
+    private static final long BACKGROUND_RESUME_NO_SURFACE_GRACE_MS = 360L;
+    private Runnable backgroundResumeNoSurfaceProbeRunnable;
 
     // 切换听视频模式时：强制在新会话 onPrepared 后跳回切换前进度，并尽量用准确 seek 避免回退到关键帧。
     private long pendingAudioOnlyToggleSeekMs = -1L;
@@ -766,6 +890,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void setPlaybackSpeed(float speed) {
+        setPlaybackSpeed(speed, "setPlaybackSpeed");
+    }
+
+    private void setPlaybackSpeed(float speed, @NonNull String reason) {
         playbackSpeed = speed;
         try {
             if (ijkPlayer != null)
@@ -777,50 +905,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 mDanmakuView.setSpeed(speed);
         } catch (Exception ignore) {
         }
-        applyDanmakuLoadSheddingForSpeed(speed, "setPlaybackSpeed");
     }
 
-    private void applyDanmakuLoadSheddingForSpeed(float speed, @NonNull String reason) {
-        boolean enable = speed >= DANMAKU_LOAD_SHEDDING_SPEED_THRESHOLD;
-        boolean stateChanged = danmakuLoadSheddingEnabled != enable;
-        danmakuLoadSheddingEnabled = enable;
-
-        if (mContext == null)
+    private void endLongPressSpeedMode(@NonNull String reason) {
+        if (!onLongClick && !runtimeCoordinator.isLongPressSpeedActive())
             return;
-
-        int userMaxLines = SharedPreferencesUtil.getInt("player_danmaku_maxline", 15);
-        int maxLines = enable
-                ? Math.max(1, Math.min(userMaxLines, DANMAKU_LOAD_SHEDDING_MAX_LINES))
-                : userMaxLines;
-
-        try {
-            HashMap<Integer, Integer> maxLinesPair = new HashMap<>();
-            maxLinesPair.put(BaseDanmaku.TYPE_SCROLL_RL, maxLines);
-            mContext.setMaximumLines(maxLinesPair);
-            mContext.setMaximumVisibleSizeInScreen(enable ? DANMAKU_LOAD_SHEDDING_MAX_VISIBLE_IN_SCREEN : -1);
-        } catch (Exception ignore) {
-        }
-
-        try {
-            if (mDanmakuView != null) {
-                // 当前会话已创建后该开关不会替换 DrawTask 类型；仍设置它，保证下一次只重建弹幕会话时生效。
-                mDanmakuView.enableDanmakuDrawingCache(!enable);
-                if (hasDanmaku && isDanmakuVisible && mDanmakuView.isPrepared()) {
-                    long pos = getLatestPlayerPositionForDanmaku();
-                    mDanmakuView.clearDanmakusOnScreen();
-                    mDanmakuView.showAndResumeDrawTask(pos);
-                }
-            }
-        } catch (Exception ignore) {
-        }
-
-        if (stateChanged) {
-            Logu.w("danmaku", "load shedding " + (enable ? "enabled" : "disabled")
-                    + ": reason=" + reason
-                    + ", speed=" + speed
-                    + ", maxLines=" + maxLines
-                    + ", maxVisible=" + (enable ? DANMAKU_LOAD_SHEDDING_MAX_VISIBLE_IN_SCREEN : -1));
-        }
+        runtimeCoordinator.setLongPressSpeedActive(false, android.os.SystemClock.uptimeMillis(), reason);
+        onLongClick = false;
+        if (seekbar_speed == null)
+            return;
+        int speedIndex = Math.max(0, Math.min(seekbar_speed.getProgress(), speed_values.length - 1));
+        float normalSpeed = speed_values[speedIndex];
+        setPlaybackSpeed(normalSpeed, "longPressEnd:" + reason);
+        if (text_speed != null)
+            text_speed.setText(speed_strs[speedIndex]);
     }
 
     private void updateLatestPlayerPosition(long positionMs) {
@@ -975,6 +1073,65 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         } catch (Exception ignore) {
             return false;
         }
+    }
+
+    private void kickDanmakuForegroundRender(@NonNull String reason) {
+        if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode)
+            return;
+        if (!hasDanmaku || !isDanmakuVisible || mDanmakuView == null)
+            return;
+        if (!isCurrentDanmakuPrepared())
+            return;
+
+        long pos = safeGetPlayerPositionMs();
+        long dmTime = 0L;
+        long lastDraw = getDanmakuLastDrawUptimeMs();
+        long now = android.os.SystemClock.uptimeMillis();
+        boolean paused = false;
+        try {
+            dmTime = Math.max(0L, mDanmakuView.getCurrentTime());
+        } catch (Exception ignore) {
+        }
+        try {
+            paused = mDanmakuView.isPaused();
+        } catch (Exception ignore) {
+        }
+
+        long lag = Math.max(0L, pos - dmTime);
+        boolean staleDraw = lastDraw <= 0L || now - lastDraw >= DANMAKU_FOREGROUND_RESTORE_STALE_DRAW_MS;
+        boolean shouldSeek = Math.abs(pos - dmTime) >= 240L;
+        boolean viewShown = false;
+        try {
+            viewShown = mDanmakuView.isShown();
+        } catch (Exception ignore) {
+        }
+
+        try {
+            if (!isAudioOnlyMode) {
+                mDanmakuView.setVisibility(View.VISIBLE);
+            }
+            if (!viewShown) {
+                mDanmakuView.showAndResumeDrawTask(pos);
+            } else if (shouldSeek) {
+                mDanmakuView.seekTo(pos);
+            }
+            if (isPlaying || paused || staleDraw) {
+                mDanmakuView.resume();
+            }
+            mDanmakuView.adjust();
+        } catch (Exception ignore) {
+        }
+
+        refreshDanmakuPositionSync("foregroundDanmakuKick:" + reason);
+        Logu.w("danmaku", "foreground render kick: reason=" + reason
+                + ", pos=" + pos
+                + ", dm=" + dmTime
+                + ", lag=" + lag
+                + ", staleDraw=" + staleDraw
+                + ", paused=" + paused
+                + ", shown=" + viewShown
+                + ", seek=" + shouldSeek
+                + ", playing=" + isPlaying);
     }
 
     private boolean isCurrentDanmakuSourceAvailable() {
@@ -1485,6 +1642,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         mainHandler = new Handler(Looper.getMainLooper());
+        runtimeCoordinator.resetForNewSession(playerSessionId,
+                SharedPreferencesUtil.getBoolean("pref_switch_danmaku", true),
+                android.os.SystemClock.uptimeMillis());
 
         setVideoGestures();
         autohideReset();
@@ -1703,12 +1863,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         break;
 
                     case MotionEvent.ACTION_UP:
-                        if (onLongClick) {
-                            onLongClick = false;
-                            float normalSpeed = speed_values[seekbar_speed.getProgress()];
-                            setPlaybackSpeed(normalSpeed);
-                            text_speed.setText(speed_strs[seekbar_speed.getProgress()]);
-                        }
+                    case MotionEvent.ACTION_CANCEL:
+                        endLongPressSpeedMode(action == MotionEvent.ACTION_CANCEL ? "touchCancel" : "touchUp");
                         if (gesture_moved)
                             gesture_moved = false;
                         if (gesture_scaled)
@@ -1725,11 +1881,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             });
         } else {
             layout_control.setOnTouchListener((view, motionEvent) -> {
-                if (motionEvent.getAction() == MotionEvent.ACTION_UP && onLongClick) {
-                    onLongClick = false;
-                    float normalSpeed = speed_values[seekbar_speed.getProgress()];
-                    setPlaybackSpeed(normalSpeed);
-                    text_speed.setText(speed_strs[seekbar_speed.getProgress()]);
+                int action = motionEvent.getActionMasked();
+                if ((action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) && onLongClick) {
+                    endLongPressSpeedMode(action == MotionEvent.ACTION_CANCEL ? "touchCancel" : "touchUp");
                 }
                 return false;
             });
@@ -1748,7 +1902,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     && !isLiveMode) {
                 if (!onLongClick && !gesture_click_disabled) {
                     hidecon.run();
-                    setPlaybackSpeed(3.0F);
+                    runtimeCoordinator.setLongPressSpeedActive(true, android.os.SystemClock.uptimeMillis(), "longClickDown");
+                    setPlaybackSpeed(3.0F, "longPressStart");
                     text_speed.setText("x 3.0");
                     onLongClick = true;
                     Logu.v("gesture", "longclick_down");
@@ -1935,6 +2090,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private boolean maybeSkipBackgroundRestoreOrRebuild(long restorePositionMs,
                                                         @NonNull String reason,
                                                         boolean allowDecodeFallback) {
+        if (backgroundPlaybackSurfaceRecreated || isWaitingForBackgroundSurfaceFirstFrame()) {
+            Logu.d("surface", "skip healthy-probe shortcut for active background restore: reason=" + reason
+                    + ", online=" + isOnlineVideo);
+            return false;
+        }
         if (!hasHealthyVideoRenderOutput(reason, allowDecodeFallback))
             return false;
 
@@ -1943,12 +2103,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         long resolvedPosition = Math.max(restorePositionMs, getLatestPlayerPositionForDanmaku());
         syncProgressUiFromPlayer(resolvedPosition);
         forceHideAllLoadingUi(reason + "-healthyRender");
-        if (isPlaying && hasDanmaku && mDanmakuView != null) {
-            try {
-                mDanmakuView.resume();
-            } catch (Exception ignore) {
-            }
-        }
+        kickDanmakuForegroundRender(reason + "-healthyRender");
         refreshDanmakuPositionSync(reason + "-healthyRender");
         Logu.w("surface", "skip active restore/rebuild: reason=" + reason
                 + ", pos=" + resolvedPosition
@@ -2253,8 +2408,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         prepareRequested = true;
         displayConfigured = false;
         cancelConsumeBackgroundPlaybackFlag();
+        cancelBackgroundResumeNoSurfaceProbe();
         skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
         backgroundPlaybackSurfaceRecreated = false;
+        runtimeCoordinator.cancelSeek("invalidatePlayerSession:" + reason);
         Logu.v("session", "invalidatePlayerSession: " + reason + ", id=" + playerSessionId);
     }
 
@@ -2271,8 +2428,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         prepareRequested = false;
         displayConfigured = false;
         cancelConsumeBackgroundPlaybackFlag();
+        cancelBackgroundResumeNoSurfaceProbe();
         skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
         backgroundPlaybackSurfaceRecreated = false;
+        runtimeCoordinator.resetForNewSession(playerSessionId,
+                SharedPreferencesUtil.getBoolean("pref_switch_danmaku", true),
+                android.os.SystemClock.uptimeMillis());
         Logu.v("session", "startNewPlayerSession: " + reason + ", id=" + playerSessionId);
     }
 
@@ -2285,6 +2446,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         completionReplayNeedsRebuild = false;
         waitingForFirstVideoFrame = false;
         firstVideoFrameRendered = false;
+        waitingForFirstVideoFrameUptimeMs = 0L;
+        waitingForFirstVideoFrameStartPosMs = 0L;
         video_all = 0;
         video_now = 0;
         video_now_last = 0;
@@ -2308,8 +2471,22 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         frameLoadingDelayedHideRunnable = null;
     }
 
+    private boolean isFrameLoadingOwner(PlayerRuntimeCoordinator.LoadingOwner owner) {
+        return owner == PlayerRuntimeCoordinator.LoadingOwner.FIRST_FRAME
+                || owner == PlayerRuntimeCoordinator.LoadingOwner.BACKGROUND_RESTORE
+                || owner == PlayerRuntimeCoordinator.LoadingOwner.AUDIO_ONLY_TOGGLE;
+    }
+
+    private void endFrameLoadingOwner(@NonNull String reason) {
+        PlayerRuntimeCoordinator.LoadingOwner owner = runtimeCoordinator.loadingOwner();
+        if (isFrameLoadingOwner(owner)) {
+            runtimeCoordinator.endLoading(owner, runtimeCoordinator.loadingToken(), reason);
+        }
+    }
+
     private void cancelFrameLoadingMinShowGuard() {
         cancelPendingFrameLoadingHide();
+        endFrameLoadingOwner("cancelFrameLoadingMinShowGuard");
         frameLoadingActive = false;
         frameLoadingVisibleSinceUptimeMs = 0L;
     }
@@ -2335,6 +2512,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     }
 
     private void resetBufferingUiState() {
+        resetBufferingUiState(false, "resetBufferingUiState");
+    }
+
+    private void resetBufferingUiState(boolean resumeDanmakuIfPossible, @NonNull String reason) {
+        boolean hadPausedDanmaku = bufferingPausedDanmaku;
         playerReportedBuffering = false;
         bufferingUiVisible = false;
         bufferingUiVisibleSinceUptimeMs = 0L;
@@ -2342,6 +2524,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         bufferingStartUptimeMs = 0L;
         cancelBufferingUiShow();
         cancelBufferingUiHide();
+        runtimeCoordinator.endLoading(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING,
+                runtimeCoordinator.loadingToken(), reason);
+        if (hadPausedDanmaku && resumeDanmakuIfPossible) {
+            bufferingPausedDanmaku = true;
+            resumeDanmakuPausedForBufferingIfNeeded(reason);
+            return;
+        }
+        bufferingPausedDanmaku = false;
     }
 
     private boolean shouldSuppressTransientBufferingUi() {
@@ -2359,8 +2549,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
     private void showBufferingUiNow(@NonNull String reason) {
         if (destroyed || resourcesReleased || isAudioOnlyMode)
             return;
-        if (frameLoadingActive)
+        if (runtimeCoordinator.isLoadingOwnedBy(PlayerRuntimeCoordinator.LoadingOwner.SEEK)) {
+            runtimeCoordinator.clearLoading("bufferingOverrideSeek:" + reason);
+        }
+        if (runtimeCoordinator.loadingOwner() != PlayerRuntimeCoordinator.LoadingOwner.NONE
+                && !runtimeCoordinator.isLoadingOwnedBy(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING))
             return;
+        runtimeCoordinator.beginLoading(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING,
+                android.os.SystemClock.uptimeMillis(), reason);
 
         cancelBufferingUiHide();
         bufferingUiVisible = true;
@@ -2374,13 +2570,31 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 loading_text0.setText("正在缓冲");
             showLoadingSpeed();
         });
-        if (hasDanmaku && mDanmakuView != null && isPlaying) {
+        if (hasDanmaku && isDanmakuVisible && mDanmakuView != null && isPlaying) {
             try {
                 mDanmakuView.pause();
+                bufferingPausedDanmaku = true;
             } catch (Exception ignore) {
             }
         }
         Logu.d("buffering", "show buffering ui: " + reason);
+    }
+
+    private void resumeDanmakuPausedForBufferingIfNeeded(@NonNull String reason) {
+        if (!bufferingPausedDanmaku)
+            return;
+        if (playerReportedBuffering || bufferingUiVisible || frameLoadingActive || waitingForFirstVideoFrame)
+            return;
+        if (!hasDanmaku || !isDanmakuVisible || mDanmakuView == null || !isPlaying) {
+            bufferingPausedDanmaku = false;
+            return;
+        }
+        try {
+            mDanmakuView.resume();
+        } catch (Exception ignore) {
+        }
+        bufferingPausedDanmaku = false;
+        Logu.d("buffering", "resume danmaku after buffering: " + reason);
     }
 
     private void scheduleBufferingUiShow(@NonNull String reason) {
@@ -2414,14 +2628,20 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             mainHandler = new Handler(Looper.getMainLooper());
 
         cancelBufferingUiShow();
-        if (!bufferingUiVisible)
+        if (!bufferingUiVisible) {
+            runtimeCoordinator.endLoading(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING,
+                    runtimeCoordinator.loadingToken(), reason + "-notVisible");
+            resumeDanmakuPausedForBufferingIfNeeded(reason + "-notVisible");
             return;
+        }
 
         long shownAt = bufferingUiVisibleSinceUptimeMs;
         long elapsed = shownAt > 0L ? (android.os.SystemClock.uptimeMillis() - shownAt) : BUFFERING_UI_MIN_SHOW_MS;
         long remain = shownAt > 0L ? Math.max(0L, BUFFERING_UI_MIN_SHOW_MS - elapsed) : 0L;
 
         Runnable hideAction = () -> {
+            runtimeCoordinator.endLoading(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING,
+                    runtimeCoordinator.loadingToken(), reason);
             bufferingUiHideRunnable = null;
             bufferingUiVisible = false;
             bufferingUiVisibleSinceUptimeMs = 0L;
@@ -2441,12 +2661,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         anim_loading.stop();
                 }
             });
-            if (!frameLoadingActive && hasDanmaku && mDanmakuView != null && isPlaying) {
-                try {
-                    mDanmakuView.resume();
-                } catch (Exception ignore) {
-                }
-            }
+            resumeDanmakuPausedForBufferingIfNeeded(reason);
             Logu.d("buffering", "hide buffering ui: " + reason);
         };
 
@@ -2494,11 +2709,30 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         long shownAt = frameLoadingVisibleSinceUptimeMs;
         long elapsed = shownAt > 0L ? (android.os.SystemClock.uptimeMillis() - shownAt) : FRAME_LOADING_MIN_SHOW_MS;
         long remain = shownAt > 0L ? Math.max(0L, FRAME_LOADING_MIN_SHOW_MS - elapsed) : 0L;
+        final PlayerRuntimeCoordinator.LoadingOwner ownerAtHide = runtimeCoordinator.loadingOwner();
+        final long loadingTokenAtHide = runtimeCoordinator.loadingToken();
 
         Runnable hideAction = () -> {
+            if (isFrameLoadingOwner(ownerAtHide)) {
+                runtimeCoordinator.endLoading(ownerAtHide, loadingTokenAtHide, reason);
+            }
             frameLoadingDelayedHideRunnable = null;
             frameLoadingActive = false;
             frameLoadingVisibleSinceUptimeMs = 0L;
+            if (playerReportedBuffering && !bufferingUiVisible && !isAudioOnlyMode) {
+                long now = android.os.SystemClock.uptimeMillis();
+                runtimeCoordinator.beginLoading(PlayerRuntimeCoordinator.LoadingOwner.BUFFERING,
+                        now, "frameLoadingToBuffering:" + reason);
+                bufferingUiVisible = true;
+                bufferingUiVisibleSinceUptimeMs = now;
+                if (hasDanmaku && isDanmakuVisible && mDanmakuView != null && isPlaying && !bufferingPausedDanmaku) {
+                    try {
+                        mDanmakuView.pause();
+                        bufferingPausedDanmaku = true;
+                    } catch (Exception ignore) {
+                    }
+                }
+            }
             runOnUiThreadIfNeeded(() -> {
                 if (playerReportedBuffering || bufferingUiVisible) {
                     if (loading_info != null)
@@ -2516,6 +2750,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         anim_loading.stop();
                 }
             });
+            resumeDanmakuPausedForBufferingIfNeeded("hideFrameLoading:" + reason);
             Logu.d("render", "hideFrameLoading: " + reason);
         };
 
@@ -2535,9 +2770,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             waitingForFirstVideoFrameStartPosMs = 0L;
             return;
         }
+        long now = android.os.SystemClock.uptimeMillis();
+        PlayerRuntimeCoordinator.LoadingOwner owner = inBackgroundSurfaceRestore
+                || pendingOnlineRebuildFirstVideoFrameFallback
+                ? PlayerRuntimeCoordinator.LoadingOwner.BACKGROUND_RESTORE
+                : PlayerRuntimeCoordinator.LoadingOwner.FIRST_FRAME;
+        runtimeCoordinator.beginLoading(owner, now, reason);
         waitingForFirstVideoFrame = true;
         firstVideoFrameRendered = false;
-        waitingForFirstVideoFrameUptimeMs = android.os.SystemClock.uptimeMillis();
+        waitingForFirstVideoFrameUptimeMs = now;
         long startPos = Math.max(0L, latestPlayerPositionMs);
         if (ijkPlayer != null && isPrepared) {
             try {
@@ -2557,7 +2798,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         Logu.d("render", "beginWaitingForFirstVideoFrame: " + reason);
     }
 
-    private void cancelOnlineRebuildFirstVideoFrameFallback() {
+    private void cancelOnlineRebuildFirstVideoFrameFallbackRunnable() {
         if (mainHandler != null && onlineRebuildFirstVideoFrameFallbackRunnable != null) {
             try {
                 mainHandler.removeCallbacks(onlineRebuildFirstVideoFrameFallbackRunnable);
@@ -2565,7 +2806,61 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             }
         }
         onlineRebuildFirstVideoFrameFallbackRunnable = null;
+    }
+
+    private void cancelOnlineRebuildFirstVideoFrameFallback() {
+        cancelOnlineRebuildFirstVideoFrameFallbackRunnable();
         pendingOnlineRebuildFirstVideoFrameFallback = false;
+        onlineRebuildFirstVideoFrameRecoveryKickTriggered = false;
+        onlineRebuildFirstVideoFrameSlowNoticeShown = false;
+    }
+
+    private boolean shouldRequireRealOnlineFirstFrameEvent() {
+        return isOnlineVideo
+                && !isAudioOnlyMode
+                && waitingForFirstVideoFrame
+                && !firstVideoFrameRendered
+                && (inBackgroundSurfaceRestore
+                || pendingOnlineRebuildFirstVideoFrameFallback
+                || backgroundResumeRenderHealthCheckRunnable != null
+                || backgroundSurfaceRefreshTriggered
+                || backgroundPlaybackSurfaceRecreated);
+    }
+
+    private void performOnlineRebuildFirstFrameRecoveryKick(@NonNull String reason,
+                                                            long pos,
+                                                            long moved,
+                                                            float outputFps) {
+        if (!pendingOnlineRebuildFirstVideoFrameFallback || destroyed || resourcesReleased
+                || !isOnlineVideo || isAudioOnlyMode)
+            return;
+        if (!waitingForFirstVideoFrame || firstVideoFrameRendered)
+            return;
+
+        IjkMediaPlayer player = ijkPlayer;
+        if (player == null || !isPrepared)
+            return;
+
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+        if (isPlaying || pausedByLifecycle) {
+            try {
+                player.start();
+            } catch (Exception ignore) {
+            }
+        }
+        try {
+            attachSurfaceIfPossible();
+        } catch (Exception ignore) {
+        }
+
+        Logu.w("surface", "online rebuild first-frame recovery kick: reason=" + reason
+                + ", pos=" + pos
+                + ", moved=" + moved
+                + ", outputFps=" + outputFps
+                + ", session=" + playerSessionId);
     }
 
     private void scheduleOnlineRebuildFirstVideoFrameFallback(@NonNull String reason) {
@@ -2574,19 +2869,29 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (mainHandler == null)
             mainHandler = new Handler(Looper.getMainLooper());
 
-        cancelOnlineRebuildFirstVideoFrameFallback();
+        cancelOnlineRebuildFirstVideoFrameFallbackRunnable();
         pendingOnlineRebuildFirstVideoFrameFallback = true;
         final int session = playerSessionId;
         onlineRebuildFirstVideoFrameFallbackRunnable = new Runnable() {
             @Override
             public void run() {
-                if (destroyed || resourcesReleased || session != playerSessionId) {
-                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
-                    pendingOnlineRebuildFirstVideoFrameFallback = false;
+                if (destroyed || resourcesReleased) {
+                    if (onlineRebuildFirstVideoFrameFallbackRunnable == this) {
+                        onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                        pendingOnlineRebuildFirstVideoFrameFallback = false;
+                    }
+                    return;
+                }
+                if (session != playerSessionId) {
+                    if (onlineRebuildFirstVideoFrameFallbackRunnable == this) {
+                        onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    }
                     return;
                 }
                 if (!pendingOnlineRebuildFirstVideoFrameFallback || !waitingForFirstVideoFrame || firstVideoFrameRendered) {
-                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    if (onlineRebuildFirstVideoFrameFallbackRunnable == this) {
+                        onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    }
                     return;
                 }
 
@@ -2602,11 +2907,34 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
                 if (moved >= ONLINE_REBUILD_FIRST_VIDEO_FRAME_MOVED_MS
                         || (isRenderSurfaceReady() && outputFps > 8f)) {
-                    onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    if (onlineRebuildFirstVideoFrameFallbackRunnable == this) {
+                        onlineRebuildFirstVideoFrameFallbackRunnable = null;
+                    }
                     pendingOnlineRebuildFirstVideoFrameFallback = false;
                     onFirstVideoFrameRendered("onlineRebuildFallback:" + reason
                             + ", moved=" + moved + ", fps=" + outputFps);
                     return;
+                }
+
+                long waited = waitingForFirstVideoFrameUptimeMs > 0L
+                        ? android.os.SystemClock.uptimeMillis() - waitingForFirstVideoFrameUptimeMs
+                        : 0L;
+                if (!onlineRebuildFirstVideoFrameRecoveryKickTriggered
+                        && waited >= ONLINE_REBUILD_FIRST_VIDEO_FRAME_RECOVERY_KICK_MS) {
+                    onlineRebuildFirstVideoFrameRecoveryKickTriggered = true;
+                    performOnlineRebuildFirstFrameRecoveryKick(reason, pos, moved, outputFps);
+                }
+                if (!onlineRebuildFirstVideoFrameSlowNoticeShown
+                        && waited >= ONLINE_REBUILD_FIRST_VIDEO_FRAME_SLOW_NOTICE_MS) {
+                    onlineRebuildFirstVideoFrameSlowNoticeShown = true;
+                    updateFrameLoadingText("画面恢复较慢", "正在等待视频首帧");
+                    Logu.w("surface", "online rebuild still waiting first frame: reason=" + reason
+                            + ", waited=" + waited + "ms"
+                            + ", pos=" + pos
+                            + ", moved=" + moved
+                            + ", outputFps=" + outputFps
+                            + ", surfaceReady=" + isRenderSurfaceReady()
+                            + ", session=" + playerSessionId);
                 }
 
                 if (mainHandler != null) {
@@ -2677,6 +3005,120 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         backgroundResumeRenderHealthCheckRunnable = null;
     }
 
+    private void cancelBackgroundResumeNoSurfaceProbe() {
+        if (mainHandler != null && backgroundResumeNoSurfaceProbeRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(backgroundResumeNoSurfaceProbeRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        backgroundResumeNoSurfaceProbeRunnable = null;
+    }
+
+    private boolean hasContinuousPlaybackAfterNoSurfaceResume(long restorePositionMs,
+                                                             @NonNull String reason) {
+        if (!isPrepared || isLiveMode || isAudioOnlyMode || ijkPlayer == null)
+            return false;
+        boolean surfaceReady = isRenderSurfaceReady();
+        float outputFps = 0f;
+        float decodeFps = 0f;
+        try {
+            outputFps = ijkPlayer.getVideoOutputFramesPerSecond();
+        } catch (Exception ignore) {
+        }
+        try {
+            decodeFps = ijkPlayer.getVideoDecodeFramesPerSecond();
+        } catch (Exception ignore) {
+        }
+        long pos = safeGetPlayerPositionMs();
+        long moved = Math.max(0L, pos - Math.max(0L, restorePositionMs));
+        boolean continuous = surfaceReady && outputFps > 0.01f;
+        if (!continuous && !isOnlineVideo) {
+            continuous = surfaceReady
+                    && ((isPlaying && moved >= BACKGROUND_SURFACE_RESTORE_HEURISTIC_MOVED_MS)
+                    || (decodeFps > 0.01f && pos > 0L));
+        }
+        Logu.d("surface", "no-surface resume probe: reason=" + reason
+                + ", continuous=" + continuous
+                + ", surfaceReady=" + surfaceReady
+                + ", outputFps=" + outputFps
+                + ", decodeFps=" + decodeFps
+                + ", moved=" + moved
+                + ", session=" + playerSessionId);
+        return continuous;
+    }
+
+    private void finishBackgroundResumeWithoutSurfaceRestore(long restorePositionMs,
+                                                            @NonNull String reason) {
+        cancelBackgroundResumeNoSurfaceProbe();
+        skipSeekOnNextSurfaceCreatedFromBackgroundPlayback = false;
+        backgroundPlaybackSurfaceRecreated = false;
+        long resolvedPosition = Math.max(restorePositionMs, getLatestPlayerPositionForDanmaku());
+        syncProgressUiFromPlayer(resolvedPosition);
+        forceHideAllLoadingUi(reason + "-continuousNoSurface");
+        kickDanmakuForegroundRender(reason + "-continuousNoSurface");
+        refreshDanmakuPositionSync(reason + "-continuousNoSurface");
+        Logu.w("surface", "finish background resume without visible restore: reason=" + reason
+                + ", pos=" + resolvedPosition
+                + ", session=" + playerSessionId);
+    }
+
+    private void scheduleBackgroundResumeNoSurfaceProbe(long restorePositionMs,
+                                                        @NonNull String reason) {
+        cancelBackgroundResumeNoSurfaceProbe();
+        if (destroyed || resourcesReleased || isLiveMode || isAudioOnlyMode)
+            return;
+        if (!skipSeekOnNextSurfaceCreatedFromBackgroundPlayback || backgroundPlaybackSurfaceRecreated)
+            return;
+        if (ijkPlayer == null || !isPrepared)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+
+        final int session = playerSessionId;
+        final boolean onlineAtSchedule = isOnlineVideo;
+        final long probeBasePosition = Math.max(0L, restorePositionMs);
+        backgroundResumeNoSurfaceProbeRunnable = () -> {
+            backgroundResumeNoSurfaceProbeRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            if (!skipSeekOnNextSurfaceCreatedFromBackgroundPlayback || backgroundPlaybackSurfaceRecreated)
+                return;
+            if (ijkPlayer == null || !isPrepared || isLiveMode || isAudioOnlyMode)
+                return;
+
+            try {
+                attachSurfaceIfPossible();
+            } catch (Exception ignore) {
+            }
+
+            long currentPosition = Math.max(probeBasePosition, safeGetPlayerPositionMs());
+            syncProgressUiFromPlayer(currentPosition);
+            if (maybeSkipBackgroundRestoreOrRebuild(currentPosition,
+                    reason + "-silentProbe", true)) {
+                return;
+            }
+            if (hasContinuousPlaybackAfterNoSurfaceResume(probeBasePosition, reason)) {
+                finishBackgroundResumeWithoutSurfaceRestore(currentPosition, reason);
+                return;
+            }
+
+            if (backgroundPlaybackSurfaceRecreated)
+                return;
+            Logu.w("surface", "no-surface resume probe escalates to visible restore: reason=" + reason
+                    + ", online=" + onlineAtSchedule
+                    + ", pos=" + currentPosition
+                    + ", session=" + playerSessionId);
+            startBackgroundSurfaceRestore(currentPosition,
+                    (onlineAtSchedule ? "onlineNoSurfaceGrace:" : "localNoSurfaceGrace:") + reason);
+        };
+        mainHandler.postDelayed(backgroundResumeNoSurfaceProbeRunnable,
+                BACKGROUND_RESUME_NO_SURFACE_GRACE_MS);
+        Logu.d("surface", "schedule no-surface resume probe: reason=" + reason
+                + ", pos=" + probeBasePosition
+                + ", timeout=" + BACKGROUND_RESUME_NO_SURFACE_GRACE_MS + "ms");
+    }
+
     private void scheduleBackgroundResumeRenderHealthCheck(long restorePositionMs, @NonNull String reason) {
         scheduleBackgroundResumeRenderHealthCheck(restorePositionMs, reason,
                 BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_MS);
@@ -2734,6 +3176,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 }
                 if (restoreCompleted)
                     return;
+                if (backgroundSurfaceRefreshTriggered
+                        && inBackgroundSurfaceRestore && waitingForFirstVideoFrame
+                        && !firstVideoFrameRendered && outputFps > 0.01f) {
+                    scheduleBackgroundResumeRenderHealthCheck(safeGetPlayerPositionMs(),
+                            "afterOutputObserved:" + reason,
+                            BACKGROUND_SURFACE_RESTORE_HEURISTIC_OBSERVED_MS);
+                    return;
+                }
             }
 
             // 在线恢复单独走“两级兜底”：
@@ -3015,10 +3465,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             return true;
         }
 
-        // 在线视频后台恢复：不再接受基于 outputFps / 进度推进的启发式“恢复完成”。
-        // 只要没收到真实的首帧事件，就继续等待 health check 触发 refresh / rebuild，
-        // 避免出现“日志显示恢复完成，但屏幕仍黑”的误判。
-        if (isOnlineVideo) {
+        // 本地/缓存视频的 outputFps 是 codec 输出统计，不保证已经渲染到刚重建的新 Surface。
+        // 日志中出现过 outputFps 正常但 SurfaceView first render 仍晚到数秒的情况；这里不能用它结束恢复。
+        // 无首帧事件时交给 local black timeout 重建兜底，避免提前隐藏 loading 后露出黑屏。
+        if (!isOnlineVideo) {
             return false;
         }
 
@@ -3026,8 +3476,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             long refreshElapsed = backgroundSurfaceRefreshTriggeredUptimeMs > 0L
                     ? (now - backgroundSurfaceRefreshTriggeredUptimeMs)
                     : 0L;
-            if (refreshElapsed < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MIN_MS
-                    || moved < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MOVED_MS) {
+            if (refreshElapsed < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MIN_MS) {
+                return false;
+            }
+            if (surfaceReady && outputObserved
+                    && observedFor >= BACKGROUND_SURFACE_RESTORE_HEURISTIC_OBSERVED_MS
+                    && effectiveFps > 1f) {
+                Logu.w("surface", "bgRestore online complete after refresh output: source=" + source
+                        + ", fps=" + effectiveFps
+                        + ", observedFor=" + observedFor + "ms"
+                        + ", refreshElapsed=" + refreshElapsed + "ms"
+                        + ", moved=" + moved + "ms"
+                        + ", step=" + backgroundSurfaceRestoreStep
+                        + ", surfaceReady=" + surfaceReady);
+                onFirstVideoFrameRendered("bgRestore-onlineRefreshOutput:" + source + ", fps=" + effectiveFps);
+                return true;
+            }
+            if (moved < BACKGROUND_SURFACE_RESTORE_HEURISTIC_AFTER_REFRESH_MOVED_MS) {
                 return false;
             }
         }
@@ -3287,6 +3752,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         boolean restoreFrameEventReceived = backgroundSurfaceRestoreFrameEventReceived;
         boolean restoreOutputObserved = backgroundSurfaceRestoreOutputFpsObserved;
         int restoreStep = backgroundSurfaceRestoreStep;
+        cancelBackgroundResumeNoSurfaceProbe();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
         cancelOnlineRebuildFirstVideoFrameFallback();
@@ -3301,6 +3767,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         inBackgroundSurfaceRestore = false;
         backgroundSurfaceRestoreStartUptimeMs = 0L;
         hideFrameLoading(reason);
+        kickDanmakuForegroundRender("firstVideoFrame:" + reason);
         Logu.d("render", "onFirstVideoFrameRendered: " + reason);
         if (restoreElapsedMs >= 0L) {
             Logu.w("surface", "bgRestore complete: reason=" + reason
@@ -3318,6 +3785,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      */
     private void ensureLoadingHidden(@NonNull String reason) {
         // 先停掉所有可能让 loading 再次出现/保持的流程
+        cancelBackgroundResumeNoSurfaceProbe();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
         cancelFirstVideoFrameFallback();
@@ -3328,11 +3796,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         waitingForFirstVideoFrameUptimeMs = 0L;
         waitingForFirstVideoFrameStartPosMs = 0L;
 
+        runtimeCoordinator.clearLoading("ensureLoadingHidden:" + reason);
         hideFrameLoading(reason);
         Logu.d("render", "ensureLoadingHidden: " + reason);
     }
 
     private void forceHideAllLoadingUi(@NonNull String reason) {
+        cancelBackgroundResumeNoSurfaceProbe();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
         cancelOnlineRebuildFirstVideoFrameFallback();
@@ -3349,6 +3819,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         frameLoadingVisibleSinceUptimeMs = 0L;
 
         resetBufferingUiState();
+        runtimeCoordinator.clearLoading("forceHideAllLoadingUi:" + reason);
 
         try {
             if (loadingTimer != null) {
@@ -3410,12 +3881,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 decodeFps = player.getVideoDecodeFramesPerSecond();
             } catch (Exception ignore) {
             }
-            if (outputFps > 0.01f) {
-                if (!inBackgroundSurfaceRestore) {
-                    onFirstVideoFrameRendered("localBackgroundBlackRebuildSkip-outputFps=" + outputFps);
-                } else {
-                    maybeCompleteBackgroundRestoreByHeuristic("localBackgroundBlackRebuild", outputFps);
-                }
+            if (outputFps > 0.01f
+                    && maybeCompleteBackgroundRestoreByHeuristic("localBackgroundBlackRebuild", outputFps)) {
                 return;
             }
 
@@ -3566,11 +4033,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             scheduleBackgroundResumeRenderHealthCheck(backgroundSurfaceRestoreBasePosMs,
                     "bgRestore-online:" + reason,
                     BACKGROUND_RESUME_RENDER_HEALTHCHECK_TIMEOUT_ONLINE_MS);
+            scheduleBackgroundSurfaceRefreshTimeout("bgRestore:" + reason);
         } else {
             scheduleLocalBackgroundSurfaceBlackRebuild("bgRestore-local:" + reason);
+            // 本地/缓存视频不要等 220ms timeout 再 kick。Surface 刚重建时 outputFps 可能是旧统计，
+            // 但 pause/start 会促使 codec 尽快向新 surface 输出，不改变播放位置。
+            performBackgroundSurfaceRefresh("bgRestore-localImmediate:" + reason);
         }
         startBackgroundSurfaceRestoreProbe(reason);
-        scheduleBackgroundSurfaceRefreshTimeout("bgRestore:" + reason);
 
         // UI 兜底：若一直没有 rendering_start 事件，但播放在继续推进，推断画面已恢复，自动关闭 loading。
         // 这样不会无限卡住（你反馈的“画面已出但提示不消失”）。
@@ -3609,7 +4079,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 long pos = safeGetPlayerPositionMs();
                 boolean posMoving = pos >= backgroundSurfaceRestoreStartPosMs + 600L;
 
-                if (posMoving && surfaceReady && isPlaying) {
+                if (!isOnlineVideo && posMoving && surfaceReady && isPlaying) {
                     onFirstVideoFrameRendered("bgRestore-autoHideNoEvent");
                     return;
                 }
@@ -3727,6 +4197,44 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         localSeekVerifyRunnable = null;
     }
 
+    private long getSeekBackwardToleranceMs() {
+        return isOnlineVideo ? ONLINE_SEEK_BACKWARD_TOLERANCE_MS : LOCAL_SEEK_BACKWARD_TOLERANCE_MS;
+    }
+
+    private boolean isSeekTargetReached(long targetMs, long positionMs) {
+        if (targetMs < 0L)
+            return true;
+        long startMs = runtimeCoordinator.currentSeekStartMs();
+        long toleranceMs = getSeekBackwardToleranceMs();
+        if (startMs >= 0L && targetMs < startMs - toleranceMs) {
+            return positionMs <= targetMs + toleranceMs;
+        }
+        return positionMs >= targetMs - toleranceMs;
+    }
+
+    private void maybeFinishRuntimeSeek(long token, @NonNull String reason) {
+        if (!runtimeCoordinator.isCurrentSeekTokenActive(token))
+            return;
+        long target = runtimeCoordinator.currentSeekTargetMs();
+        long pos = safeGetPlayerPositionMs();
+        if (isSeekTargetReached(target, pos)) {
+            runtimeCoordinator.finishSeek(token, reason + ":pos=" + pos + ",target=" + target);
+            return;
+        }
+        long now = android.os.SystemClock.uptimeMillis();
+        long requestedAt = runtimeCoordinator.currentSeekRequestedUptimeMs();
+        boolean timeout = requestedAt > 0L && now - requestedAt >= SEEK_RUNTIME_TIMEOUT_MS;
+        if (timeout && !playerReportedBuffering && runtimeCoordinator.expireStaleSeekIfNeeded(now, reason)) {
+            runtimeCoordinator.endLoading(PlayerRuntimeCoordinator.LoadingOwner.SEEK,
+                    runtimeCoordinator.loadingToken(), "seekExpired:" + reason);
+            return;
+        }
+        Logu.d("seek", "runtime seek keep waiting: reason=" + reason
+                + ", token=" + token
+                + ", pos=" + pos
+                + ", target=" + target);
+    }
+
     private void scheduleLocalSeekVerify(long targetMs, @NonNull String reason) {
         cancelLocalSeekVerify();
         if (destroyed || resourcesReleased)
@@ -3755,12 +4263,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 long pos = safeGetPlayerPositionMs();
                 long backward = target - pos;
 
-                if (backward > LOCAL_SEEK_BACKWARD_TOLERANCE_MS && localSeekVerifyRetry < LOCAL_SEEK_VERIFY_MAX_RETRY) {
+                if (!isSeekTargetReached(target, pos) && localSeekVerifyRetry < LOCAL_SEEK_VERIFY_MAX_RETRY) {
                     localSeekVerifyRetry++;
 
-                    // 推进目标：把“落后量”补回去并再加一点余量，尽量跳到下一个关键帧附近。
-                    long nudge = Math.min(8000L, backward + 650L);
-                    long newTarget = target + nudge;
+                    // 向前 seek 可能落在较早关键帧，向前补一点；向后 seek 则重试原目标。
+                    long newTarget = target;
+                    if (backward > 0L) {
+                        long nudge = Math.min(8000L, backward + 650L);
+                        newTarget = target + nudge;
+                    }
                     if (video_all > 0) {
                         newTarget = Math.min(newTarget, Math.max(0L, video_all - 1L));
                     }
@@ -3772,6 +4283,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         cancelLocalSeekVerify();
                         return;
                     }
+                    cancelPendingDanmakuSeek("localSeekVerifyRetry:" + reason);
+                    runtimeCoordinator.commitUserSeek(pos, newTarget,
+                            android.os.SystemClock.uptimeMillis(), "localSeekVerify:" + reason);
                     markExplicitSeek(newTarget);
                     if (hasDanmaku && mDanmakuView != null) {
                         try {
@@ -3793,6 +4307,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
+                maybeFinishRuntimeSeek(runtimeCoordinator.currentSeekToken(), "localSeekVerify:" + reason);
                 cancelLocalSeekVerify();
             }
         };
@@ -3851,10 +4366,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 long pos = safeGetPlayerPositionMs();
                 long backward = target - pos;
 
-                if (backward <= ONLINE_SEEK_BACKWARD_TOLERANCE_MS || pos >= target) {
+                if (isSeekTargetReached(target, pos)) {
                     Logu.d("seek", "online seek verify ok: reason=" + reason
                             + ", pos=" + pos + ", target=" + target
                             + ", retry=" + onlineSeekVerifyRetry);
+                    maybeFinishRuntimeSeek(runtimeCoordinator.currentSeekToken(), "onlineSeekVerify:" + reason);
                     cancelOnlineSeekVerify();
                     return;
                 }
@@ -3889,6 +4405,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
+                cancelPendingDanmakuSeek("onlineSeekVerifyRetry:" + reason);
+                runtimeCoordinator.commitUserSeek(pos, correctionTarget,
+                        android.os.SystemClock.uptimeMillis(), "onlineSeekVerify:" + reason);
                 markExplicitSeek(correctionTarget);
                 if (hasDanmaku && mDanmakuView != null) {
                     try {
@@ -4026,6 +4545,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         if (destroyed)
             return;
 
+        boolean preserveOnlineRebuildFirstFrameFallback =
+                "backgroundResumeRenderTimeout".equals(reason)
+                        && pendingOnlineRebuildFirstVideoFrameFallback;
+
         // 防止“切听视频模式”残留的 pendingSeek 影响其它重建原因（切分P/清晰度/互动跳转等）。
         if (!"toggleAudioOnlyMode".equals(reason)) {
             pendingAudioOnlyToggleSeekMs = -1L;
@@ -4041,6 +4564,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         stopAllPeriodicTasks();
         releaseIjkPlayerSafely(reason);
         resetPlaybackFlagsForNewSession();
+        if (preserveOnlineRebuildFirstFrameFallback) {
+            pendingOnlineRebuildFirstVideoFrameFallback = true;
+            onlineRebuildFirstVideoFrameRecoveryKickTriggered = false;
+            onlineRebuildFirstVideoFrameSlowNoticeShown = false;
+        }
 
         ijkPlayer = new IjkMediaPlayer();
         progress_history = startPositionMs;
@@ -4195,6 +4723,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         ijkPlayer.setOnErrorListener((iMediaPlayer, what, extra) -> {
             if (destroyed || resourcesReleased || iMediaPlayer != ijkPlayer || sessionAtPrepare != playerSessionId)
                 return false;
+            runtimeCoordinator.cancelSeek("playerError:" + what + ":" + extra);
+            runtimeCoordinator.clearLoading("playerError:" + what + ":" + extra);
+            resetBufferingUiState(true, "playerError:" + what + ":" + extra);
             String EReport = "播放器可能遇到错误！\n错误码：" + what + "\n附加：" + extra;
             Logu.e("ijk-err", EReport);
             // Toast.makeText(PlayerActivity.this, EReport, Toast.LENGTH_LONG).show();
@@ -4210,6 +4741,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         ijkPlayer.setOnSeekCompleteListener(mp -> {
             if (destroyed || resourcesReleased || mp != ijkPlayer || sessionAtPrepare != playerSessionId)
                 return;
+            maybeFinishRuntimeSeek(runtimeCoordinator.currentSeekToken(), "OnSeekComplete");
             notifyOnlineSeekSignal("OnSeekComplete");
         });
 
@@ -4230,7 +4762,23 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             if (what == IMediaPlayer.MEDIA_INFO_VIDEO_SEEK_RENDERING_START
                     || what == IMediaPlayer.MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE) {
+                maybeFinishRuntimeSeek(runtimeCoordinator.currentSeekToken(), "MEDIA_INFO_SEEK_" + what);
                 notifyOnlineSeekSignal("MEDIA_INFO_SEEK_" + what);
+                if (waitingForFirstVideoFrame && !firstVideoFrameRendered) {
+                    boolean requireRealFirstFrameEvent = shouldRequireRealOnlineFirstFrameEvent();
+                    if (requireRealFirstFrameEvent) {
+                        Logu.d("render", "ignore seek info as online first-frame completion: what=" + what
+                                + ", pendingOnlineRebuild=" + pendingOnlineRebuildFirstVideoFrameFallback
+                                + ", inBackgroundRestore=" + inBackgroundSurfaceRestore);
+                    } else if (what == IMediaPlayer.MEDIA_INFO_VIDEO_SEEK_RENDERING_START
+                            && isRenderSurfaceReady()) {
+                        onFirstVideoFrameRendered("MEDIA_INFO_VIDEO_SEEK_RENDERING_START");
+                    } else if (what == IMediaPlayer.MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE
+                            && !inBackgroundSurfaceRestore
+                            && hasHealthyVideoRenderOutput("MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE", false)) {
+                        onFirstVideoFrameRendered("MEDIA_INFO_MEDIA_ACCURATE_SEEK_COMPLETE");
+                    }
+                }
             }
 
             // 本地点播一般不需要展示“正在缓冲/网速”，且部分版本可能不会触发 buffering 事件。
@@ -4248,9 +4796,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     notifyOnlineSeekSignal("MEDIA_INFO_BUFFERING_END");
                     if (pendingOnlineRebuildFirstVideoFrameFallback
                             && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
-                        pendingOnlineRebuildFirstVideoFrameFallback = false;
-                        onFirstVideoFrameRendered("MEDIA_INFO_BUFFERING_END-after-online-rebuild");
-                        return;
+                        Logu.d("render", "keep waiting first frame after online rebuild buffering end");
                     }
                     if (!isOnlineVideo && backgroundSurfaceRefreshTriggered
                             && waitingForFirstVideoFrame && !firstVideoFrameRendered) {
@@ -4259,7 +4805,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         // 避免视频已恢复显示但 loading 一直悬浮不消失。
                         onFirstVideoFrameRendered("MEDIA_INFO_BUFFERING_END-after-background-refresh");
                     }
-                    if (!waitingForFirstVideoFrame || firstVideoFrameRendered || isAudioOnlyMode) {
+                    if (waitingForFirstVideoFrame && !firstVideoFrameRendered && frameLoadingActive) {
+                        hideBufferingUi("MEDIA_INFO_BUFFERING_END-behind-frame-loading");
+                    } else if (!waitingForFirstVideoFrame || firstVideoFrameRendered || isAudioOnlyMode) {
                         hideBufferingUi("MEDIA_INFO_BUFFERING_END");
                     }
                 });
@@ -4595,13 +5143,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                             long waited = waitingForFirstVideoFrameUptimeMs > 0L
                                     ? (nowUptime - waitingForFirstVideoFrameUptimeMs)
                                     : 0L;
-                            if (isOnlineVideo && backgroundResumeRenderHealthCheckRunnable != null) {
-                                return;
-                            }
-                            long movedSinceWaitStart = Math.max(0L, video_now - waitingForFirstVideoFrameStartPosMs);
-                            // 等待超过 800ms 且播放进度已明显前进（>300ms）时触发。
-                            if (waited >= 800L && movedSinceWaitStart >= 300L) {
-                                onFirstVideoFrameRendered("posMovingFallback");
+                            if (!shouldRequireRealOnlineFirstFrameEvent()) {
+                                long movedSinceWaitStart = Math.max(0L, video_now - waitingForFirstVideoFrameStartPosMs);
+                                // 等待超过 800ms 且播放进度已明显前进（>300ms）时触发。
+                                if (waited >= 800L && movedSinceWaitStart >= 300L) {
+                                    onFirstVideoFrameRendered("posMovingFallback");
+                                }
                             }
                         }
                     }
@@ -5079,8 +5626,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         final boolean isProtobuf = protobufSegments != null && !protobufSegments.isEmpty();
         mDanmakuView.setCallback(new SafeDanmakuCallback(this, session, seq, isProtobuf));
-        mDanmakuView.enableDanmakuDrawingCache(!danmakuLoadSheddingEnabled);
-        applyDanmakuLoadSheddingForSpeed(getPlaybackSpeed(), "streamDanmakuPrepare");
+        mDanmakuView.enableDanmakuDrawingCache(true);
         if (!isDanmakuRequestValid(session, seq))
             return;
         mDanmakuView.prepare(mParser, mContext);
@@ -5189,6 +5735,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             if (speed <= 0f) {
                 speed = 1.0f;
             }
+            boolean speedStressWindow = a.runtimeCoordinator.isLongPressSpeedActive()
+                    || a.runtimeCoordinator.isSpeedTransitionGraceActive(nowUptime);
 
             long handlerLagMs = Math.max(0L, currentPos - timer.currMillisecond);
             if (handlerLagMs > 0L) {
@@ -5196,10 +5744,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 if (handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_DENSE_LAG_MS) {
                     visibleCount = a.getCurrentVisibleDanmakuCount();
                 }
-                boolean shouldForceCatchUp = handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_LAG_MS
+                boolean shouldForceCatchUp = speedStressWindow
+                        ? handlerLagMs >= DANMAKU_TIMER_SPEED_TRANSIENT_FORCE_CATCH_UP_LAG_MS
+                        : (handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_LAG_MS
                         || (handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_DENSE_LAG_MS
                         && (visibleCount >= DANMAKU_TIMER_FORCE_CATCH_UP_VISIBLE_COUNT
-                        || speed >= DANMAKU_TIMER_FORCE_CATCH_UP_SPEED));
+                        || speed >= DANMAKU_TIMER_FORCE_CATCH_UP_SPEED)));
                 if (shouldForceCatchUp) {
                     consecutiveForceCatchUpCount++;
                     long lastNonEmptyVisibleUptimeMs = a.lastNonEmptyVisibleDanmakuUptimeMs;
@@ -5217,6 +5767,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         }
                     } catch (Exception ignore) {
                     }
+                    boolean speedStressRecoverableStuck = speedStressWindow
+                            && handlerLagMs >= DANMAKU_TIMER_SPEED_STUCK_RECOVERY_LAG_MS
+                            && (likelyEmptyVisibleFreeze || viewPaused || visibleCount == 0);
                     boolean triggeredSoftRecovery = false;
 
                     if (likelyEmptyVisibleFreeze) {
@@ -5225,7 +5778,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                         consecutiveEmptyVisibleForceCatchUpCount = 0;
                     }
 
-                    if (likelyEmptyVisibleFreeze
+                    if ((!speedStressWindow || speedStressRecoverableStuck)
+                            && likelyEmptyVisibleFreeze
                             && consecutiveEmptyVisibleForceCatchUpCount >= DANMAKU_TIMER_EMPTY_VISIBLE_RECOVERY_TRIGGER_COUNT
                             && nowUptime - lastEmptyVisibleRecoveryUptimeMs
                             >= DANMAKU_TIMER_EMPTY_VISIBLE_RECOVERY_COOLDOWN_MS) {
@@ -5251,7 +5805,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     }
 
                     boolean sparseVisibleForSoftRecovery = visibleCount <= DANMAKU_TIMER_FORCE_CATCH_UP_SOFT_RECOVERY_VISIBLE_LIMIT;
-                    boolean shouldForceSoftRecovery = !triggeredSoftRecovery
+                    boolean shouldForceSoftRecovery = (!speedStressWindow || speedStressRecoverableStuck)
+                            && !triggeredSoftRecovery
                             && nowUptime - lastForceCatchUpSoftRecoveryUptimeMs
                             >= DANMAKU_TIMER_FORCE_CATCH_UP_SOFT_RECOVERY_COOLDOWN_MS
                             && ((viewPaused && handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_DENSE_LAG_MS)
@@ -5273,14 +5828,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     }
 
                     long catchUpTarget = currentPos;
-                    boolean hardSnapCatchUp = likelyEmptyVisibleFreeze
+                    boolean hardSnapCatchUp = ((!speedStressWindow || speedStressRecoverableStuck) && (likelyEmptyVisibleFreeze
                             || viewPaused
-                            || shouldForceSoftRecovery
-                            || handlerLagMs >= DANMAKU_TIMER_FORCE_CATCH_UP_HARD_SNAP_LAG_MS;
+                            || shouldForceSoftRecovery))
+                            || handlerLagMs >= (speedStressWindow
+                            ? DANMAKU_TIMER_SPEED_TRANSIENT_HARD_SNAP_LAG_MS
+                            : DANMAKU_TIMER_FORCE_CATCH_UP_HARD_SNAP_LAG_MS);
                     if (!hardSnapCatchUp) {
-                        long stepCap = Math.max(DANMAKU_TIMER_GRADUAL_CATCH_UP_BASE_STEP_MS,
-                                Math.round(DANMAKU_TIMER_GRADUAL_CATCH_UP_BASE_STEP_MS * Math.max(1.0f, speed)));
-                        if (visibleCount >= DANMAKU_TIMER_FORCE_CATCH_UP_VISIBLE_COUNT) {
+                        long baseStep = speedStressWindow
+                                ? DANMAKU_TIMER_SPEED_TRANSIENT_CATCH_UP_STEP_MS
+                                : DANMAKU_TIMER_GRADUAL_CATCH_UP_BASE_STEP_MS;
+                        long stepCap = Math.max(baseStep,
+                                Math.round(baseStep * Math.max(1.0f, speed)));
+                        if (!speedStressWindow && visibleCount >= DANMAKU_TIMER_FORCE_CATCH_UP_VISIBLE_COUNT) {
                             stepCap = Math.max(stepCap, DANMAKU_TIMER_GRADUAL_CATCH_UP_DENSE_STEP_MS);
                         }
                         long residualLag = Math.max(DANMAKU_TIMER_GRADUAL_CATCH_UP_MIN_RESIDUAL_LAG_MS,
@@ -5299,7 +5859,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                                 + ", lag=" + handlerLagMs
                                 + ", visible=" + visibleCount
                                 + ", speed=" + speed
-                                + ", snap=" + hardSnapCatchUp);
+                                + ", snap=" + hardSnapCatchUp
+                                + ", speedStress=" + speedStressWindow);
                     }
                     return;
                 }
@@ -5568,6 +6129,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         super.onPause();
         Logu.v("onPause");
         cancelConsumeBackgroundPlaybackFlag();
+        cancelBackgroundResumeNoSurfaceProbe();
         if (finishWatching && isPrepared && !isLiveMode) {
             completionReplayNeedsRebuild = true;
             Logu.d("player", "onPause after completion: mark replay rebuild");
@@ -5589,11 +6151,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         super.onResume();
         Logu.v("onResume");
         cancelConsumeBackgroundPlaybackFlag();
+        if (isPrepared && isPlaying && !finishWatching) {
+            kickDanmakuForegroundRender("onResume");
+        }
         if (pausedByLifecycle) {
             boolean canAutoResume = isPrepared && !isPlaying && !finishWatching;
             pausedByLifecycle = false;
             if (canAutoResume) {
                 playerResume();
+                kickDanmakuForegroundRender("onResume-autoResume");
             }
         }
         if (isPrepared && finishWatching && !isLiveMode) {
@@ -5628,23 +6194,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     true)) {
                 return;
             }
-            if (isOnlineVideo) {
-                Logu.w("surface", "onResume: staged online restore without surface recreate, pos="
-                        + currentPosition + ", session=" + playerSessionId);
-                scheduleConsumeBackgroundPlaybackFlag("onResume-noSurfaceRecreate-online");
-                startBackgroundSurfaceRestore(currentPosition, "onResume-noSurfaceRecreate-online");
-                return;
-            } else {
-                // 本地/缓存视频此前在“未发生 surface recreate”的回前台路径里几乎不做恢复动作，
-                // 容易出现恢复时长 1~5s 的长尾。
-                // 这里统一走一次本地 staged restore：
-                // - 能快速恢复则保留旧会话
-                // - 500ms 内仍无有效输出帧则由 local black timeout 兜底重建
-                Logu.w("surface", "onResume: staged local restore without surface recreate, pos=" + currentPosition);
-                scheduleConsumeBackgroundPlaybackFlag("onResume-noSurfaceRecreate-local");
-                startBackgroundSurfaceRestore(currentPosition, "onResume-noSurfaceRecreate-local");
-                return;
-            }
+            Logu.w("surface", "onResume: probe background resume without surface recreate, online="
+                    + isOnlineVideo + ", pos=" + currentPosition + ", session=" + playerSessionId);
+            scheduleBackgroundResumeNoSurfaceProbe(currentPosition, "onResume-noSurfaceRecreate");
+            return;
         }
         if (isPrepared && (!isPlaying || finishWatching)) {
             forceHideAllLoadingUi("onResume-nonPlaying");
@@ -5782,6 +6335,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      */
     private void stopAllPeriodicTasks() {
         cancelConsumeBackgroundPlaybackFlag();
+        cancelBackgroundResumeNoSurfaceProbe();
         cancelBackgroundResumeRenderHealthCheck();
         cancelBackgroundSurfaceRefreshTimeout();
         cancelOnlineRebuildFirstVideoFrameFallback();
@@ -6146,6 +6700,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
                 @Override
                 public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surfaceTexture) {
+                    if (waitingForFirstVideoFrame && !firstVideoFrameRendered && !isAudioOnlyMode) {
+                        if (inBackgroundSurfaceRestore) {
+                            backgroundSurfaceRestoreFrameEventReceived = true;
+                        }
+                        onFirstVideoFrameRendered("SurfaceTextureUpdated");
+                    }
                 }
             });
             layout_video.addView(textureView, params);
@@ -6242,6 +6802,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             public void onStartTrackingTouch(SeekBar seekBar) {
                 cancelLocalSeekVerify();
                 cancelOnlineSeekVerify();
+                runtimeCoordinator.beginUserSeekDrag(android.os.SystemClock.uptimeMillis());
                 isSeeking = true;
             }
 
@@ -6356,13 +6917,19 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             cancelLocalSeekVerify();
             cancelOnlineSeekVerify();
+            long from = safeGetPlayerPositionMs();
+            long seekToken = runtimeCoordinator.commitUserSeek(from, target,
+                    android.os.SystemClock.uptimeMillis(), "seekToPosition");
             try {
                 ijkPlayer.seekTo(target);
             } catch (Exception ignore) {
+                runtimeCoordinator.cancelSeek("playerSeekFailed");
+                runtimeCoordinator.endLoading(PlayerRuntimeCoordinator.LoadingOwner.SEEK,
+                        runtimeCoordinator.loadingToken(), "playerSeekFailed");
                 return;
             }
-            // Danmaku seek 走去抖：连续拖动时只对 DFM 执行最后一次 seek，避免频繁 quitUpdateThread/join。
-            scheduleDanmakuSeek(target, "userSeek");
+            // Danmaku seek 走去抖：连续拖动时只对 DFM 执行最后一次 seek，避免频繁重置弹幕窗口。
+            scheduleDanmakuSeek(target, seekToken, "userSeek");
             // 同步标记：允许弹幕时间轴在短窗口内回退，防止“回跳钳制”影响正常 seek。
             markExplicitSeek(target);
             updateLatestPlayerPosition(target);
@@ -6485,6 +7052,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             return;
 
         isDanmakuVisible = visible;
+        runtimeCoordinator.setDanmakuVisibleByUser(visible, reason);
 
         // 硬恢复 prepare 尚未完成时，不让外部 show 调用把半初始化状态的弹幕层再次拉起。
         // 但 hide 仍然允许，以便用户在恢复期关闭弹幕。
@@ -6502,6 +7070,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 pendingDanmakuRestartPrepareSeq = -1;
                 pendingDanmakuRestartVisible = false;
                 try {
+                    hideDanmakuAndPauseWithoutQuit(reason);
+                } catch (Exception ignore) {
+                }
+                try {
                     mDanmakuView.clearDanmakusOnScreen();
                 } catch (Exception ignore) {
                 }
@@ -6509,8 +7081,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     mDanmakuView.clear();
                 } catch (Exception ignore) {
                 }
-                hideDanmakuAndPauseWithoutQuit(reason);
+                try {
+                    mDanmakuView.setVisibility(View.INVISIBLE);
+                } catch (Exception ignore) {
+                }
                 return;
+            }
+
+            if (!isAudioOnlyMode) {
+                try {
+                    mDanmakuView.setVisibility(View.VISIBLE);
+                } catch (Exception ignore) {
+                }
             }
 
             final long pos = safeGetPlayerPositionMs();
@@ -6610,7 +7192,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
-                if (!hasDanmaku || !isDanmakuVisible || !isPrepared || !isPlaying || mDanmakuView == null) {
+                if (!runtimeCoordinator.canRunDanmakuWatchdog(now, hasDanmaku, isPrepared, isPlaying)
+                        || !isDanmakuVisible || mDanmakuView == null) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
                     return;
                 }
@@ -6944,6 +7527,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 layout_video.setVisibility(View.GONE);
                 layout_audio_only.setVisibility(View.VISIBLE);
                 if (mDanmakuView != null) {
+                    hideDanmakuAndPauseWithoutQuit("audioOnlyEnter");
+                    mDanmakuView.clear();
                     mDanmakuView.setVisibility(View.GONE);
                 }
                 if (text_audio_title != null) {
@@ -6958,7 +7543,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 layout_video.setVisibility(View.VISIBLE);
                 layout_audio_only.setVisibility(View.GONE);
                 if (mDanmakuView != null && isDanmakuVisible) {
-                    mDanmakuView.setVisibility(View.VISIBLE);
+                    applyDanmakuVisibility(true, "audioOnlyExit");
                 }
             }
         });

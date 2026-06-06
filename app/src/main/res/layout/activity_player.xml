@@ -19,7 +19,7 @@
         android:layout_centerInParent="true" />
 
 
-    <master.flame.danmaku.ui.widget.DanmakuView
+    <master.flame.danmaku.ui.widget.DanmakuTextureView
         android:id="@+id/sv_danmaku"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />

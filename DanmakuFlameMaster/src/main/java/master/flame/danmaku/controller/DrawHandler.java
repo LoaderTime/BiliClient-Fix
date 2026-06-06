@@ -121,11 +121,13 @@ public class DrawHandler extends Handler {
     @SuppressWarnings("unused")
     private long mThresholdTime;
 
+    private final Object mTimerLock = new Object();
+
     private long mLastDeltaTime;
 
-    private boolean mInSeekingAction;
+    private volatile boolean mInSeekingAction;
 
-    private long mDesireSeekingTime;
+    private volatile long mDesireSeekingTime;
 
     private long mRemainingTime;
 
@@ -199,9 +201,12 @@ public class DrawHandler extends Handler {
                         timer.update(getCurrentTime());
                         drawTask.requestClear();
                     } else {
-                        drawTask.start();
-                        drawTask.seek(start);
-                        drawTask.requestClear();
+                        synchronized (drawTask) {
+                            drawTask.start();
+                            drawTask.seek(start);
+                            drawTask.requestClear();
+                            drawTask.notifyAll();
+                        }
                         resume = true;
                     }
                 }
@@ -221,15 +226,15 @@ public class DrawHandler extends Handler {
                 }
             case SEEK_POS:
                 if (what == SEEK_POS) {
+                    Long positionObj = (Long) msg.obj;
+                    long position = positionObj == null ? timer.currMillisecond : positionObj;
+                    if (!quitFlag) {
+                        seekInRunningState(position);
+                        break;
+                    }
                     quitFlag = true;
                     quitUpdateThread();
-                    Long position = (Long) msg.obj;
-                    long deltaMs = position - timer.currMillisecond;
-                    mTimeBase -= deltaMs;
-                    timer.update(position);
-                    mContext.mGlobalFlagValues.updateMeasureFlag();
-                    if (drawTask != null)
-                        drawTask.seek(position);
+                    applySeekPosition(position);
                     pausedPosition = position;
                 }
             case RESUME:
@@ -430,6 +435,43 @@ public class DrawHandler extends Handler {
         mThread.start();
     }
 
+    private void applySeekPosition(long position) {
+        synchronized (mTimerLock) {
+            long deltaMs = position - timer.currMillisecond;
+            mTimeBase -= deltaMs;
+            timer.update(position);
+            mRemainingTime = 0;
+            mLastDeltaTime = 0;
+            mSpeedOffsetNoRender = 0L;
+            mSpeedOffsetRender = 0L;
+            mRenderingState.reset();
+            mDrawTimes.clear();
+            if (mContext != null) {
+                mContext.mGlobalFlagValues.updateMeasureFlag();
+            }
+            if (drawTask != null) {
+                synchronized (drawTask) {
+                    drawTask.seek(position);
+                    drawTask.requestClear();
+                    drawTask.notifyAll();
+                }
+            }
+        }
+    }
+
+    private void seekInRunningState(long position) {
+        mInSeekingAction = true;
+        try {
+            applySeekPosition(position);
+            pausedPosition = position;
+            if (mDanmakusVisible) {
+                requestRender();
+            }
+        } finally {
+            mInSeekingAction = false;
+        }
+    }
+
     private long mSpeedOffsetNoRender = 0L;
     private long mSpeedOffsetRender = 0L;
     private float mSpeed = 1.0F;
@@ -439,50 +481,55 @@ public class DrawHandler extends Handler {
     }
 
     public long syncTimer(long startMS) {
-        if (mInSeekingAction || mInSyncAction) {
-            return 0;
-        }
-        mInSyncAction = true;
-        long d = 0;
-        long time = startMS - mTimeBase;
-        if (!mDanmakusVisible || mRenderingState.nothingRendered || mInWaitingState) {
-            timer.update(time + mSpeedOffsetNoRender + mSpeedOffsetRender);
-            mSpeedOffsetNoRender += mFrameUpdateRate * (mSpeed - 1);
-            mRemainingTime = 0;
-            if (mCallback != null) {
-                mCallback.updateTimer(timer);
+        synchronized (mTimerLock) {
+            if (mInSeekingAction || mInSyncAction) {
+                return 0;
             }
-        } else {
-            long gapTime = time - timer.currMillisecond;
-            long averageTime = Math.max(mFrameUpdateRate, getAverageRenderingTime());
-            if (gapTime > 2000 || mRenderingState.consumingTime > mCordonTime || averageTime > mCordonTime) {
-                d = gapTime;
-                gapTime = 0;
-            } else {
-                d = averageTime + gapTime / mFrameUpdateRate;
-                d = Math.max(mFrameUpdateRate, d);
-                d = Math.min(mCordonTime, d);
-                long a = d - mLastDeltaTime;
-                if (a > 3 && a < 8 && mLastDeltaTime >= mFrameUpdateRate && mLastDeltaTime <= mCordonTime) {
-                    d = mLastDeltaTime;
+            mInSyncAction = true;
+            try {
+                long d = 0;
+                long time = startMS - mTimeBase;
+                if (!mDanmakusVisible || mRenderingState.nothingRendered || mInWaitingState) {
+                    timer.update(time + mSpeedOffsetNoRender + mSpeedOffsetRender);
+                    mSpeedOffsetNoRender += mFrameUpdateRate * (mSpeed - 1);
+                    mRemainingTime = 0;
+                    if (mCallback != null) {
+                        mCallback.updateTimer(timer);
+                    }
                 } else {
-                    mSpeedOffsetRender += d * (mSpeed - 1);
-                    d = (int) (d * mSpeed);
+                    long gapTime = time - timer.currMillisecond;
+                    long averageTime = Math.max(mFrameUpdateRate, getAverageRenderingTime());
+                    if (gapTime > 2000 || mRenderingState.consumingTime > mCordonTime || averageTime > mCordonTime) {
+                        d = gapTime;
+                        gapTime = 0;
+                    } else {
+                        d = averageTime + gapTime / mFrameUpdateRate;
+                        d = Math.max(mFrameUpdateRate, d);
+                        d = Math.min(mCordonTime, d);
+                        long a = d - mLastDeltaTime;
+                        if (a > 3 && a < 8 && mLastDeltaTime >= mFrameUpdateRate && mLastDeltaTime <= mCordonTime) {
+                            d = mLastDeltaTime;
+                        } else {
+                            mSpeedOffsetRender += d * (mSpeed - 1);
+                            d = (int) (d * mSpeed);
+                        }
+                        gapTime -= d;
+                        mLastDeltaTime = d;
+                    }
+                    mRemainingTime = gapTime;
+                    timer.add(d);
+                    // Log.e("DrawHandler", time+"|d:" + d + "RemaingTime:" + mRemainingTime +
+                    // ",gapTime:" + gapTime + ",rtim:" + mRenderingState.consumingTime +
+                    // ",average:" + averageTime);
                 }
-                gapTime -= d;
-                mLastDeltaTime = d;
+                if (mCallback != null) {
+                    mCallback.updateTimer(timer);
+                }
+                return d;
+            } finally {
+                mInSyncAction = false;
             }
-            mRemainingTime = gapTime;
-            timer.add(d);
-            // Log.e("DrawHandler", time+"|d:" + d + "RemaingTime:" + mRemainingTime +
-            // ",gapTime:" + gapTime + ",rtim:" + mRenderingState.consumingTime +
-            // ",average:" + averageTime);
         }
-        if (mCallback != null) {
-            mCallback.updateTimer(timer);
-        }
-        mInSyncAction = false;
-        return d;
     }
 
     public void syncTimerIfNeeded() {
@@ -585,6 +632,26 @@ public class DrawHandler extends Handler {
         obtainMessage(DrawHandler.SEEK_POS, ms).sendToTarget();
     }
 
+    public void requestRender() {
+        if (drawTask == null) {
+            return;
+        }
+        if (mInWaitingState) {
+            sendEmptyMessage(NOTIFY_RENDERING);
+            return;
+        }
+        if (quitFlag) {
+            redrawIfNeeded();
+            return;
+        }
+        if (mUpdateInNewThread && mThread != null) {
+            return;
+        }
+        if (!hasMessages(UPDATE)) {
+            sendEmptyMessage(UPDATE);
+        }
+    }
+
     public void addDanmaku(BaseDanmaku item) {
         if (drawTask != null) {
             item.flags = mContext.mGlobalFlagValues;
@@ -649,7 +716,7 @@ public class DrawHandler extends Handler {
     }
 
     private void redrawIfNeeded() {
-        if (quitFlag && mDanmakusVisible) {
+        if (drawTask != null && quitFlag && mDanmakusVisible) {
             obtainMessage(UPDATE_WHEN_PAUSED).sendToTarget();
         }
     }
@@ -765,16 +832,18 @@ public class DrawHandler extends Handler {
     }
 
     public long getCurrentTime() {
-        if (!mReady) {
-            return 0;
+        synchronized (mTimerLock) {
+            if (!mReady) {
+                return 0;
+            }
+            if (mInSeekingAction) {
+                return mDesireSeekingTime;
+            }
+            if (quitFlag || !mInWaitingState) {
+                return timer.currMillisecond - mRemainingTime;
+            }
+            return SystemClock.uptimeMillis() - mTimeBase;
         }
-        if (mInSeekingAction) {
-            return mDesireSeekingTime;
-        }
-        if (quitFlag || !mInWaitingState) {
-            return timer.currMillisecond - mRemainingTime;
-        }
-        return SystemClock.uptimeMillis() - mTimeBase;
     }
 
     public void clearDanmakusOnScreen() {
