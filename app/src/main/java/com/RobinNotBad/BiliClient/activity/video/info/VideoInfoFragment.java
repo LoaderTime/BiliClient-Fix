@@ -365,6 +365,7 @@ public class VideoInfoFragment extends BaseFragment {
         }
         
         description.setText(descBuilder);
+        description.setOnTouchListener(new StringUtil.ClickableSpanTouchListener());
         
         description.setOnClickListener(view1 -> {
             if (desc_expand) description.setMaxLines(3);
