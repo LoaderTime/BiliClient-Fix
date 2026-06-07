@@ -21,8 +21,6 @@ import com.RobinNotBad.BiliClient.util.MsgUtil;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 
 //用户动态
 //2023-09-30
@@ -95,16 +93,8 @@ public class UserDynamicFragment extends RefreshListFragment {
                     Logu.w(TRACE_TAG, "fragment space preflight failed, mid=" + mid + ", err=" + e.getMessage());
                 }
 
-                Future<UserInfo> userInfoFuture = CenterThreadPool.supplyAsyncWithFuture(() -> {
-                    long start = System.currentTimeMillis();
-                    UserInfo userInfo = UserInfoApi.getUserInfo(mid);
-                    Logu.w(TRACE_TAG, "fragment user info finished, mid=" + mid
-                            + ", success=" + (userInfo != null)
-                            + ", costMs=" + (System.currentTimeMillis() - start));
-                    return userInfo;
-                });
-
-                Future<FirstPageLoadResult> dynamicFuture = CenterThreadPool.supplyAsyncWithFuture(() -> {
+                FirstPageLoadResult result;
+                try {
                     long start = System.currentTimeMillis();
                     ArrayList<Dynamic> firstPageList = new ArrayList<>();
                     long nextOffset = DynamicApi.getDynamicList(firstPageList, 0, mid, null);
@@ -112,16 +102,17 @@ public class UserDynamicFragment extends RefreshListFragment {
                             + ", resultSize=" + firstPageList.size()
                             + ", nextOffset=" + nextOffset
                             + ", costMs=" + (System.currentTimeMillis() - start));
-                    return new FirstPageLoadResult(firstPageList, nextOffset);
-                });
-
-                UserInfo userInfo;
-                try {
-                    userInfo = userInfoFuture.get();
-                } catch (ExecutionException e) {
-                    Logu.w(TRACE_TAG, "fragment user info failed, mid=" + mid + ", err=" + describeExecutionException(e));
-                    throw new IOException("用户信息加载失败: " + describeExecutionException(e), e);
+                    result = new FirstPageLoadResult(firstPageList, nextOffset);
+                } catch (Exception e) {
+                    Logu.w(TRACE_TAG, "fragment dynamic first page failed, mid=" + mid + ", err=" + e);
+                    throw new IOException("动态加载失败: " + e, e);
                 }
+
+                long userInfoStart = System.currentTimeMillis();
+                UserInfo userInfo = UserInfoApi.getUserInfo(mid);
+                Logu.w(TRACE_TAG, "fragment user info finished after dynamic, mid=" + mid
+                        + ", success=" + (userInfo != null)
+                        + ", costMs=" + (System.currentTimeMillis() - userInfoStart));
                 if (userInfo == null) {
                     runOnUiThread(() -> {
                         setRefreshing(false);
@@ -129,14 +120,6 @@ public class UserDynamicFragment extends RefreshListFragment {
                         requireActivity().finish();
                     });
                     return;
-                }
-
-                FirstPageLoadResult result;
-                try {
-                    result = dynamicFuture.get();
-                } catch (ExecutionException e) {
-                    Logu.w(TRACE_TAG, "fragment dynamic first page failed, mid=" + mid + ", err=" + describeExecutionException(e));
-                    throw new IOException("动态加载失败: " + describeExecutionException(e), e);
                 }
 
                 if (isAdded()) {
@@ -164,11 +147,6 @@ public class UserDynamicFragment extends RefreshListFragment {
                 loadFail(e);
             }
         });
-    }
-
-    private String describeExecutionException(ExecutionException e) {
-        Throwable cause = e.getCause();
-        return cause == null ? e.toString() : cause.toString();
     }
 
     @SuppressLint("NotifyDataSetChanged")

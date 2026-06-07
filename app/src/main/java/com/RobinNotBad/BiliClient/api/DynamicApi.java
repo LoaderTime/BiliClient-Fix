@@ -208,6 +208,7 @@ public class DynamicApi {
         setHeader(headers, "User-Agent", SPACE_DYNAMIC_USER_AGENT);
         setHeader(headers, "Origin", "https://space.bilibili.com");
         setHeader(headers, "Referer", "https://space.bilibili.com/" + mid + "/dynamic");
+        setHeader(headers, "Cookie", CookiesApi.buildSpaceDynamicCookieHeader());
         CookiesApi.applyPiliPlusAccountHeaders(headers);
         return headers;
     }

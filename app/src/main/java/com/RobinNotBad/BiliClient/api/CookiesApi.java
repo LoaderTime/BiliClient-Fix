@@ -47,7 +47,17 @@ public class CookiesApi {
     private static final String RISK_TRACE_TAG = "cookie-risk-active";
     private static final String RISK_SCENE_DEFAULT = "333.1007.fp.risk";
     private static final String RISK_SCENE_SPACE_DYNAMIC = "333.1387.fp.risk";
-    private static final String PILIPLUS_RISK_USER_AGENT = "Dart/3.6 (dart:io)";
+    private static final String SPACE_DYNAMIC_RISK_USER_AGENT = "Dart/3.6 (dart:io)";
+    // Space feed risk is sensitive to browser-cookie noise; keep this list close to PiliPlus's account cookie context.
+    private static final String[] SPACE_DYNAMIC_COOKIE_NAMES = {
+            "SESSDATA",
+            "DedeUserID",
+            "DedeUserID__ckMd5",
+            "bili_jct",
+            "sid",
+            "buvid3",
+            "b_nut"
+    };
     private static final Object PROCESS_RISK_ACTIVE_LOCK = new Object();
     private static final Map<String, Boolean> PROCESS_RISK_ACTIVE = new HashMap<>();
 
@@ -97,21 +107,77 @@ public class CookiesApi {
 
     private static ArrayList<String> genRiskActiveHeaders(String riskScene, long mid) {
         ArrayList<String> headers = RISK_SCENE_SPACE_DYNAMIC.equals(riskScene)
-                ? genPiliPlusRiskActiveHeaders()
+                ? genSpaceDynamicRiskActiveHeaders()
                 : genWebHeaders();
         applyPiliPlusAccountHeaders(headers);
         return headers;
     }
 
-    private static ArrayList<String> genPiliPlusRiskActiveHeaders() {
+    private static ArrayList<String> genSpaceDynamicRiskActiveHeaders() {
         ArrayList<String> headers = new ArrayList<>();
         headers.add("Cookie");
-        headers.add(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
+        headers.add(buildSpaceDynamicCookieHeader());
         headers.add("Referer");
         headers.add("https://www.bilibili.com/");
         headers.add("User-Agent");
-        headers.add(PILIPLUS_RISK_USER_AGENT);
+        headers.add(SPACE_DYNAMIC_RISK_USER_AGENT);
         return headers;
+    }
+
+    public static String buildSpaceDynamicCookieHeader() {
+        return buildSpaceDynamicCookieHeader(SharedPreferencesUtil.getString(SharedPreferencesUtil.cookies, ""));
+    }
+
+    private static String buildSpaceDynamicCookieHeader(String rawCookie) {
+        Map<String, String> cookieMap = parseCookieHeader(rawCookie);
+        StringBuilder builder = new StringBuilder();
+        for (String name : SPACE_DYNAMIC_COOKIE_NAMES) {
+            String value = cookieMap.get(name);
+            if (value == null || value.isEmpty()) continue;
+            if (builder.length() > 0) builder.append("; ");
+            builder.append(name).append("=").append(value);
+        }
+        String result = builder.toString();
+        if (!hasCookieName(result, "SESSDATA") || !hasCookieName(result, "buvid3")) {
+            Logu.w(RISK_TRACE_TAG, "space dynamic cookie incomplete, names=" + summarizeCookieNames(result));
+        }
+        return result;
+    }
+
+    private static boolean hasCookieName(String cookieHeader, String name) {
+        if (cookieHeader == null || cookieHeader.trim().isEmpty()) return false;
+        String[] cookies = cookieHeader.split(";\\s*");
+        for (String cookie : cookies) {
+            int index = cookie.indexOf('=');
+            if (index > 0 && name.equals(cookie.substring(0, index))) return true;
+        }
+        return false;
+    }
+
+    private static Map<String, String> parseCookieHeader(String rawCookie) {
+        Map<String, String> result = new HashMap<>();
+        if (rawCookie == null || rawCookie.trim().isEmpty()) return result;
+        String[] cookies = rawCookie.split(";\\s*");
+        for (String cookie : cookies) {
+            if (cookie == null) continue;
+            int index = cookie.indexOf('=');
+            if (index <= 0) continue;
+            String key = cookie.substring(0, index).trim();
+            String value = cookie.substring(index + 1).trim();
+            if (!key.isEmpty()) result.put(key, value);
+        }
+        return result;
+    }
+
+    private static String summarizeCookieNames(String cookieHeader) {
+        if (cookieHeader == null || cookieHeader.trim().isEmpty()) return "[]";
+        List<String> names = new ArrayList<>();
+        String[] cookies = cookieHeader.split(";\\s*");
+        for (String cookie : cookies) {
+            int index = cookie.indexOf('=');
+            if (index > 0) names.add(cookie.substring(0, index));
+        }
+        return names.toString();
     }
 
     static void applyPiliPlusAccountHeaders(List<String> headers) {
