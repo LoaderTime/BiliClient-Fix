@@ -57,6 +57,8 @@ public class SettingLaboratoryActivity extends RefreshListActivity {
                         getString(R.string.setting_lab_media_session), "false"));
                 add(new SettingSection("switch", "互动视频调试", "player_interaction_debug",
                         "在互动视频播放时，在左侧倍速按钮上方显示调试按钮，可以查看和修改互动视频的变量", "false"));
+                add(new SettingSection("switch", "播放器弹幕诊断", "player_danmaku_diagnostics",
+                        "输出播放器 seek、长按倍速、弹幕恢复和渲染心跳诊断日志，用于区分状态恢复问题和设备性能上限。", "false"));
 
                 add(new SettingSection("title", "调试", "", "", ""));
                 add(new SettingSection("switch", "允许Logu.v", "dev_logv", getString(R.string.setting_lab_logv),

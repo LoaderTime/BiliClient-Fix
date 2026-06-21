@@ -338,14 +338,100 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
      * 在弱设备上容易放大为“弹幕线程进入 paused/等待态并长尾恢复”。
      */
     private static final long DANMAKU_SEEK_DEBOUNCE_DELAY_MS = 160L;
-    private static final long DANMAKU_SEEK_HEALTHCHECK_DELAY_MS = 320L;
+    private static final long DANMAKU_SEEK_HEALTHCHECK_DELAY_MS = 700L;
     private static final long DANMAKU_SEEK_HEALTHCHECK_LAG_MS = 900L;
     private static final long DANMAKU_SEEK_HEALTHCHECK_STALE_DRAW_MS = 420L;
     private static final long DANMAKU_FOREGROUND_RESTORE_STALE_DRAW_MS = 220L;
+    private static final long DANMAKU_RECOVERY_ACTION_COOLDOWN_MS = 2600L;
+    private static final long DANMAKU_REOPEN_HEALTHCHECK_DELAY_MS = 700L;
     private Runnable pendingDanmakuSeekRunnable;
     private Runnable pendingDanmakuSeekHealthCheckRunnable;
+    private Runnable pendingDanmakuReopenHealthCheckRunnable;
     private volatile long pendingDanmakuSeekTargetMs = -1L;
     private volatile long pendingDanmakuSeekScheduledUptimeMs = 0L;
+    private volatile long lastDanmakuRecoveryActionUptimeMs = 0L;
+    private volatile String lastDanmakuRecoveryActionReason = "";
+
+    private boolean isDanmakuDiagnosticsEnabled() {
+        try {
+            return SharedPreferencesUtil.getBoolean("player_danmaku_diagnostics", false);
+        } catch (Exception ignore) {
+            return false;
+        }
+    }
+
+    private void danmakuDiag(@NonNull String event, @NonNull String detail) {
+        if (!isDanmakuDiagnosticsEnabled())
+            return;
+        Logu.w("danmaku", "[PDM-DIAG] " + event + ": " + detail);
+    }
+
+    private String getPlayerPerfSummary() {
+        boolean hardwareCodec = true;
+        boolean openSles = false;
+        try {
+            hardwareCodec = SharedPreferencesUtil.getBoolean("player_codec", true);
+            openSles = SharedPreferencesUtil.getBoolean("player_audio", false);
+        } catch (Exception ignore) {
+        }
+        return "display=" + (usingTextureView() ? "TextureView" : "SurfaceView")
+                + ", codec=" + (hardwareCodec ? "hardware" : "software")
+                + ", audio=" + (openSles ? "OpenSles" : "AudioTrack")
+                + ", speed=" + getPlaybackSpeed();
+    }
+
+    private boolean isDanmakuRecoveryCooldownActive(long nowUptimeMs) {
+        return lastDanmakuRecoveryActionUptimeMs > 0L
+                && nowUptimeMs - lastDanmakuRecoveryActionUptimeMs < DANMAKU_RECOVERY_ACTION_COOLDOWN_MS;
+    }
+
+    private boolean shouldSuppressDanmakuRecoveryAction(@NonNull String reason) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (runtimeCoordinator.isLongPressSpeedActive()) {
+            danmakuDiag("recovery-skip", "reason=" + reason + ", cause=longPressSpeed, " + getPlayerPerfSummary());
+            return true;
+        }
+        if (isDanmakuRecoveryCooldownActive(now)) {
+            danmakuDiag("recovery-skip", "reason=" + reason
+                    + ", cause=cooldown"
+                    + ", lastReason=" + lastDanmakuRecoveryActionReason
+                    + ", age=" + (now - lastDanmakuRecoveryActionUptimeMs)
+                    + ", cooldown=" + DANMAKU_RECOVERY_ACTION_COOLDOWN_MS);
+            return true;
+        }
+        return false;
+    }
+
+    private void markDanmakuRecoveryAction(@NonNull String reason) {
+        lastDanmakuRecoveryActionUptimeMs = android.os.SystemClock.uptimeMillis();
+        lastDanmakuRecoveryActionReason = reason;
+        danmakuDiag("recovery-action", "reason=" + reason
+                + ", pos=" + getLatestPlayerPositionForDanmaku()
+                + ", dm=" + safeGetDanmakuCurrentTime()
+                + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                + ", visible=" + lastVisibleDanmakuCountSample
+                + ", " + getPlayerPerfSummary());
+    }
+
+    private long safeGetDanmakuCurrentTime() {
+        if (mDanmakuView == null)
+            return -1L;
+        try {
+            return Math.max(0L, mDanmakuView.getCurrentTime());
+        } catch (Exception ignore) {
+            return -1L;
+        }
+    }
+
+    private boolean safeIsDanmakuPrepared() {
+        if (mDanmakuView == null)
+            return false;
+        try {
+            return mDanmakuView.isPrepared();
+        } catch (Exception ignore) {
+            return false;
+        }
+    }
 
     private void cancelPendingDanmakuSeek(@NonNull String reason) {
         if (mainHandler != null && pendingDanmakuSeekRunnable != null) {
@@ -362,9 +448,88 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
         pendingDanmakuSeekRunnable = null;
         pendingDanmakuSeekHealthCheckRunnable = null;
+        if (mainHandler != null && pendingDanmakuReopenHealthCheckRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuReopenHealthCheckRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+        pendingDanmakuReopenHealthCheckRunnable = null;
         pendingDanmakuSeekTargetMs = -1L;
         pendingDanmakuSeekScheduledUptimeMs = 0L;
         Logu.d("danmaku", "cancel pending danmaku seek: " + reason);
+    }
+
+    private void scheduleDanmakuReopenHealthCheck(long targetMs, @NonNull String reason) {
+        if (destroyed || resourcesReleased || isLiveMode)
+            return;
+        if (!hasDanmaku || mDanmakuView == null || !isDanmakuVisible)
+            return;
+        if (mainHandler == null)
+            mainHandler = new Handler(Looper.getMainLooper());
+        if (pendingDanmakuReopenHealthCheckRunnable != null) {
+            try {
+                mainHandler.removeCallbacks(pendingDanmakuReopenHealthCheckRunnable);
+            } catch (Exception ignore) {
+            }
+        }
+
+        final int session = playerSessionId;
+        final long checkTarget = Math.max(0L, targetMs);
+        final long drawSeqBefore = getDanmakuDrawFrameSeq();
+        final long issuedAt = android.os.SystemClock.uptimeMillis();
+        pendingDanmakuReopenHealthCheckRunnable = () -> {
+            pendingDanmakuReopenHealthCheckRunnable = null;
+            if (destroyed || resourcesReleased || session != playerSessionId)
+                return;
+            if (!hasDanmaku || mDanmakuView == null || !isDanmakuVisible || !isCurrentDanmakuPrepared())
+                return;
+
+            long now = android.os.SystemClock.uptimeMillis();
+            long playerPos = Math.max(checkTarget, getLatestPlayerPositionForDanmaku());
+            long dmTime = safeGetDanmakuCurrentTime();
+            long drawSeq = getDanmakuDrawFrameSeq();
+            long lastDrawUptimeMs = getDanmakuLastDrawUptimeMs();
+            boolean viewPaused = false;
+            try {
+                viewPaused = mDanmakuView.isPaused();
+            } catch (Exception ignore) {
+            }
+
+            boolean noNewDraw = drawSeq <= drawSeqBefore;
+            boolean staleDraw = lastDrawUptimeMs <= 0L
+                    || lastDrawUptimeMs < issuedAt
+                    || now - lastDrawUptimeMs >= DANMAKU_SEEK_HEALTHCHECK_STALE_DRAW_MS;
+            long lag = dmTime >= 0L ? Math.max(0L, playerPos - dmTime) : 0L;
+            boolean lagging = lag >= DANMAKU_SEEK_HEALTHCHECK_LAG_MS;
+
+            danmakuDiag("reopen-health", "reason=" + reason
+                    + ", target=" + checkTarget
+                    + ", pos=" + playerPos
+                    + ", dm=" + dmTime
+                    + ", lag=" + lag
+                    + ", paused=" + viewPaused
+                    + ", noNewDraw=" + noNewDraw
+                    + ", staleDraw=" + staleDraw
+                    + ", " + getPlayerPerfSummary());
+
+            if (!viewPaused && !noNewDraw && !staleDraw && !lagging)
+                return;
+
+            try {
+                if (viewPaused && isPlaying) {
+                    mDanmakuView.resume();
+                }
+                mDanmakuView.seekTo(playerPos);
+                mDanmakuView.adjust();
+                markDanmakuSoftResync("reopenHealth:" + reason, playerPos, false);
+            } catch (Exception ignore) {
+            }
+        };
+        mainHandler.postDelayed(pendingDanmakuReopenHealthCheckRunnable, DANMAKU_REOPEN_HEALTHCHECK_DELAY_MS);
+        danmakuDiag("reopen-health-scheduled", "reason=" + reason
+                + ", target=" + checkTarget
+                + ", delay=" + DANMAKU_REOPEN_HEALTHCHECK_DELAY_MS);
     }
 
     private void scheduleDanmakuSeekHealthCheck(long targetMs,
@@ -426,10 +591,25 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             boolean lagging = lag >= DANMAKU_SEEK_HEALTHCHECK_LAG_MS;
 
             if (!viewPaused && !noNewDraw && !staleDraw && !lagging) {
+                danmakuDiag("seek-health-ok", "reason=" + reason
+                        + ", target=" + checkTarget
+                        + ", pos=" + playerPos
+                        + ", dm=" + danmakuTime
+                        + ", lag=" + lag);
                 maybeFinishRuntimeSeek(checkToken, "danmakuSeekHealthCheckOk:" + reason);
                 return;
             }
 
+            danmakuDiag("seek-health-recover", "reason=" + reason
+                    + ", target=" + checkTarget
+                    + ", pos=" + playerPos
+                    + ", dm=" + danmakuTime
+                    + ", lag=" + lag
+                    + ", paused=" + viewPaused
+                    + ", noNewDraw=" + noNewDraw
+                    + ", staleDraw=" + staleDraw
+                    + ", speedStress=" + runtimeCoordinator.isLongPressSpeedActive()
+                    + ", " + getPlayerPerfSummary());
             Logu.w("danmaku", "seek health check recover: reason=" + reason
                     + ", target=" + checkTarget
                     + ", pos=" + playerPos
@@ -438,6 +618,17 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     + ", paused=" + viewPaused
                     + ", noNewDraw=" + noNewDraw
                     + ", staleDraw=" + staleDraw);
+
+            if (runtimeCoordinator.isLongPressSpeedActive()) {
+                danmakuDiag("seek-health-skip", "reason=" + reason
+                        + ", cause=longPressSpeed"
+                        + ", target=" + checkTarget
+                        + ", pos=" + playerPos
+                        + ", dm=" + danmakuTime
+                        + ", lag=" + lag
+                        + ", " + getPlayerPerfSummary());
+                return;
+            }
 
             try {
                 if (viewPaused && isPlaying) {
@@ -503,13 +694,28 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     if (mDanmakuView.isPrepared()) {
                         mDanmakuView.seekTo(target);
                         mDanmakuView.adjust();
+                        scheduleDanmakuSeekHealthCheck(target, scheduledSeekToken, issuedAt, drawSeqBefore, reason);
                     } else {
-                        mDanmakuView.showAndResumeDrawTask(target);
+                        if (shouldSuppressDanmakuRecoveryAction("seekShowAndResume:" + reason)) {
+                            danmakuDiag("seek-show-resume-skip", "reason=" + reason
+                                    + ", target=" + target
+                                    + ", token=" + scheduledSeekToken
+                                    + ", " + getPlayerPerfSummary());
+                            maybeFinishRuntimeSeek(scheduledSeekToken, "danmakuSeekShowResumeSuppressed:" + reason);
+                        } else {
+                            markDanmakuRecoveryAction("seekShowAndResume:" + reason);
+                            mDanmakuView.showAndResumeDrawTask(target);
+                            scheduleDanmakuSeekHealthCheck(target, scheduledSeekToken, issuedAt, drawSeqBefore, reason);
+                        }
                     }
-                    scheduleDanmakuSeekHealthCheck(target, scheduledSeekToken, issuedAt, drawSeqBefore, reason);
                 } else if (mDanmakuView.isPrepared()) {
                     mDanmakuView.seekTo(target);
                 }
+                danmakuDiag("seek-applied", "reason=" + reason
+                        + ", pos=" + target
+                        + ", visible=" + isDanmakuVisible
+                        + ", prepared=" + safeIsDanmakuPrepared()
+                        + ", token=" + scheduledSeekToken);
                 Logu.d("danmaku", "debounced danmaku seek applied: reason=" + reason + ", pos=" + target
                         + ", visible=" + isDanmakuVisible);
             } catch (Exception e) {
@@ -523,6 +729,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 + ", pos=" + pendingDanmakuSeekTargetMs
                 + ", token=" + scheduledSeekToken
                 + ", delay=" + DANMAKU_SEEK_DEBOUNCE_DELAY_MS + "ms");
+        danmakuDiag("seek-scheduled", "reason=" + reason
+                + ", pos=" + pendingDanmakuSeekTargetMs
+                + ", token=" + scheduledSeekToken
+                + ", delay=" + DANMAKU_SEEK_DEBOUNCE_DELAY_MS);
     }
 
     /**
@@ -895,6 +1105,10 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
     private void setPlaybackSpeed(float speed, @NonNull String reason) {
         playbackSpeed = speed;
+        danmakuDiag("speed-set", "reason=" + reason
+                + ", speed=" + speed
+                + ", longPress=" + runtimeCoordinator.isLongPressSpeedActive()
+                + ", " + getPlayerPerfSummary());
         try {
             if (ijkPlayer != null)
                 ijkPlayer.setSpeed(speed);
@@ -917,8 +1131,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         int speedIndex = Math.max(0, Math.min(seekbar_speed.getProgress(), speed_values.length - 1));
         float normalSpeed = speed_values[speedIndex];
         setPlaybackSpeed(normalSpeed, "longPressEnd:" + reason);
+        danmakuDiag("long-press-end", "reason=" + reason
+                + ", normalSpeed=" + normalSpeed
+                + ", pos=" + getLatestPlayerPositionForDanmaku()
+                + ", dm=" + safeGetDanmakuCurrentTime()
+                + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                + ", visible=" + lastVisibleDanmakuCountSample
+                + ", " + getPlayerPerfSummary());
         if (text_speed != null)
             text_speed.setText(speed_strs[speedIndex]);
+        if (hasDanmaku && isDanmakuVisible && mDanmakuView != null) {
+            scheduleDanmakuReopenHealthCheck(getLatestPlayerPositionForDanmaku(), "longPressEnd:" + reason);
+        }
     }
 
     private void updateLatestPlayerPosition(long positionMs) {
@@ -1159,6 +1383,8 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         lastDanmakuWatchdogRecoverUptimeMs = 0L;
         lastDanmakuWatchdogRecoverWasSoft = false;
         lastDanmakuSoftResyncUptimeMs = 0L;
+        lastDanmakuRecoveryActionUptimeMs = 0L;
+        lastDanmakuRecoveryActionReason = "";
     }
 
     private boolean shouldClearDanmakusOnSoftRecovery(@NonNull String reason) {
@@ -1246,10 +1472,24 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         boolean useHideShowResume = shouldUseHideShowResumeSoftStrategy(reason, viewPaused, visibleCount);
         boolean useShowAndResume = shouldUseShowAndResumeForSoftRecovery(reason);
         String strategy = useHideShowResume ? "HIDE_SHOW_RESUME" : (useShowAndResume ? "SHOW_RESUME" : "SEEK_ONLY");
+        danmakuDiag("soft-recovery-request", "reason=" + reason
+                + ", strategy=" + strategy
+                + ", pos=" + target
+                + ", dm=" + safeGetDanmakuCurrentTime()
+                + ", paused=" + viewPaused
+                + ", visible=" + visibleCount
+                + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                + ", lastDrawAge=" + getDanmakuLastDrawAgeMs()
+                + ", " + getPlayerPerfSummary());
+        boolean recoveryActionMarked = false;
 
         // paused/空屏坏态：先 hide(不quit) 让 DrawHandler 的 mDanmakusVisible=false，避免 showDanmakus(position) 被短路。
         if (useHideShowResume) {
             try {
+                if (shouldSuppressDanmakuRecoveryAction("soft:" + reason + ":" + strategy))
+                    return;
+                markDanmakuRecoveryAction("soft:" + reason + ":" + strategy);
+                recoveryActionMarked = true;
                 hideDanmakuAndPauseWithoutQuit("softRecoveryStrategy:" + reason);
                 mDanmakuView.showAndResumeDrawTask(target);
                 resynced = true;
@@ -1282,6 +1522,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         // frozen-frame 等场景：优先走 showAndResumeDrawTask（不清屏），它能显式触发 RESUME/UPDATE。
         if (useShowAndResume) {
             try {
+                if (!recoveryActionMarked) {
+                    if (shouldSuppressDanmakuRecoveryAction("soft:" + reason + ":" + strategy))
+                        return;
+                    markDanmakuRecoveryAction("soft:" + reason + ":" + strategy);
+                    recoveryActionMarked = true;
+                }
                 mDanmakuView.showAndResumeDrawTask(target);
                 resynced = true;
                 recoveryIssued = true;
@@ -1316,7 +1562,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             // 才需要 clearDanmakusOnScreen()；对 large-lag 且仍有可见弹幕的场景，如果先 clear，
             // 反而会制造一个人工空屏窗口，又被 watchdog 误判成新的异常。
             if (clearOnScreen) {
-                mDanmakuView.clearDanmakusOnScreen();
+                if (shouldSuppressDanmakuRecoveryAction("softClear:" + reason + ":" + strategy)) {
+                    clearOnScreen = false;
+                } else {
+                    markDanmakuRecoveryAction("softClear:" + reason + ":" + strategy);
+                    recoveryActionMarked = true;
+                    mDanmakuView.clearDanmakusOnScreen();
+                }
             }
             mDanmakuView.seekTo(target);
             resynced = true;
@@ -1328,6 +1580,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         if (!resynced) {
             // 仅当原地 resync 真正失败时，再退回旧的 hide/show 方案作为兜底。
+            if (!recoveryActionMarked) {
+                if (shouldSuppressDanmakuRecoveryAction("softFallback:" + reason))
+                    return;
+                markDanmakuRecoveryAction("softFallback:" + reason);
+                recoveryActionMarked = true;
+            }
             hideDanmakuAndPauseWithoutQuit("softRecoveryFallback:" + reason);
             try {
                 mDanmakuView.showAndResumeDrawTask(target);
@@ -1396,10 +1654,18 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             return;
         }
 
+        if (shouldSuppressDanmakuRecoveryAction("hard:" + reason))
+            return;
+
         pendingDanmakuRestartAfterPrepare = true;
         pendingDanmakuRestartPositionMs = Math.max(0L, positionMs);
         pendingDanmakuRestartSessionId = playerSessionId;
         pendingDanmakuRestartVisible = isDanmakuVisible;
+        markDanmakuRecoveryAction("hard:" + reason);
+        danmakuDiag("hard-recovery", "reason=" + reason
+                + ", pos=" + pendingDanmakuRestartPositionMs
+                + ", source=" + (hasCachedSegments ? "protobuf" : "file")
+                + ", " + getPlayerPerfSummary());
         Logu.w("danmaku", "watchdog hard recover: reason=" + reason + ", pos="
                 + pendingDanmakuRestartPositionMs + ", source="
                 + (hasCachedSegments ? "protobuf" : "file"));
@@ -1903,6 +2169,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 if (!onLongClick && !gesture_click_disabled) {
                     hidecon.run();
                     runtimeCoordinator.setLongPressSpeedActive(true, android.os.SystemClock.uptimeMillis(), "longClickDown");
+                    danmakuDiag("long-press-start", "pos=" + getLatestPlayerPositionForDanmaku()
+                            + ", dm=" + safeGetDanmakuCurrentTime()
+                            + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                            + ", visible=" + lastVisibleDanmakuCountSample
+                            + ", " + getPlayerPerfSummary());
                     setPlaybackSpeed(3.0F, "longPressStart");
                     text_speed.setText("x 3.0");
                     onLongClick = true;
@@ -2203,6 +2474,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         } catch (Exception ignore) {
             return 0L;
         }
+    }
+
+    private long getDanmakuLastDrawAgeMs() {
+        long lastDraw = getDanmakuLastDrawUptimeMs();
+        if (lastDraw <= 0L)
+            return -1L;
+        return Math.max(0L, android.os.SystemClock.uptimeMillis() - lastDraw);
     }
 
     private long getDanmakuDrawFrameSeq() {
@@ -4651,6 +4929,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         }
 
         displayConfigured = true;
+        danmakuDiag("player-config", getPlayerPerfSummary()
+                + ", online=" + isOnlineVideo
+                + ", live=" + isLiveMode
+                + ", audioOnly=" + isAudioOnlyMode
+                + ", session=" + playerSessionId);
 
         // 移除 surfaceTimer 轮询，改为回调驱动；如果 surface 已就绪则立即绑定并尝试 prepare。
         attachSurfaceIfPossible();
@@ -4845,6 +5128,11 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
         completionReplayNeedsRebuild = false;
         isPrepared = true;
         video_all = (int) ijkPlayer.getDuration();
+        danmakuDiag("prepared", "duration=" + video_all
+                + ", hasDanmaku=" + hasDanmaku
+                + ", visible=" + isDanmakuVisible
+                + ", " + getPlayerPerfSummary()
+                + ", session=" + playerSessionId);
 
         changeVideoSize();
 
@@ -5770,6 +6058,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     boolean speedStressRecoverableStuck = speedStressWindow
                             && handlerLagMs >= DANMAKU_TIMER_SPEED_STUCK_RECOVERY_LAG_MS
                             && (likelyEmptyVisibleFreeze || viewPaused || visibleCount == 0);
+                    if (speedStressWindow && speedStressRecoverableStuck) {
+                        a.danmakuDiag("force-catch-up-speed-stress", "raw=" + currentPos
+                                + ", lag=" + handlerLagMs
+                                + ", visible=" + visibleCount
+                                + ", paused=" + viewPaused
+                                + ", likelyEmpty=" + likelyEmptyVisibleFreeze
+                                + ", speed=" + speed);
+                    }
+                    speedStressRecoverableStuck = false;
                     boolean triggeredSoftRecovery = false;
 
                     if (likelyEmptyVisibleFreeze) {
@@ -5853,6 +6150,14 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     timer.update(catchUpTarget);
                     if (nowUptime - lastForceCatchUpLogUptimeMs >= 1000L) {
                         lastForceCatchUpLogUptimeMs = nowUptime;
+                        a.danmakuDiag("force-catch-up", "raw=" + currentPos
+                                + ", timer=" + timer.currMillisecond
+                                + ", target=" + catchUpTarget
+                                + ", lag=" + handlerLagMs
+                                + ", visible=" + visibleCount
+                                + ", speed=" + speed
+                                + ", snap=" + hardSnapCatchUp
+                                + ", speedStress=" + speedStressWindow);
                         Logu.w("danmaku", "timer force catch-up: raw=" + currentPos
                                 + ", timer=" + timer.currMillisecond
                                 + ", target=" + catchUpTarget
@@ -6920,6 +7225,12 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
             long from = safeGetPlayerPositionMs();
             long seekToken = runtimeCoordinator.commitUserSeek(from, target,
                     android.os.SystemClock.uptimeMillis(), "seekToPosition");
+            danmakuDiag("seek-commit", "from=" + from
+                    + ", target=" + target
+                    + ", token=" + seekToken
+                    + ", visible=" + isDanmakuVisible
+                    + ", prepared=" + safeIsDanmakuPrepared()
+                    + ", " + getPlayerPerfSummary());
             try {
                 ijkPlayer.seekTo(target);
             } catch (Exception ignore) {
@@ -7053,6 +7364,13 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
         isDanmakuVisible = visible;
         runtimeCoordinator.setDanmakuVisibleByUser(visible, reason);
+        danmakuDiag("visibility", "visible=" + visible
+                + ", reason=" + reason
+                + ", prepared=" + safeIsDanmakuPrepared()
+                + ", pos=" + getLatestPlayerPositionForDanmaku()
+                + ", dm=" + safeGetDanmakuCurrentTime()
+                + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                + ", " + getPlayerPerfSummary());
 
         // 硬恢复 prepare 尚未完成时，不让外部 show 调用把半初始化状态的弹幕层再次拉起。
         // 但 hide 仍然允许，以便用户在恢复期关闭弹幕。
@@ -7097,6 +7415,7 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
 
             final long pos = safeGetPlayerPositionMs();
             // position!=null 才会走 RESUME 分支，避免 show(null) 只“显示不恢复”
+            markDanmakuRecoveryAction("visibilityOn:" + reason);
             mDanmakuView.showAndResumeDrawTask(pos);
 
             // 注意：这里不要额外调用 mDanmakuView.seekTo(pos)。
@@ -7111,6 +7430,9 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                 }
             }
             refreshDanmakuPositionSync("danmakuOn:" + reason);
+            if (!"init".equals(reason)) {
+                scheduleDanmakuReopenHealthCheck(pos, reason);
+            }
             if (!isLiveMode && isPrepared) {
                 startDanmakuWatchdog();
             }
@@ -7192,6 +7514,16 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                     return;
                 }
 
+                if (runtimeCoordinator.isLongPressSpeedActive()) {
+                    danmakuDiag("watchdog-skip", "cause=longPressSpeed"
+                            + ", pos=" + getLatestPlayerPositionForDanmaku()
+                            + ", dm=" + safeGetDanmakuCurrentTime()
+                            + ", drawSeq=" + getDanmakuDrawFrameSeq()
+                            + ", visible=" + lastVisibleDanmakuCountSample
+                            + ", " + getPlayerPerfSummary());
+                    mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
+                    return;
+                }
                 if (!runtimeCoordinator.canRunDanmakuWatchdog(now, hasDanmaku, isPrepared, isPlaying)
                         || !isDanmakuVisible || mDanmakuView == null) {
                     mainHandler.postDelayed(this, DANMAKU_WATCHDOG_INTERVAL_MS);
@@ -7322,6 +7654,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                                 + ", sig=" + visibleSig
                                 + ", frozenCount=" + danmakuWatchdogFrozenSigCount
                                 + ", hard=" + escalateHard);
+                        danmakuDiag("watchdog-frozen", "pos=" + videoPos
+                                + ", dm=" + dmTime
+                                + ", lag=" + danmakuLag
+                                + ", visible=" + visibleDanmakuCount
+                                + ", sig=" + visibleSig
+                                + ", frozenCount=" + danmakuWatchdogFrozenSigCount
+                                + ", hard=" + escalateHard
+                                + ", lastDrawAge=" + getDanmakuLastDrawAgeMs()
+                                + ", " + getPlayerPerfSummary());
 
                         lastDanmakuFrozenSoftRecoveryUptimeMs = nowUptime;
                         danmakuWatchdogFrozenSigCount = 0;
@@ -7357,6 +7698,15 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                                 + ", lastDrawAgo=" + (lastDrawUptimeMs > 0L ? (now - lastDrawUptimeMs) : -1L)
                                 + ", dropped=" + droppedDrawFrames
                                 + ", hard=" + escalateHard);
+                        danmakuDiag("watchdog-render-stale", "pos=" + videoPos
+                                + ", dm=" + dmTime
+                                + ", lag=" + danmakuLag
+                                + ", visible=" + visibleDanmakuCount
+                                + ", drawSeq=" + drawFrameSeq
+                                + ", lastDrawAge=" + getDanmakuLastDrawAgeMs()
+                                + ", dropped=" + droppedDrawFrames
+                                + ", hard=" + escalateHard
+                                + ", " + getPlayerPerfSummary());
                         if (escalateHard) {
                             if (lastDanmakuHardRecoveryUptimeMs <= 0L
                                     || now - lastDanmakuHardRecoveryUptimeMs >= DANMAKU_WATCHDOG_HARD_RECOVERY_COOLDOWN_MS) {
@@ -7403,6 +7753,21 @@ public class PlayerActivity extends Activity implements IjkMediaPlayer.OnPrepare
                             + ", quickHard=" + quickHardRecover
                             + ", recentVisible=" + recentNonEmptyVisible
                             + ", recentDense=" + recentDenseVisible);
+                    danmakuDiag("watchdog-recover", "pos=" + videoPos
+                            + ", dm=" + dmTime
+                            + ", lag=" + danmakuLag
+                            + ", visible=" + visibleDanmakuCount
+                            + ", paused=" + viewPaused
+                            + ", unexpectedPaused=" + unexpectedPaused
+                            + ", stuckCount=" + danmakuWatchdogStuckCount
+                            + ", abnormalLargeLag=" + abnormalLargeLag
+                            + ", hard=" + hardRecover
+                            + ", directHard=" + directHardRecover
+                            + ", quickHard=" + quickHardRecover
+                            + ", recentVisible=" + recentNonEmptyVisible
+                            + ", recentDense=" + recentDenseVisible
+                            + ", lastDrawAge=" + getDanmakuLastDrawAgeMs()
+                            + ", " + getPlayerPerfSummary());
 
                     if (hardRecover) {
                         lastDanmakuHardRecoveryUptimeMs = now;

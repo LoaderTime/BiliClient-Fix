@@ -285,6 +285,9 @@ public final class PlayerRuntimeCoordinator {
         if (loadingOwner != LoadingOwner.NONE) {
             return false;
         }
+        if (longPressSpeedActive) {
+            return false;
+        }
         return !isSpeedTransitionGraceActive(nowUptimeMs);
     }
 }
